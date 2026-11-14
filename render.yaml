@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: dk-predictions-model
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    disk:
+      name: dkex-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: DATA_DIR
+        value: /data
+      - key: APP_PASSCODE
+        generateValue: true
+      - key: BANKROLL
+        value: "1000.0"
+      - key: DEFAULT_FEE_DOLLARS
+        value: "0.015"
+      - key: THE_ODDS_API_KEY
+        sync: false

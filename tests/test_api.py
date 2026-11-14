@@ -129,3 +129,78 @@ def test_api_endpoints_and_ledger_lifecycle(tmp_path: Path, monkeypatch) -> None
     r_guide = client.get("/api/guide")
     assert r_guide.status_code == 200
     assert "Limit Orders" in r_guide.json()["markdown"]
+
+    # 6. Healthcheck and UI-first model maintenance endpoints
+    r_health = client.get("/healthz")
+    assert r_health.status_code == 200
+    assert r_health.json()["status"] == "ok"
+
+    r_train = client.post("/api/train?sport=nba")
+    assert r_train.status_code == 200
+    assert "nba_game" in r_train.json()["trained"]
+
+
+def test_remote_passcode_auth_and_data_dir_persistence(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "remote_volume"
+    monkeypatch.setenv("DATA_DIR", str(data_dir))
+    monkeypatch.setenv("APP_PASSCODE", "secret-dkex-2026")
+
+    from src.cli import build_parser
+    from src.config import Settings
+    from src.storage.db import Database
+
+    settings = Settings.from_env()
+    assert settings.db_path == data_dir / "dk_model.sqlite3"
+    assert settings.models_dir == data_dir / "models"
+
+    # Verify CLI parser defaults to remote-ready host/port without subcommands
+    parsed = build_parser().parse_args(["--host", "0.0.0.0", "--port", "8080"])
+    assert parsed.host == "0.0.0.0"
+    assert parsed.port == 8080
+
+    # Verify SQLite app_settings roundtrip
+    db = Database(settings.db_path)
+    db.set_app_settings({"KELLY_FRACTION": "0.30"})
+    assert db.get_app_settings()["KELLY_FRACTION"] == "0.30"
+
+    client = TestClient(app)
+
+    # Public routes remain accessible for load-balancer probes and HTML shell
+    assert client.get("/healthz").status_code == 200
+    assert client.get("/").status_code == 200
+
+    st_before = client.get("/api/auth/status").json()
+    assert st_before == {"auth_enabled": True, "authenticated": False}
+
+    # Protected API routes reject unauthenticated access
+    assert client.get("/api/config").status_code == 401
+    assert client.get("/api/ledger").status_code == 401
+
+    # Bearer token works for headless/remote API calls
+    r_bearer = client.get("/api/config", headers={"Authorization": "Bearer secret-dkex-2026"})
+    assert r_bearer.status_code == 200
+
+    # Wrong passcode rejected
+    r_bad = client.post("/api/auth/login", json={"passcode": "wrong-pass"})
+    assert r_bad.status_code == 401
+
+    # Correct passcode sets session cookie and unlocks API
+    r_ok = client.post("/api/auth/login", json={"passcode": "secret-dkex-2026"})
+    assert r_ok.status_code == 200
+    assert client.get("/api/auth/status").json()["authenticated"] is True
+
+    # Masked API key & extended config save
+    r_save = client.post(
+        "/api/config",
+        json={"kelly_fraction": 0.20, "the_odds_api_key": "abcdef123456"},
+    )
+    assert r_save.status_code == 200
+    cfg_payload = r_save.json()
+    assert cfg_payload["odds_api_connected"] is True
+    assert cfg_payload["odds_api_key_masked"] == "••••3456"
+    assert "abcdef" not in cfg_payload["odds_api_key_masked"]
+
+    # Logout re-locks the session
+    client.post("/api/auth/logout")
+    assert client.get("/api/config").status_code == 401
+

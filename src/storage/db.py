@@ -71,6 +71,12 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl REAL NOT NULL DEFAULT 0.0,
     notes TEXT DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -88,6 +94,29 @@ class Database:
     def _init_db(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA_SQL)
+
+    # --- Persistent UI settings helpers ---
+    def get_app_settings(self) -> dict[str, str]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+        return {str(r["key"]): str(r["value"]) for r in rows}
+
+    def set_app_settings(self, updates: dict[str, str]) -> None:
+        if not updates:
+            return
+        now = time.time()
+        with self._connect() as conn:
+            for k, v in updates.items():
+                conn.execute(
+                    """
+                    INSERT INTO app_settings (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                    """,
+                    (str(k), str(v), now),
+                )
 
     # --- Cache helpers ---
     def get_cache(self, key: str) -> Any | None:
