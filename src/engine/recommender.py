@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import joblib
 
-from src.config import Settings, get_settings
+from src.config import PROJECT_ROOT, Settings, get_settings
 from src.data.espn_client import ESPNClient
 from src.data.nba_loader import NBALoader
 from src.data.nfl_loader import NFLLoader
@@ -216,9 +217,24 @@ class ModelHub:
         return metrics
 
     def ensure_loaded(self) -> None:
-        nfl_path = self.settings.models_dir / "nfl_game_model.joblib"
-        nba_path = self.settings.models_dir / "nba_game_model.joblib"
-        if not (nfl_path.exists() and nba_path.exists() and self.props_path.exists()):
+        primary_dir = self.settings.models_dir
+        fallback_dir = PROJECT_ROOT / "models"
+        allow_fallback = "PYTEST_CURRENT_TEST" not in os.environ
+
+        def _find_artifact(filename: str) -> Path | None:
+            cand = primary_dir / filename
+            if cand.exists():
+                return cand
+            if allow_fallback:
+                fb = fallback_dir / filename
+                if fb.exists():
+                    return fb
+            return None
+
+        nfl_path = _find_artifact("nfl_game_model.joblib")
+        nba_path = _find_artifact("nba_game_model.joblib")
+        props_path = _find_artifact("player_props_engine.joblib")
+        if not (nfl_path and nba_path and props_path):
             self.train_all("all")
             return
         if self.nfl_model is None:
@@ -226,7 +242,7 @@ class ModelHub:
         if self.nba_model is None:
             self.nba_model = NBAGameModel.load(nba_path)
         if self.props_engine is None:
-            self.props_engine = joblib.load(self.props_path)
+            self.props_engine = joblib.load(props_path)
 
     def _get_upcoming_events(
         self,

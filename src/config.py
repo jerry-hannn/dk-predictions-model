@@ -9,7 +9,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from dotenv import dotenv_values
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _resolve_project_root() -> Path:
+    app_root = os.environ.get("APP_ROOT", "").strip()
+    if app_root:
+        return Path(app_root).resolve()
+    pkg_parent = Path(__file__).resolve().parent.parent
+    if (pkg_parent / "pyproject.toml").exists() or (pkg_parent / "data").exists():
+        return pkg_parent
+    cwd = Path.cwd().resolve()
+    if (cwd / "pyproject.toml").exists() or (cwd / "data").exists():
+        return cwd
+    return pkg_parent
+
+
+def _ensure_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        return os.access(str(path), os.W_OK)
+    except OSError:
+        return False
+
+
+PROJECT_ROOT = _resolve_project_root()
 ENV_FILE = PROJECT_ROOT / ".env"
 
 
@@ -80,9 +101,14 @@ class Settings:
             return os.getenv(key, default)
 
         data_dir_raw = _base_lookup("DATA_DIR", "").strip()
-        base_data_dir = (
+        candidate_data_dir = (
             (Path(data_dir_raw) if Path(data_dir_raw).is_absolute() else PROJECT_ROOT / data_dir_raw)
             if data_dir_raw
+            else None
+        )
+        base_data_dir = (
+            candidate_data_dir
+            if (candidate_data_dir is not None and (in_pytest or _ensure_writable_dir(candidate_data_dir)))
             else None
         )
 

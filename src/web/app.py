@@ -19,7 +19,17 @@ from src.config import PROJECT_ROOT, get_settings, update_env_settings
 from src.engine.recommender import ModelHub
 from src.storage.db import Database
 
-STATIC_DIR = Path(__file__).resolve().parent / "static"
+def _resolve_static_dir() -> Path:
+    pkg_static = Path(__file__).resolve().parent / "static"
+    if pkg_static.is_dir():
+        return pkg_static
+    root_static = PROJECT_ROOT / "src" / "web" / "static"
+    if root_static.is_dir():
+        return root_static
+    return pkg_static
+
+
+STATIC_DIR = _resolve_static_dir()
 SESSION_COOKIE_NAME = "dkex_session"
 
 app = FastAPI(

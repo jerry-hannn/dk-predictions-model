@@ -204,3 +204,7 @@ def test_remote_passcode_auth_and_data_dir_persistence(tmp_path: Path, monkeypat
     client.post("/api/auth/logout")
     assert client.get("/api/config").status_code == 401
 
+    # Static assets always serve cleanly even when locked
+    assert client.get("/static/styles.css").status_code == 200
+    assert client.get("/static/app.js").status_code == 200
+

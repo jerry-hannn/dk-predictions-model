@@ -30,9 +30,15 @@ dev = [
 [project.scripts]
 dkmodel = "src.cli:app"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*"]
+
+[tool.setuptools.package-data]
+"src.web" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

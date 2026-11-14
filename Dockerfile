@@ -3,26 +3,23 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    APP_ROOT=/app \
     HOST=0.0.0.0 \
     PORT=8000 \
     DATA_DIR=/data
 
 WORKDIR /app
 
-# Create non-root runtime user and persistent volume mount directory
-RUN useradd --create-home --shell /bin/bash appuser && \
-    mkdir -p /data && chown -R appuser:appuser /data
+RUN mkdir -p /data
 
 COPY pyproject.toml README.md GUIDE.md .env.example ./
 COPY src ./src
 COPY data ./data
 COPY models ./models
 
-RUN pip install --upgrade pip && \
-    pip install . && \
-    chown -R appuser:appuser /app
-
-USER appuser
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-build-isolation -e . && \
+    DATA_DIR="" python -c "from src.engine.recommender import ModelHub; ModelHub().train_all('all')"
 
 EXPOSE 8000
 
