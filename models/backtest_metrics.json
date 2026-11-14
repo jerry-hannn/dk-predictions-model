@@ -1,0 +1,144 @@
+{
+  "nfl": {
+    "oos_games": 282,
+    "brier_score": 0.2246,
+    "log_loss": 0.6388,
+    "raw_accuracy_60plus": 0.681,
+    "calibration_bins": [
+      {
+        "bin_label": "50%-57%",
+        "count": 94,
+        "predicted_prob": 0.539,
+        "actual_win_rate": 0.5213
+      },
+      {
+        "bin_label": "57%-66%",
+        "count": 92,
+        "predicted_prob": 0.6196,
+        "actual_win_rate": 0.5978
+      },
+      {
+        "bin_label": "66%-74%",
+        "count": 63,
+        "predicted_prob": 0.701,
+        "actual_win_rate": 0.7143
+      },
+      {
+        "bin_label": "74%-82%",
+        "count": 25,
+        "predicted_prob": 0.7686,
+        "actual_win_rate": 0.76
+      },
+      {
+        "bin_label": "82%-90%",
+        "count": 8,
+        "predicted_prob": 0.8565,
+        "actual_win_rate": 1.0
+      }
+    ],
+    "simulation": {
+      "total_bets": 38,
+      "wins": 22,
+      "hit_rate": 0.5789,
+      "total_outlay": 1248.92,
+      "net_pnl": -55.92,
+      "roi_pct": -0.0448,
+      "ending_bankroll": 944.08,
+      "max_drawdown_pct": 0.1682,
+      "by_tier": {
+        "A+": {
+          "bets": 15,
+          "wins": 9,
+          "win_rate": 0.6,
+          "roi_pct": -0.12,
+          "net_pnl": -69.52
+        },
+        "A": {
+          "bets": 9,
+          "wins": 4,
+          "win_rate": 0.4444,
+          "roi_pct": -0.3202,
+          "net_pnl": -98.93
+        },
+        "B": {
+          "bets": 14,
+          "wins": 9,
+          "win_rate": 0.6429,
+          "roi_pct": 0.3122,
+          "net_pnl": 112.53
+        }
+      }
+    }
+  },
+  "nba": {
+    "oos_games": 557,
+    "brier_score": 0.1972,
+    "log_loss": 0.5807,
+    "raw_accuracy_60plus": 0.796,
+    "calibration_bins": [
+      {
+        "bin_label": "50%-57%",
+        "count": 166,
+        "predicted_prob": 0.5407,
+        "actual_win_rate": 0.5241
+      },
+      {
+        "bin_label": "57%-66%",
+        "count": 149,
+        "predicted_prob": 0.6189,
+        "actual_win_rate": 0.6846
+      },
+      {
+        "bin_label": "66%-74%",
+        "count": 141,
+        "predicted_prob": 0.6997,
+        "actual_win_rate": 0.8085
+      },
+      {
+        "bin_label": "74%-82%",
+        "count": 80,
+        "predicted_prob": 0.7737,
+        "actual_win_rate": 0.8375
+      },
+      {
+        "bin_label": "82%-90%",
+        "count": 21,
+        "predicted_prob": 0.8488,
+        "actual_win_rate": 0.9048
+      }
+    ],
+    "simulation": {
+      "total_bets": 39,
+      "wins": 34,
+      "hit_rate": 0.8718,
+      "total_outlay": 1058.95,
+      "net_pnl": 364.05,
+      "roi_pct": 0.3438,
+      "ending_bankroll": 1364.05,
+      "max_drawdown_pct": 0.0321,
+      "by_tier": {
+        "A+": {
+          "bets": 5,
+          "wins": 5,
+          "win_rate": 1.0,
+          "roi_pct": 0.378,
+          "net_pnl": 79.55
+        },
+        "A": {
+          "bets": 10,
+          "wins": 9,
+          "win_rate": 0.9,
+          "roi_pct": 0.331,
+          "net_pnl": 110.16
+        },
+        "B": {
+          "bets": 24,
+          "wins": 20,
+          "win_rate": 0.8333,
+          "roi_pct": 0.3381,
+          "net_pnl": 174.34
+        }
+      }
+    }
+  }
+}

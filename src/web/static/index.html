@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DKeX Quant — NFL &amp; NBA Pre-Game + Live In-Play Model</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-brand">
+      <span class="brand-badge">DKeX QUANT</span>
+      <div>
+        <div class="title-row">
+          <h1>DraftKings Predictions Model</h1>
+          <span id="odds-api-pill" class="api-pill">Checking Feeds...</span>
+        </div>
+        <p class="subtitle">NFL &amp; NBA Calibrated Ensemble • Pre-Game &amp; Live In-Play Contracts ($0.01–$0.99)</p>
+      </div>
+    </div>
+    <div class="topbar-actions">
+      <div class="bankroll-box">
+        <label for="global-bankroll">Bankroll ($)</label>
+        <input id="global-bankroll" type="number" min="1" step="any" value="25.00">
+      </div>
+      <div class="fee-box">
+        <label for="global-fee">DKeX Fee / Contract</label>
+        <select id="global-fee">
+          <option value="0.015" selected>1.5¢ Standard</option>
+          <option value="0.01">1.0¢ Base Tier</option>
+          <option value="0.02">2.0¢ High Tier</option>
+          <option value="0.0">0.0¢ Promo Dollars</option>
+        </select>
+      </div>
+      <button type="button" id="refresh-live-btn" class="btn btn-primary">Refresh Live Lines</button>
+      <button type="button" id="sync-btn" class="btn btn-secondary">Full Sync &amp; Retrain</button>
+    </div>
+  </header>
+
+  <section class="kpi-strip" aria-label="Portfolio and slate summary">
+    <div class="kpi-card">
+      <span class="kpi-label">Active Bankroll</span>
+      <strong id="kpi-bankroll" class="kpi-value">—</strong>
+      <span id="kpi-pnl" class="kpi-meta">Realized P&amp;L: $0.00</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">A+ / A Lock Contracts</span>
+      <strong id="kpi-locks" class="kpi-value">0</strong>
+      <span id="kpi-total-picks" class="kpi-meta">0 qualifying plays</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">Tracked Hit Rate</span>
+      <strong id="kpi-hitrate" class="kpi-value">—</strong>
+      <span id="kpi-exp-hitrate" class="kpi-meta">Log trades to track</span>
+    </div>
+    <div class="kpi-card">
+      <span class="kpi-label">Tracked Net ROI</span>
+      <strong id="kpi-roi" class="kpi-value">0.0%</strong>
+      <span id="kpi-exposure" class="kpi-meta">Open Exposure: $0.00</span>
+    </div>
+  </section>
+
+  <main class="container">
+    <div class="tabs-shell">
+      <div class="tablist" role="tablist" focusgroup="tablist nomemory" aria-label="Model workspace sections">
+        <button type="button" role="tab" id="tab-picks" aria-selected="true" focusgroupstart>Pre-Game &amp; Live Picks</button>
+        <button type="button" role="tab" id="tab-calculator" aria-selected="false">Live DK Contract Analyzer</button>
+        <button type="button" role="tab" id="tab-ledger" aria-selected="false">Trade Ledger &amp; Live Cash-Out</button>
+        <button type="button" role="tab" id="tab-backtest" aria-selected="false">Walk-Forward Calibration</button>
+        <button type="button" role="tab" id="tab-guide" aria-selected="false">Betting &amp; Execution Guide</button>
+      </div>
+
+      <div id="status-banner" class="status-banner" hidden></div>
+
+      <!-- PANEL 1: DAILY & LIVE IN-PLAY PICKS -->
+      <div role="tabpanel" id="panel-picks" aria-labelledby="tab-picks">
+        <div class="panel-inner">
+          <form id="filters-form" class="filters-bar">
+            <div class="filter-group">
+              <label for="filter-mode">Slate Mode</label>
+              <select id="filter-mode">
+                <option value="all" selected>All Active (Pre-Game + Live)</option>
+                <option value="live">Live In-Play Only</option>
+                <option value="pregame">Pre-Game Only</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="filter-sport">League</label>
+              <select id="filter-sport">
+                <option value="all" selected>NFL + NBA</option>
+                <option value="nfl">NFL Only</option>
+                <option value="nba">NBA Only</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="filter-market">Market Type</label>
+              <select id="filter-market">
+                <option value="all" selected>Game Markets + Player Props</option>
+                <option value="game">Game Markets (ML, Spread, Total)</option>
+                <option value="props">Player Props Only</option>
+              </select>
+            </div>
+            <div class="filter-group">
+              <label for="filter-min-prob">Min Win Prob (<span id="min-prob-val">60%</span>)</label>
+              <input id="filter-min-prob" type="range" min="52" max="78" step="1" value="60">
+            </div>
+            <div class="filter-group">
+              <label for="filter-min-edge">Min Fee-Adj Edge (<span id="min-edge-val">+2.5%</span>)</label>
+              <input id="filter-min-edge" type="range" min="0" max="8" step="0.5" value="2.5">
+            </div>
+            <div class="filter-group checkbox-group">
+              <label for="filter-show-all" class="checkbox-label">
+                <input id="filter-show-all" type="checkbox" class="visually-hidden">
+                <span>Show PASS markets</span>
+              </label>
+            </div>
+            <div class="filter-group checkbox-group">
+              <label for="auto-refresh-live" class="checkbox-label">
+                <input id="auto-refresh-live" type="checkbox" class="visually-hidden">
+                <span>Auto-Refresh Live (60s)</span>
+              </label>
+            </div>
+          </form>
+
+          <div id="picks-grid" class="picks-grid" aria-live="polite"></div>
+        </div>
+      </div>
+
+      <!-- PANEL 2: STANDALONE CONTRACT CALCULATOR -->
+      <div role="tabpanel" id="panel-calculator" aria-labelledby="tab-calculator" hidden>
+        <div class="panel-inner">
+          <div class="calc-layout">
+            <div class="card">
+              <h2>Custom DKeX Contract &amp; Mid-Game Exit Analyzer</h2>
+              <p class="muted">Enter any DraftKings Predictions binary contract price (1¢–99¢) and model/estimated win probability to verify fee-adjusted EV, Quarter-Kelly contract quantity, and mid-game take-profit level.</p>
+              <form id="custom-calc-form" class="calc-form">
+                <div class="form-row">
+                  <label for="calc-side">Contract Side</label>
+                  <select id="calc-side">
+                    <option value="YES" selected>YES Contract</option>
+                    <option value="NO">NO Contract</option>
+                  </select>
+                </div>
+                <div class="form-row">
+                  <label for="calc-prob">Estimated True Win % (for YES)</label>
+                  <input id="calc-prob" type="number" min="1" max="99" step="0.5" value="68.5" required>
+                </div>
+                <div class="form-row">
+                  <label for="calc-price">DK Ask Price (¢, 1–99)</label>
+                  <input id="calc-price" type="number" min="1" max="99" step="0.5" value="60" required>
+                </div>
+                <div class="form-row">
+                  <label for="calc-is-live" class="checkbox-label">
+                    <input id="calc-is-live" type="checkbox" class="visually-hidden">
+                    <span>In-Play Live Market (apply live Kelly &amp; latency haircut)</span>
+                  </label>
+                </div>
+                <button type="submit" class="btn btn-primary">Analyze Contract</button>
+              </form>
+            </div>
+
+            <div id="calc-result-card" class="card calc-result">
+              <h3>Contract Valuation Output</h3>
+              <div id="calc-output-body" class="calc-metrics-grid"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- PANEL 3: LEDGER -->
+      <div role="tabpanel" id="panel-ledger" aria-labelledby="tab-ledger" hidden>
+        <div class="panel-inner">
+          <div class="section-header">
+            <div>
+              <h2 id="ledger-table-caption">DraftKings Predictions Trade Ledger &amp; Live Position Monitor</h2>
+              <p class="muted">Track entry ¢, itemized fees, live Hold-vs-Cash-Out guidance, Closing Line Value (CLV), and $1.00 settlements.</p>
+            </div>
+          </div>
+
+          <div tabindex="0" role="region" aria-labelledby="ledger-table-caption" class="table-wrapper">
+            <table class="data-table ledger-table">
+              <thead>
+                <tr>
+                  <th scope="col">Contract</th>
+                  <th scope="col">League</th>
+                  <th scope="col">Side</th>
+                  <th scope="col">Qty @ Entry</th>
+                  <th scope="col">All-In Cost</th>
+                  <th scope="col">Model / Live Win %</th>
+                  <th scope="col">Live Guidance / Fair Exit</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Net P&amp;L</th>
+                  <th scope="col">Actions</th>
+                </tr>
+              </thead>
+              <tbody id="ledger-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- PANEL 4: BACKTEST & CALIBRATION -->
+      <div role="tabpanel" id="panel-backtest" aria-labelledby="tab-backtest" hidden>
+        <div class="panel-inner">
+          <h2>Out-of-Sample Walk-Forward Validation</h2>
+          <p class="muted">Chronological expanding-window evaluation with zero lookahead bias and $0.015/contract fee deduction.</p>
+          <div id="backtest-container" class="backtest-grid"></div>
+        </div>
+      </div>
+
+      <!-- PANEL 5: BETTING GUIDE -->
+      <div role="tabpanel" id="panel-guide" aria-labelledby="tab-guide" hidden>
+        <div class="panel-inner">
+          <article id="guide-content" class="guide-prose"></article>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Light-Dismiss Modal Dialog for Settling / Mid-Game Selling Trades -->
+  <dialog id="settle-dialog" closedby="any" aria-labelledby="settle-dialog-title">
+    <form id="settle-form" class="dialog-body">
+      <div class="dialog-header">
+        <h2 id="settle-dialog-title">Update / Settle DKeX Position</h2>
+        <button type="button" id="close-dialog-btn" class="icon-btn" aria-label="Close dialog">&times;</button>
+      </div>
+      <input type="hidden" id="settle-trade-id">
+      <p id="settle-trade-summary" class="muted"></p>
+
+      <div class="form-row">
+        <label for="settle-status">Resolution Type</label>
+        <select id="settle-status">
+          <option value="WON">Settled WON ($1.00 / contract, $0 exit fee)</option>
+          <option value="LOST">Settled LOST ($0.00 / contract)</option>
+          <option value="SOLD">Sold Early Mid-Game / Pre-Game</option>
+        </select>
+      </div>
+
+      <div id="sold-fields" class="sold-fields" hidden>
+        <div class="form-row">
+          <label for="settle-sell-price">Sale Price (¢, 1–99)</label>
+          <input id="settle-sell-price" type="number" min="1" max="99" step="0.5" value="75">
+        </div>
+        <div class="form-row">
+          <label for="settle-sell-fee">Exit Fee per Contract (¢)</label>
+          <input id="settle-sell-fee" type="number" min="0" max="5" step="0.5" value="1.5">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <label for="settle-closing-price">Closing Pre-Game Price (¢, optional for CLV)</label>
+        <input id="settle-closing-price" type="number" min="1" max="99" step="0.5" placeholder="e.g. 66">
+      </div>
+
+      <div class="dialog-actions">
+        <button type="button" id="cancel-dialog-btn" class="btn btn-secondary">Cancel</button>
+        <button type="submit" id="save-settle-btn" class="btn btn-primary">Save Settlement</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/static/app.js" type="module"></script>
+</body>
+</html>
