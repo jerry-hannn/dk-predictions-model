@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -180,7 +181,7 @@ class ESPNClient:
     ) -> list[dict[str, Any]]:
         """
         Fetch upcoming & live in-progress games for NFL or NBA with live scores, clocks,
-        play-by-play win probabilities, and embedded DraftKings odds.
+        play-by-play win probabilities, and embedded DraftKings odds across upcoming slates.
         """
         sport_u = sport.upper()
         sp, lg = SPORT_PATHS[sport_u]
@@ -188,15 +189,16 @@ class ESPNClient:
         dates_to_check: list[str | None]
         if sport_u == "NFL" and target_date is None:
             dates_to_check = [None]
+        elif target_date:
+            dt = datetime.strptime(target_date, "%Y-%m-%d")
+            dates_to_check = [dt.strftime("%Y%m%d")]
         else:
-            dt = (
-                datetime.strptime(target_date, "%Y-%m-%d")
-                if target_date
-                else datetime.now()
-            )
-            d0 = dt.strftime("%Y%m%d")
-            d1 = (dt + timedelta(days=1)).strftime("%Y%m%d")
-            dates_to_check = [d0, d1] if target_date is None else [d0]
+            # Anchor to US Eastern sports day (-4h so late West Coast games stay on tonight's slate)
+            now_sports = datetime.now(ZoneInfo("America/New_York")) - timedelta(hours=4)
+            dates_to_check = [
+                (now_sports + timedelta(days=offset)).strftime("%Y%m%d")
+                for offset in (0, 1, 2)
+            ]
 
         normalized_events: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -240,12 +242,6 @@ class ESPNClient:
                 if parsed is not None:
                     seen_ids.add(ev_id)
                     normalized_events.append(parsed)
-
-            active_today = [
-                e for e in normalized_events if e["state"] in ("PRE", "IN")
-            ]
-            if sport_u == "NBA" and len(active_today) >= 3:
-                break
 
         return normalized_events
 

@@ -8,6 +8,8 @@ const state = {
   ledgerFilter: 'ALL',
   searchQuery: '',
   picks: [],
+  totalCandidates: 0,
+  gamesCount: 0,
   trades: [],
   lastCalcEval: null,
   backtestLoaded: false,
@@ -476,6 +478,56 @@ document.getElementById('filter-min-edge').addEventListener('input', (e) => {
 });
 document.getElementById('auto-refresh-live').addEventListener('change', syncAutoRefreshTimer);
 
+document.getElementById('quick-toggle-pass-btn').addEventListener('click', () => {
+  const cb = document.getElementById('filter-show-all');
+  cb.checked = !cb.checked;
+  loadPicks();
+});
+
+function formatEventStart(startTimeIso, statusDetail) {
+  if (startTimeIso) {
+    const dt = new Date(startTimeIso);
+    if (!Number.isNaN(dt.getTime())) {
+      const now = new Date();
+      const startDay = new Date(dt.getFullYear(), dt.getMonth(), dt.getDate());
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const diffDays = Math.round((startDay - today) / 86400000);
+      const timeStr = dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      if (diffDays === 0) return `Today ${timeStr}`;
+      if (diffDays === 1) return `Tomorrow ${timeStr}`;
+      const dateStr = dt.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+      return `${dateStr} · ${timeStr}`;
+    }
+  }
+  return statusDetail || '';
+}
+
+function updateSlateMetaBar() {
+  const bar = document.getElementById('slate-meta-bar');
+  const txt = document.getElementById('slate-meta-text');
+  const btn = document.getElementById('quick-toggle-pass-btn');
+  const showAll = document.getElementById('filter-show-all').checked;
+
+  if (!state.totalCandidates && !state.picks.length) {
+    bar.hidden = true;
+    return;
+  }
+
+  bar.hidden = false;
+  const gamesWord = state.gamesCount === 1 ? 'game' : 'games';
+  if (showAll) {
+    const actionCount = state.picks.filter((p) => p.confidence_tier !== 'PASS').length;
+    txt.textContent = `Showing all ${state.picks.length} priced lines (${actionCount} conviction) across ${state.gamesCount} upcoming ${gamesWord}`;
+    btn.textContent = 'Hide PASS lines';
+    btn.hidden = false;
+  } else {
+    const pickWord = state.picks.length === 1 ? 'play' : 'plays';
+    txt.textContent = `Showing ${state.picks.length} conviction ${pickWord} of ${state.totalCandidates} priced lines across ${state.gamesCount} upcoming ${gamesWord}`;
+    btn.textContent = `Show all ${state.totalCandidates} lines`;
+    btn.hidden = state.totalCandidates <= state.picks.length;
+  }
+}
+
 // --- Load & Render Markets ---
 async function loadPicks() {
   const minProb = parseFloat(document.getElementById('filter-min-prob').value) / 100;
@@ -507,10 +559,13 @@ async function loadPicks() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     state.picks = data.picks || [];
+    state.totalCandidates = Number(data.total_candidates ?? state.picks.length);
+    state.gamesCount = Number(data.games_count ?? 0);
     if (data.odds_quota) {
       updateOddsApiPill(Boolean(data.odds_api_connected), undefined, data.odds_quota);
     }
     updateKPIs(data.ledger_summary, state.picks);
+    updateSlateMetaBar();
     renderPicks();
   } catch (err) {
     if (err.message !== 'Authentication required') {
@@ -538,6 +593,7 @@ function buildPickCardInnerHtml(p, idx) {
   const liveBadge = isLive
     ? `<span class="live-indicator"><span class="live-dot"></span>LIVE ${escapeHtml(p.status_detail || '')}${p.score_display ? ` · ${escapeHtml(p.score_display)}` : ''}</span>`
     : '';
+  const startLabel = !isLive ? formatEventStart(p.start_time, p.status_detail) : '';
 
   const drivers = p.drivers || [];
   const primaryDriver = drivers[0] ? `<p class="driver-primary">${escapeHtml(drivers[0])}</p>` : '';
@@ -576,7 +632,7 @@ function buildPickCardInnerHtml(p, idx) {
 
     <div>
       <h3 class="pick-title">${escapeHtml(p.selection_label)}</h3>
-      <p class="pick-subtitle">${escapeHtml(p.short_name || p.event_name)} · ${escapeHtml(p.line_source || 'ESPN/DK')}${formatAgeText(p.odds_age_seconds)}</p>
+      <p class="pick-subtitle">${escapeHtml(p.short_name || p.event_name)}${startLabel ? ` · ${escapeHtml(startLabel)}` : ''} · ${escapeHtml(p.line_source || 'ESPN/DK')}${formatAgeText(p.odds_age_seconds)}</p>
     </div>
 
     <div class="metrics-strip">
@@ -755,9 +811,10 @@ function renderPicks() {
         const isLive = p.game_state === 'LIVE';
         const edgeCls = p.net_edge >= 0 ? 'positive' : 'negative';
         const edgeSign = p.net_edge >= 0 ? '+' : '';
+        const startTxt = !isLive ? formatEventStart(p.start_time, p.status_detail) : '';
         const stateLabel = isLive
           ? `<span class="live-indicator"><span class="live-dot"></span>${escapeHtml(p.score_display || p.status_detail || 'LIVE')}</span>`
-          : escapeHtml(p.short_name || p.event_name);
+          : `${escapeHtml(p.short_name || p.event_name)}${startTxt ? ` <span class="muted">· ${escapeHtml(startTxt)}</span>` : ''}`;
         const qty = Math.max(1, p.recommended_contracts || 1);
         return `
           <tr>

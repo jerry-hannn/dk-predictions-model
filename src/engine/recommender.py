@@ -271,10 +271,8 @@ class ModelHub:
                 return pre
 
         active = [e for e in events if e.get("state") in ("PRE", "IN")]
-        if active:
+        if active or events:
             return active
-        if events and mode_l == "all":
-            return events[:6]
 
         # Offline fallback slate (only when completely offline in 'all'/'pregame' mode)
         if sport_u == "NFL":

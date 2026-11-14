@@ -252,7 +252,7 @@ def get_picks(
 ) -> dict[str, Any]:
     hub = _get_hub()
     eff_bankroll = bankroll if bankroll is not None else hub.settings.bankroll
-    picks = hub.generate_picks(
+    all_candidates = hub.generate_picks(
         sport=sport,
         market_filter=market,
         mode=mode,
@@ -261,14 +261,21 @@ def get_picks(
         min_net_edge=min_edge,
         fee_per_contract=fee,
         bankroll=eff_bankroll,
-        include_passes=include_passes,
+        include_passes=True,
         fresh=fresh,
         live_props=live_props,
+    )
+    picks = (
+        all_candidates
+        if include_passes
+        else [c for c in all_candidates if c["confidence_tier"] != "PASS"]
     )
     ledger = hub.db.ledger_summary(starting_bankroll=eff_bankroll)
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(picks),
+        "total_candidates": len(all_candidates),
+        "games_count": len({c["event_id"] for c in all_candidates}),
         "live_count": sum(1 for p in picks if p.get("game_state") == "LIVE"),
         "high_confidence_count": sum(1 for p in picks if p["confidence_tier"] in ("A+", "A")),
         "odds_api_connected": bool(hub.settings.the_odds_api_key),
