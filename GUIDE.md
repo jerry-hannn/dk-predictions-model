@@ -16,9 +16,9 @@ Everything runs directly inside the web interface (`dkmodel` locally or your hos
 2. **Scan Markets (`Markets` tab)**:
    - Filter instantaneously by **All / Live / Pre-Game**, **NFL / NBA**, **Games / Props**, or search any team/player.
    - Switch between **Cards** and dense **Table** views.
-   - Click **Refresh** (~1–2s) to pull live ESPN scoreboards, active player box scores, injury reports, and sharp sportsbook lines, or enable **Auto-refresh (60s)** inside `Filters` (automatically pauses when the browser tab is backgrounded).
-3. **Verify Exact Ask `¢` Before Buying**:
-   - Every market card includes an inline **`YES/NO` + `¢`** input box. Type the exact live offer shown on your DraftKings app to re-compute post-fee edge and Quarter-Kelly contract quantity on the spot, or open the **Analyzer** tab for standalone calculations.
+   - Click **Refresh** (~1–2s) to pull live ESPN scoreboards, active player box scores, injury reports, DraftKings game & player prop lines (zero API key required via ESPN/DraftKings feeds, plus optional multi-book consensus via The Odds API), or enable **Auto-refresh (60s)** inside `Filters`.
+3. **Configure Exact DK Line (`Ln`) & Ask (`¢`) Before Buying**:
+   - Every Spread, Total, and Player Prop card includes an inline **`Ln`** input alongside **`YES/NO` + `¢`**. If DraftKings Predictions offers an alternate or shifted number (e.g., `20.5` PRA instead of `19.5`), type `20.5` right on the card—true win probability, market prior, `Max Buy`, `Net Edge`, and Quarter-Kelly sizing recalculate immediately and persist in SQLite until you click **`↺`** to reset to the synced line.
 4. **Track Open Positions & Cash-Outs (`Ledger` tab)**:
    - Click **Log** on any market card (or **+ Log Position** in the Ledger) to record your entry price and itemized contract fee.
    - During live games, open positions automatically display live win probability shifts and **`HOLD TO $1.00`** vs **`CONSIDER CASH OUT`** guidance.

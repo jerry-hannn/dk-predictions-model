@@ -77,6 +77,14 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS line_overrides (
+    override_key TEXT PRIMARY KEY,
+    line_value REAL NOT NULL,
+    contract_price REAL,
+    side TEXT,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -87,7 +95,7 @@ class Database:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -152,6 +160,68 @@ class Database:
                 (key, json.dumps(payload), now + ttl_seconds, now),
             )
 
+    # --- Custom Line Override helpers ---
+    def get_line_overrides(self, max_age_seconds: float = 86400.0) -> dict[str, dict[str, Any]]:
+        cutoff = time.time() - max_age_seconds
+        with self._connect() as conn:
+            conn.execute("DELETE FROM line_overrides WHERE updated_at < ?", (cutoff,))
+            rows = conn.execute(
+                "SELECT override_key, line_value, contract_price, side, updated_at FROM line_overrides"
+            ).fetchall()
+        return {
+            str(r["override_key"]): {
+                "override_key": str(r["override_key"]),
+                "line_value": float(r["line_value"]),
+                "contract_price": float(r["contract_price"]) if r["contract_price"] is not None else None,
+                "side": str(r["side"]) if r["side"] is not None else None,
+                "updated_at": float(r["updated_at"]),
+            }
+            for r in rows
+        }
+
+    def set_line_override(
+        self,
+        override_key: str,
+        line_value: float,
+        contract_price: float | None = None,
+        side: str | None = None,
+    ) -> dict[str, Any]:
+        now = time.time()
+        norm_side = side.upper() if side and side.upper() in ("YES", "NO") else None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO line_overrides (override_key, line_value, contract_price, side, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(override_key) DO UPDATE SET
+                    line_value = excluded.line_value,
+                    contract_price = excluded.contract_price,
+                    side = excluded.side,
+                    updated_at = excluded.updated_at
+                """,
+                (str(override_key), float(line_value), contract_price, norm_side, now),
+            )
+        return {
+            "override_key": str(override_key),
+            "line_value": float(line_value),
+            "contract_price": contract_price,
+            "side": norm_side,
+            "updated_at": now,
+        }
+
+    def delete_line_override(self, override_key: str) -> bool:
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM line_overrides WHERE override_key = ?",
+                (str(override_key),),
+            )
+            return cur.rowcount > 0
+
+    def clear_line_overrides(self) -> int:
+        with self._connect() as conn:
+            cur = conn.execute("DELETE FROM line_overrides")
+            return int(cur.rowcount or 0)
+
     # --- Predictions Snapshot ---
     def save_predictions(self, picks: list[dict[str, Any]]) -> None:
         now = time.time()
@@ -172,6 +242,9 @@ class Database:
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
                     )
                     ON CONFLICT(pick_id) DO UPDATE SET
+                        selection_label = excluded.selection_label,
+                        line_value = excluded.line_value,
+                        recommended_side = excluded.recommended_side,
                         contract_price = excluded.contract_price,
                         fee_per_contract = excluded.fee_per_contract,
                         model_prob = excluded.model_prob,

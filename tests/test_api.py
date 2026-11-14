@@ -139,6 +139,78 @@ def test_api_endpoints_and_ledger_lifecycle(tmp_path: Path, monkeypatch) -> None
     assert r_train.status_code == 200
     assert "nba_game" in r_train.json()["trained"]
 
+    # 7. Configurable line overrides lifecycle (Prop + Spread -> Persist -> Reset -> Clear)
+    all_picks = client.get("/api/picks?sport=all&include_passes=true").json()["picks"]
+    prop_pick = next(p for p in all_picks if p.get("override_key") and ":prop:" in p["override_key"])
+    orig_line = float(prop_pick["line_value"])
+    shifted_line = orig_line + 2.0
+
+    r_ov = client.post(
+        "/api/line-override",
+        json={
+            "override_key": prop_pick["override_key"],
+            "sport": prop_pick["sport"],
+            "event_id": str(prop_pick["event_id"]),
+            "pick_id": prop_pick["pick_id"],
+            "line_value": shifted_line,
+            "side": "NO",
+            "contract_price": 0.51,
+            "fee_per_contract": 0.015,
+            "bankroll": 35.50,
+        },
+    )
+    assert r_ov.status_code == 200
+    ov_pick = r_ov.json()["pick"]
+    assert ov_pick["line_value"] == shifted_line
+    assert ov_pick["default_line_value"] == orig_line
+    assert ov_pick["is_custom_line"] is True
+    assert ov_pick["recommended_side"] == "NO"
+    assert abs(ov_pick["contract_price"] - 0.51) < 1e-4
+    assert f"Under {shifted_line:.1f}" in ov_pick["selection_label"]
+    assert ov_pick["yes_true_prob"] < prop_pick["yes_true_prob"]
+
+    # Verify override persists across GET /api/picks and /api/config
+    assert client.get("/api/config").json()["line_overrides_count"] == 1
+    refetched = client.get("/api/picks?sport=all&include_passes=true").json()["picks"]
+    persisted_pick = next(p for p in refetched if p.get("override_key") == prop_pick["override_key"])
+    assert persisted_pick["line_value"] == shifted_line
+    assert persisted_pick["is_custom_line"] is True
+
+    # Reset single card back to synced default line
+    r_reset = client.post(
+        "/api/line-override",
+        json={
+            "override_key": prop_pick["override_key"],
+            "sport": prop_pick["sport"],
+            "event_id": str(prop_pick["event_id"]),
+            "pick_id": prop_pick["pick_id"],
+            "reset": True,
+        },
+    )
+    assert r_reset.status_code == 200
+    reset_pick = r_reset.json()["pick"]
+    assert reset_pick["line_value"] == orig_line
+    assert reset_pick["is_custom_line"] is False
+    assert client.get("/api/config").json()["line_overrides_count"] == 0
+
+    # Spread override + bulk DELETE /api/line-overrides
+    spread_pick = next(p for p in all_picks if str(p.get("override_key") or "").endswith(":spread"))
+    r_sp = client.post(
+        "/api/line-override",
+        json={
+            "override_key": spread_pick["override_key"],
+            "sport": spread_pick["sport"],
+            "event_id": str(spread_pick["event_id"]),
+            "pick_id": spread_pick["pick_id"],
+            "line_value": float(spread_pick["line_value"]) - 3.0,
+        },
+    )
+    assert r_sp.status_code == 200
+    assert r_sp.json()["pick"]["is_custom_line"] is True
+    r_del_all = client.delete("/api/line-overrides")
+    assert r_del_all.status_code == 200
+    assert r_del_all.json()["cleared"] == 1
+
 
 def test_remote_passcode_auth_and_data_dir_persistence(tmp_path: Path, monkeypatch) -> None:
     data_dir = tmp_path / "remote_volume"

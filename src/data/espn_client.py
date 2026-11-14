@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-import httpx
-
-from src.data.odds_client import devig_american_pair
+from src.data.odds_client import devig_american_pair, http_get
+from src.engine.dk_math import normalize_player_name
 from src.storage.db import Database
 
 HEADERS = {
@@ -23,6 +23,22 @@ HEADERS = {
 SPORT_PATHS = {
     "NFL": ("football", "nfl"),
     "NBA": ("basketball", "nba"),
+}
+
+ESPN_PROP_TYPE_MAP_NBA = {
+    "1": "points",
+    "2": "assists",
+    "3": "rebounds",
+    "4": "fg3m",
+    "90": "pra",
+}
+
+ESPN_PROP_TYPE_MAP_NFL = {
+    "8": "passing_yards",
+    "10": "passing_tds",
+    "12": "rushing_yards",
+    "13": "receiving_yards",
+    "14": "receptions",
 }
 
 TEAM_NAME_TO_ABBR = {
@@ -210,10 +226,8 @@ class ESPNClient:
                 url = f"{self.SITE_BASE}/{sp}/{lg}/scoreboard"
                 params = {"dates": d_param} if d_param else {}
                 try:
-                    with httpx.Client(timeout=10.0, headers=HEADERS) as client:
-                        resp = client.get(url, params=params)
-                        resp.raise_for_status()
-                        payload = resp.json()
+                    resp = http_get(url, params=params, headers=HEADERS, timeout=10.0)
+                    payload = resp.json()
                     has_live = any(
                         str(
                             ev.get("competitions", [{}])[0]
@@ -262,10 +276,8 @@ class ESPNClient:
 
         url = f"{self.SITE_BASE}/{sp}/{lg}/summary"
         try:
-            with httpx.Client(timeout=8.5, headers=HEADERS) as client:
-                resp = client.get(url, params={"event": event_id})
-                resp.raise_for_status()
-                raw = resp.json()
+            resp = http_get(url, params={"event": event_id}, headers=HEADERS, timeout=8.5)
+            raw = resp.json()
         except Exception:
             stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
             return stale or {"players": {}, "live_win_prob": None, "market": {}}
@@ -309,7 +321,7 @@ class ESPNClient:
                         fg3m, _ = (0.0, 0.0) if dnp else _parse_made_attempted(_get_stat("3PT"))
                         fouls = 0.0 if dnp else (_parse_line_number(_get_stat("PF")) or 0.0)
 
-                        players_map[pname.lower()] = {
+                        entry_obj = {
                             "player_name": pname,
                             "team": team_abbr,
                             "starter": bool(ath_row.get("starter", False)),
@@ -324,6 +336,10 @@ class ESPNClient:
                             "pra": pts + reb + ast,
                             "fouls": fouls,
                         }
+                        players_map[pname.lower()] = entry_obj
+                        norm_nm = normalize_player_name(pname)
+                        if norm_nm:
+                            players_map.setdefault(norm_nm, entry_obj)
             else:
                 # NFL categories: passing, rushing, receiving
                 for stat_group in team_entry.get("statistics", []) or []:
@@ -355,6 +371,9 @@ class ESPNClient:
                                 "receptions": 0.0,
                             },
                         )
+                        norm_nm = normalize_player_name(pname)
+                        if norm_nm:
+                            players_map.setdefault(norm_nm, entry)
 
                         def _nfl_val(lbl: str, _s: list[Any] = stats, _m: dict[str, int] = idx_map) -> str:
                             idx = _m.get(lbl)
@@ -420,10 +439,8 @@ class ESPNClient:
         url = f"{self.SITE_BASE}/{sp}/{lg}/injuries"
         injuries_by_team: dict[str, list[dict[str, Any]]] = {}
         try:
-            with httpx.Client(timeout=10.0, headers=HEADERS) as client:
-                resp = client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
+            resp = http_get(url, headers=HEADERS, timeout=10.0)
+            data = resp.json()
 
             for team_block in data.get("injuries", []):
                 team_info = team_block.get("team", {})
@@ -459,6 +476,325 @@ class ESPNClient:
             stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
             return stale or {}
         return injuries_by_team
+
+    def fetch_team_roster(
+        self, sport: str, team_id: str, force_refresh: bool = False
+    ) -> dict[str, str]:
+        """
+        Fetch ESPN team roster mapping `{athlete_id: displayName}` for NBA (flat list) or NFL (grouped).
+        Cached for 12 hours.
+        """
+        tid = str(team_id or "").strip()
+        if not tid or not tid.isdigit():
+            return {}
+        sport_u = sport.upper()
+        sp, lg = SPORT_PATHS[sport_u]
+        cache_key = f"espn:roster:{sport_u}:{tid}"
+        if not force_refresh:
+            cached = self.db.get_cache(cache_key)
+            if cached is not None:
+                return cached
+
+        url = f"{self.SITE_BASE}/{sp}/{lg}/teams/{tid}/roster"
+        roster: dict[str, str] = {}
+        try:
+            resp = http_get(url, headers=HEADERS, timeout=8.5)
+            data = resp.json()
+            for entry in data.get("athletes") or []:
+                if not isinstance(entry, dict):
+                    continue
+                sub_items = entry.get("items")
+                ath_list = sub_items if isinstance(sub_items, list) else [entry]
+                for ath in ath_list:
+                    if not isinstance(ath, dict):
+                        continue
+                    aid = str(ath.get("id", "")).strip()
+                    dname = str(ath.get("displayName") or ath.get("fullName") or "").strip()
+                    if aid and dname:
+                        roster[aid] = dname
+            if roster:
+                self.db.set_cache(cache_key, roster, ttl_seconds=43200)
+        except Exception:
+            stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
+            return stale or {}
+        return roster
+
+    def fetch_athlete_name(self, sport: str, athlete_id: str) -> str:
+        """Single-athlete lookup fallback for recently traded players not yet on cached team roster."""
+        aid = str(athlete_id or "").strip()
+        if not aid or not aid.isdigit():
+            return ""
+        sport_u = sport.upper()
+        sp, lg = SPORT_PATHS[sport_u]
+        cache_key = f"espn:athlete:{sport_u}:{aid}"
+        cached = self.db.get_cache(cache_key)
+        if isinstance(cached, str) and cached:
+            return cached
+
+        url = f"{self.CORE_BASE}/{sp}/leagues/{lg}/athletes/{aid}"
+        try:
+            resp = http_get(url, headers=HEADERS, timeout=6.0)
+            data = resp.json()
+            name = str(data.get("displayName") or data.get("fullName") or "").strip()
+            if name:
+                self.db.set_cache(cache_key, name, ttl_seconds=86400 * 7)
+            return name
+        except Exception:
+            return ""
+
+    @staticmethod
+    def extract_espn_prop_lines(
+        sport: str,
+        items: list[dict[str, Any]],
+        athlete_names: dict[str, str],
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """
+        Parse ESPN Core API DraftKings (`odds/100/propBets`) items into `(player_key, stat_col)` dicts.
+        Each `(athlete_id, col, line)` group emits Over first and Under second in feed order.
+        """
+        prop_map = (
+            ESPN_PROP_TYPE_MAP_NBA if sport.upper() == "NBA" else ESPN_PROP_TYPE_MAP_NFL
+        )
+        grouped: dict[tuple[str, str, float], list[float | None]] = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            type_obj = item.get("type") or {}
+            type_id = str(type_obj.get("id", "")).strip()
+            col = prop_map.get(type_id)
+            if not col:
+                tname = str(type_obj.get("name", "")).strip().lower()
+                if sport.upper() == "NBA":
+                    if tname in ("total points, rebounds, and assists", "points + rebounds + assists"):
+                        col = "pra"
+                    elif tname == "total points":
+                        col = "points"
+                    elif tname == "total rebounds":
+                        col = "rebounds"
+                    elif tname == "total assists":
+                        col = "assists"
+                    elif "3-point" in tname or "three point" in tname:
+                        col = "fg3m"
+                else:
+                    if tname == "total passing yards":
+                        col = "passing_yards"
+                    elif tname == "total passing touchdowns":
+                        col = "passing_tds"
+                    elif tname == "total rushing yards":
+                        col = "rushing_yards"
+                    elif tname == "total receiving yards":
+                        col = "receiving_yards"
+                    elif tname == "total receptions":
+                        col = "receptions"
+            if not col:
+                continue
+            ath_obj = item.get("athlete") or {}
+            aid = str(ath_obj.get("id", "")).strip()
+            if not aid:
+                ref = str(ath_obj.get("$ref", ""))
+                m = re.search(r"/athletes/(\d+)", ref)
+                if m:
+                    aid = m.group(1)
+            if not aid:
+                continue
+
+            cur_target = ((item.get("current") or {}).get("target") or {}).get("value")
+            odds_obj = item.get("odds") or {}
+            tot_field = odds_obj.get("total")
+            tot_val = tot_field.get("value") if isinstance(tot_field, dict) else tot_field
+            line_val = _parse_line_number(cur_target if cur_target is not None else tot_val)
+            if line_val is None or line_val <= 0.0:
+                continue
+
+            am_field = odds_obj.get("american")
+            am_raw = am_field.get("value") if isinstance(am_field, dict) else am_field
+            am_px = _parse_american_str(am_raw)
+            grouped.setdefault((aid, col, round(line_val, 2)), []).append(am_px)
+
+        best_by_player_col: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        for (aid, col, line_val), prices in grouped.items():
+            pname = athlete_names.get(aid, "").strip()
+            if not pname:
+                continue
+            over_prob: float | None = None
+            dk_over_prob: float | None = None
+            imbalance = 0.25
+            if len(prices) >= 2 and prices[0] is not None and prices[1] is not None:
+                po, _ = devig_american_pair(float(prices[0]), float(prices[1]))
+                over_prob = round(po, 4)
+                dk_over_prob = round(po, 4)
+                imbalance = abs(po - 0.50)
+
+            candidate = {
+                "line": line_val,
+                "over_prob": over_prob,
+                "dk_over_prob": dk_over_prob,
+                "source": "DraftKings",
+            }
+            existing = best_by_player_col.get((aid, col))
+            if existing is None or imbalance < existing[0]:
+                best_by_player_col[(aid, col)] = (imbalance, candidate)
+
+        out_props: dict[tuple[str, str], dict[str, Any]] = {}
+        for (aid, col), (_, val_obj) in best_by_player_col.items():
+            pname = athlete_names[aid].strip()
+            p_low = pname.lower()
+            out_props[(p_low, col)] = val_obj
+            norm_p = normalize_player_name(pname)
+            if norm_p:
+                out_props.setdefault((norm_p, col), val_obj)
+        return out_props
+
+    def fetch_event_player_props(
+        self,
+        sport: str,
+        event_id: str,
+        home_id: str = "",
+        away_id: str = "",
+        force_refresh: bool = False,
+        live_mode: bool = False,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """
+        Zero-key DraftKings player prop line & odds sync via ESPN Core API (`odds/100/propBets`).
+        """
+        eid = str(event_id or "").strip()
+        if not eid or not eid.isdigit():
+            return {}
+
+        sport_u = sport.upper()
+        sp, lg = SPORT_PATHS[sport_u]
+        cache_key = f"espn:props:{sport_u}:{eid}"
+        if not force_refresh:
+            cached = self.db.get_cache(cache_key)
+            if cached is not None:
+                out_cached: dict[tuple[str, str], dict[str, Any]] = {}
+                for k, v in cached.items():
+                    if "::" not in k:
+                        continue
+                    p_low, col = k.split("::", 1)
+                    out_cached[(p_low, col)] = v
+                    norm_p = normalize_player_name(p_low)
+                    if norm_p:
+                        out_cached.setdefault((norm_p, col), v)
+                return out_cached
+
+        url = f"{self.CORE_BASE}/{sp}/leagues/{lg}/events/{eid}/competitions/{eid}/odds/100/propBets"
+        all_items: list[dict[str, Any]] = []
+        try:
+            resp = http_get(
+                url,
+                params={"lang": "en", "region": "us", "limit": 1000, "page": 1},
+                headers=HEADERS,
+                timeout=8.5,
+                raise_for_status=False,
+            )
+            if resp.status_code == 404:
+                self.db.set_cache(cache_key, {}, ttl_seconds=90)
+                return {}
+            resp.raise_for_status()
+            first_page = resp.json()
+            all_items.extend(first_page.get("items") or [])
+            page_count = int(first_page.get("pageCount", 1) or 1)
+            for p_idx in range(2, min(4, page_count + 1)):
+                p_resp = http_get(
+                    url,
+                    params={"lang": "en", "region": "us", "limit": 1000, "page": p_idx},
+                    headers=HEADERS,
+                    timeout=8.5,
+                )
+                all_items.extend(p_resp.json().get("items") or [])
+        except Exception:
+            stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
+            if stale:
+                return {
+                    (k.split("::", 1)[0], k.split("::", 1)[1]): v
+                    for k, v in stale.items()
+                    if "::" in k
+                }
+            return {}
+
+        if not all_items:
+            self.db.set_cache(cache_key, {}, ttl_seconds=90)
+            return {}
+
+        athlete_names: dict[str, str] = {}
+        if home_id:
+            athlete_names.update(self.fetch_team_roster(sport_u, home_id))
+        if away_id:
+            athlete_names.update(self.fetch_team_roster(sport_u, away_id))
+
+        prop_map = (
+            ESPN_PROP_TYPE_MAP_NBA if sport_u == "NBA" else ESPN_PROP_TYPE_MAP_NFL
+        )
+        missing_aids: list[str] = []
+        for item in all_items:
+            if not isinstance(item, dict):
+                continue
+            type_id = str((item.get("type") or {}).get("id", "")).strip()
+            if type_id not in prop_map:
+                continue
+            ref = str((item.get("athlete") or {}).get("$ref", ""))
+            m = re.search(r"/athletes/(\d+)", ref)
+            if m:
+                aid = m.group(1)
+                if aid not in athlete_names and aid not in missing_aids:
+                    missing_aids.append(aid)
+
+        for aid in missing_aids[:8]:
+            nm = self.fetch_athlete_name(sport_u, aid)
+            if nm:
+                athlete_names[aid] = nm
+
+        parsed = self.extract_espn_prop_lines(sport_u, all_items, athlete_names)
+        serializable = {f"{p_low}::{col}": val for (p_low, col), val in parsed.items()}
+        self.db.set_cache(cache_key, serializable, ttl_seconds=90 if live_mode else 300)
+        return parsed
+
+    def fetch_slate_player_props(
+        self,
+        sport: str,
+        events: list[dict[str, Any]],
+        force_refresh: bool = False,
+    ) -> dict[str, dict[tuple[str, str], dict[str, Any]]]:
+        """Concurrently sync zero-key DraftKings player props across all active slate events."""
+        sport_u = sport.upper()
+        valid_events = [
+            ev for ev in events if str(ev.get("event_id", "")).strip().isdigit()
+        ]
+        if not valid_events:
+            return {}
+
+        team_ids = sorted(
+            {
+                tid
+                for ev in valid_events
+                for tid in (str(ev.get("home_id", "")), str(ev.get("away_id", "")))
+                if tid.isdigit()
+            }
+        )
+        if team_ids:
+            with ThreadPoolExecutor(max_workers=min(8, len(team_ids))) as pool:
+                list(pool.map(lambda tid: self.fetch_team_roster(sport_u, tid), team_ids))
+
+        out: dict[str, dict[tuple[str, str], dict[str, Any]]] = {}
+
+        def _fetch_one(ev: dict[str, Any]) -> tuple[str, dict[tuple[str, str], dict[str, Any]]]:
+            eid = str(ev["event_id"])
+            props = self.fetch_event_player_props(
+                sport_u,
+                eid,
+                home_id=str(ev.get("home_id", "")),
+                away_id=str(ev.get("away_id", "")),
+                force_refresh=force_refresh,
+                live_mode=(ev.get("state") == "IN"),
+            )
+            return eid, props
+
+        with ThreadPoolExecutor(max_workers=min(8, len(valid_events))) as pool:
+            for eid, props in pool.map(_fetch_one, valid_events):
+                if props:
+                    out[eid] = props
+        return out
 
     def _parse_event(self, sport: str, ev: dict[str, Any]) -> dict[str, Any] | None:
         comps = ev.get("competitions", [])
@@ -571,6 +907,8 @@ class ESPNClient:
             "possession_team": possession_team,
             "is_red_zone": is_red_zone,
             "down_distance": down_distance,
+            "home_id": str(home_team.get("id", "")),
+            "away_id": str(away_team.get("id", "")),
             "home_abbr": home_abbr,
             "away_abbr": away_abbr,
             "home_name": home_team.get("displayName", home_abbr),

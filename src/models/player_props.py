@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import gamma, nbinom, poisson, t as student_t
 
-from src.engine.dk_math import clamp_prob
+from src.engine.dk_math import clamp_prob, normalize_player_name
 
 
 @dataclass
@@ -32,6 +32,44 @@ class PlayerPropProjection:
     market_over_prob: float | None = None
     dk_over_prob: float | None = None
     line_source: str = "Model Ref Line"
+    default_line_value: float | None = None
+    is_custom_line: bool = False
+
+
+def _lookup_player_prop(
+    mapping: dict[tuple[str, str], Any] | None,
+    pname: str,
+    col: str,
+) -> Any | None:
+    if not mapping:
+        return None
+    for key in (
+        (pname, col),
+        (pname.lower(), col),
+        (normalize_player_name(pname), col),
+    ):
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _has_any_player_prop(
+    mapping: dict[tuple[str, str], Any] | None,
+    pname: str,
+) -> bool:
+    if not mapping:
+        return False
+    candidates = {pname, pname.lower(), normalize_player_name(pname)}
+    return any(k[0] in candidates for k in mapping)
+
+
+def _lookup_live_player(
+    live_boxscore: dict[str, dict[str, Any]] | None,
+    pname: str,
+) -> dict[str, Any] | None:
+    if not live_boxscore:
+        return None
+    return live_boxscore.get(pname.lower()) or live_boxscore.get(normalize_player_name(pname))
 
 
 def _ewma_mean_std(values: np.ndarray, span: int = 6) -> tuple[float, float]:
@@ -245,10 +283,15 @@ class PlayerPropsEngine:
                 for item in injuries_by_team.get(team, []):
                     st = str(item.get("status", "")).lower()
                     nm = str(item.get("player_name", "")).lower()
+                    nm_norm = normalize_player_name(nm)
                     if "out" in st or "doubtful" in st:
                         out_names.add(nm)
+                        if nm_norm:
+                            out_names.add(nm_norm)
                     elif "questionable" in st:
                         q_names.add(nm)
+                        if nm_norm:
+                            q_names.add(nm_norm)
 
             player_summaries = (
                 t_logs.groupby("player_name", as_index=False)
@@ -258,23 +301,51 @@ class PlayerPropsEngine:
             vacated_pts = sum(
                 float(r["avg_pts"])
                 for _, r in player_summaries.iterrows()
-                if str(r["player_name"]).lower() in out_names and float(r["avg_min"]) >= 22.0
+                if (
+                    str(r["player_name"]).lower() in out_names
+                    or normalize_player_name(str(r["player_name"])) in out_names
+                )
+                and float(r["avg_min"]) >= 22.0
             )
             usage_boost = float(np.clip(1.0 + (vacated_pts * 0.0045), 1.0, 1.12))
 
-            top_players = [
-                str(r["player_name"])
-                for _, r in player_summaries.iterrows()
-                if str(r["player_name"]).lower() not in out_names
-                and (not recently_active or str(r["player_name"]) in recently_active)
-                and float(r["avg_min"]) >= 24.0
-                and int(r["n"]) >= 4
-            ][:3]
+            if live_prop_markets or custom_lines:
+                cand_rows = [
+                    str(r["player_name"])
+                    for _, r in player_summaries.iterrows()
+                    if str(r["player_name"]).lower() not in out_names
+                    and normalize_player_name(str(r["player_name"])) not in out_names
+                    and (not recently_active or str(r["player_name"]) in recently_active)
+                    and int(r["n"]) >= 4
+                    and (
+                        float(r["avg_min"]) >= 24.0
+                        or (
+                            float(r["avg_min"]) >= 16.0
+                            and (
+                                _has_any_player_prop(live_prop_markets, str(r["player_name"]))
+                                or _has_any_player_prop(custom_lines, str(r["player_name"]))
+                            )
+                        )
+                    )
+                ]
+                custom_p = [p for p in cand_rows if _has_any_player_prop(custom_lines, p)]
+                other_p = [p for p in cand_rows if p not in custom_p]
+                top_players = (custom_p + other_p)[:6]
+            else:
+                top_players = [
+                    str(r["player_name"])
+                    for _, r in player_summaries.iterrows()
+                    if str(r["player_name"]).lower() not in out_names
+                    and normalize_player_name(str(r["player_name"])) not in out_names
+                    and (not recently_active or str(r["player_name"]) in recently_active)
+                    and float(r["avg_min"]) >= 24.0
+                    and int(r["n"]) >= 4
+                ][:3]
 
             opp_factors = self.nba_opp_def_factor.get(opp, {})
 
             for pname in top_players:
-                p_live = (live_boxscore or {}).get(pname.lower()) if is_live else None
+                p_live = _lookup_live_player(live_boxscore, pname) if is_live else None
                 if is_live:
                     if p_live is None or p_live.get("ejected") or p_live.get("did_not_play"):
                         continue
@@ -290,7 +361,11 @@ class PlayerPropsEngine:
                 ewma_min, _ = _ewma_mean_std(min_vals, span=5)
                 season_min = float(np.mean(p_all_active["minutes"]))
                 full_proj_min = (0.60 * ewma_min + 0.40 * season_min) * blowout_haircut
-                inj_clarity = 0.68 if pname.lower() in q_names else 1.0
+                inj_clarity = (
+                    0.68
+                    if (pname.lower() in q_names or normalize_player_name(pname) in q_names)
+                    else 1.0
+                )
 
                 # Live blowout benching & foul-trouble adjustments
                 live_min_mult = 1.0
@@ -323,11 +398,16 @@ class PlayerPropsEngine:
                     season_vals = p_all_active[col].to_numpy(dtype=float)
                     ewma_val, std_val = _ewma_mean_std(vals, span=7)
                     season_avg = float(np.mean(season_vals))
-                    if col == "fg3m" and season_avg < 1.5:
+
+                    mkt_prop = _lookup_player_prop(live_prop_markets, pname, col)
+                    custom_val = _lookup_player_prop(custom_lines, pname, col)
+                    has_explicit_line = mkt_prop is not None or custom_val is not None
+
+                    if col == "fg3m" and season_avg < (0.8 if has_explicit_line else 1.5):
                         continue
-                    if col == "assists" and season_avg < 3.5:
+                    if col == "assists" and season_avg < (1.2 if has_explicit_line else 3.5):
                         continue
-                    if col == "rebounds" and season_avg < 4.5:
+                    if col == "rebounds" and season_avg < (1.5 if has_explicit_line else 4.5):
                         continue
 
                     season_rate = season_avg / max(15.0, season_min)
@@ -343,11 +423,6 @@ class PlayerPropsEngine:
                     )
 
                     base_std = max(std_val, 0.22 * season_avg)
-                    mkt_prop = (
-                        live_prop_markets.get((pname.lower(), col))
-                        if live_prop_markets
-                        else None
-                    )
                     mkt_anchor = 0.55 * season_avg + 0.45 * ewma_val
 
                     if is_live:
@@ -360,39 +435,57 @@ class PlayerPropsEngine:
                             base_std * float(np.sqrt(max(0.04, rem_proj_min / max(12.0, full_proj_min)))),
                         )
 
-                        if custom_lines and (pname, col) in custom_lines:
-                            line_val = float(custom_lines[(pname, col)])
+                        sync_default_line = (
+                            float(mkt_prop["line"])
+                            if mkt_prop is not None
+                            else float(max(0.5, np.floor(cur_stat + rem_frac * mkt_anchor) + 0.5))
+                        )
+                        if custom_val is not None:
+                            line_val = float(custom_val)
+                            is_custom = True
                             line_src = "Custom Live Line"
                         elif mkt_prop is not None:
-                            line_val = float(mkt_prop["line"])
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = str(mkt_prop.get("source", "DraftKings"))
                         else:
                             # Realistic live line tracks current accumulated stat + remaining market expectation
-                            line_val = float(max(0.5, np.floor(cur_stat + rem_frac * mkt_anchor) + 0.5))
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = "Live Est Line"
 
                         # Skip low-count props late in games when no live sportsbook prop feed is attached
                         rem_mkt_mean = rem_frac * mkt_anchor
-                        if (
-                            mkt_prop is None
-                            and not (custom_lines and (pname, col) in custom_lines)
-                            and rem_mkt_mean < 0.85
-                        ):
+                        if mkt_prop is None and custom_val is None and rem_mkt_mean < 0.85:
                             continue
 
                         # If player already cleared an old pregame line and no fresh live line exists, skip stale auto-win
-                        if cur_stat > line_val and not (custom_lines and (pname, col) in custom_lines):
+                        if cur_stat > line_val and custom_val is None:
                             continue
 
                         need_rem = line_val - cur_stat
                         raw_over_p = tail_fn(rem_mean, eff_std, need_rem)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
-                        est_mkt_over = clamp_prob(
-                            0.50 + 0.78 * (tail_fn(rem_mkt_mean, eff_std, need_rem) - 0.50)
+                        rem_mkt_center = (
+                            max(0.1, float(mkt_prop["line"]) - cur_stat)
+                            if mkt_prop is not None
+                            else rem_mkt_mean
                         )
-                        eff_mkt_over = mkt_prop["over_prob"] if mkt_prop else round(est_mkt_over, 4)
+                        est_mkt_over = clamp_prob(
+                            0.50 + 0.78 * (tail_fn(rem_mkt_center, eff_std, need_rem) - 0.50)
+                        )
+                        same_as_mkt = (
+                            mkt_prop is not None and abs(line_val - float(mkt_prop["line"])) < 0.01
+                        )
+                        eff_mkt_over = (
+                            mkt_prop["over_prob"]
+                            if same_as_mkt and mkt_prop.get("over_prob") is not None
+                            else round(est_mkt_over, 4)
+                        )
                         eff_dk_over = (
-                            mkt_prop.get("dk_over_prob") if mkt_prop else round(est_mkt_over, 4)
+                            mkt_prop["dk_over_prob"]
+                            if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
+                            else round(est_mkt_over, 4)
                         )
                         drivers = [
                             f"LIVE: Has {cur_stat:.0f} now + {rem_mean:.1f} rem ({rem_proj_min:.1f}m left) = {proj_mean:.1f} vs {line_val:.1f}"
@@ -401,30 +494,49 @@ class PlayerPropsEngine:
                         cur_stat = 0.0
                         raw_proj_mean = blended_rate * full_proj_min * pace_adj * opp_mult * boost_mult
                         eff_std = base_std
-                        if custom_lines and (pname, col) in custom_lines:
-                            line_val = float(custom_lines[(pname, col)])
+                        sync_default_line = (
+                            float(mkt_prop["line"])
+                            if mkt_prop is not None
+                            else float(max(0.5, np.floor(mkt_anchor) + 0.5))
+                        )
+                        proj_mean = (
+                            raw_proj_mean
+                            if mkt_prop is not None
+                            else mkt_anchor + 0.65 * (raw_proj_mean - mkt_anchor)
+                        )
+                        if custom_val is not None:
+                            line_val = float(custom_val)
+                            is_custom = True
                             line_src = "Custom Line"
-                            proj_mean = raw_proj_mean
                         elif mkt_prop is not None:
-                            line_val = float(mkt_prop["line"])
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = str(mkt_prop.get("source", "DraftKings"))
-                            proj_mean = raw_proj_mean
                         else:
-                            line_val = float(max(0.5, np.floor(mkt_anchor) + 0.5))
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = "Model Ref Line"
-                            # Shrink toward market anchor when comparing against a synthetic ref line
-                            proj_mean = mkt_anchor + 0.65 * (raw_proj_mean - mkt_anchor)
 
                         raw_over_p = tail_fn(proj_mean, eff_std, line_val)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
+                        mkt_center = (
+                            float(mkt_prop["line"]) if mkt_prop is not None else mkt_anchor
+                        )
                         est_mkt_over = clamp_prob(
-                            0.50 + 0.78 * (tail_fn(mkt_anchor, eff_std, line_val) - 0.50)
+                            0.50 + 0.78 * (tail_fn(mkt_center, eff_std, line_val) - 0.50)
+                        )
+                        same_as_mkt = (
+                            mkt_prop is not None and abs(line_val - float(mkt_prop["line"])) < 0.01
                         )
                         eff_mkt_over = (
-                            mkt_prop["over_prob"] if mkt_prop else round(est_mkt_over, 4)
+                            mkt_prop["over_prob"]
+                            if same_as_mkt and mkt_prop.get("over_prob") is not None
+                            else round(est_mkt_over, 4)
                         )
                         eff_dk_over = (
-                            mkt_prop.get("dk_over_prob") if mkt_prop else round(est_mkt_over, 4)
+                            mkt_prop["dk_over_prob"]
+                            if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
+                            else round(est_mkt_over, 4)
                         )
                         src_note = f"{line_src} — verify DK line/¢" if line_src == "Model Ref Line" else line_src
                         drivers = [
@@ -458,6 +570,8 @@ class PlayerPropsEngine:
                             market_over_prob=eff_mkt_over,
                             dk_over_prob=eff_dk_over,
                             line_source=line_src,
+                            default_line_value=sync_default_line,
+                            is_custom_line=is_custom,
                         )
                     )
         return out
@@ -524,10 +638,15 @@ class PlayerPropsEngine:
                 for item in injuries_by_team.get(team, []):
                     st = str(item.get("status", "")).lower()
                     nm = str(item.get("player_name", "")).lower()
+                    nm_norm = normalize_player_name(nm)
                     if "out" in st or "doubtful" in st:
                         out_names.add(nm)
+                        if nm_norm:
+                            out_names.add(nm_norm)
                     elif "questionable" in st:
                         q_names.add(nm)
+                        if nm_norm:
+                            q_names.add(nm_norm)
 
             # Game-script pass/rush volume tilt (uses live scoreboard deficit when in-play!)
             if is_live and live_state is not None:
@@ -553,6 +672,7 @@ class PlayerPropsEngine:
             qb_logs = recent_t_logs[
                 (recent_t_logs["position"].str.upper() == "QB")
                 & (~recent_t_logs["player_name"].str.lower().isin(out_names))
+                & (~recent_t_logs["player_name"].map(normalize_player_name).isin(out_names))
             ]
             if len(qb_logs) > 0:
                 active_qb1 = str(
@@ -573,34 +693,51 @@ class PlayerPropsEngine:
             for _, prow in grouped.iterrows():
                 pname = str(prow["player_name"])
                 pos = str(prow["position"]).upper()
-                if pname.lower() in out_names:
+                if pname.lower() in out_names or normalize_player_name(pname) in out_names:
                     continue
+                has_player_mkt = _has_any_player_prop(live_prop_markets, pname) or _has_any_player_prop(
+                    custom_lines, pname
+                )
                 if pos == "QB" and (pname != active_qb1 or float(prow["py"]) < 145.0):
                     continue
-                if pos == "RB" and float(prow["ry"]) < 38.0 and float(prow["recy"]) < 22.0:
+                if (
+                    not has_player_mkt
+                    and pos == "RB"
+                    and float(prow["ry"]) < 38.0
+                    and float(prow["recy"]) < 22.0
+                ):
                     continue
-                if pos in ("WR", "TE") and float(prow["recy"]) < 38.0:
+                if not has_player_mkt and pos in ("WR", "TE") and float(prow["recy"]) < 38.0:
                     continue
 
-                p_live = (live_boxscore or {}).get(pname.lower()) if is_live else None
+                p_live = _lookup_live_player(live_boxscore, pname) if is_live else None
                 if is_live and p_live is None and live_period >= 2:
                     continue
                 p_all = t_logs[t_logs["player_name"] == pname]
                 p_hist = p_all.tail(12)
-                inj_clarity = 0.68 if pname.lower() in q_names else 1.0
+                inj_clarity = (
+                    0.68
+                    if (pname.lower() in q_names or normalize_player_name(pname) in q_names)
+                    else 1.0
+                )
 
                 for col, label, allowed_pos, tail_fn in self.NFL_PROPS:
                     if pos not in allowed_pos:
                         continue
                     vals = p_hist[col].to_numpy(dtype=float)
                     ewma_val, std_val = _ewma_mean_std(vals, span=5)
-                    if col == "rushing_yards" and ewma_val < 28.0:
+
+                    mkt_prop = _lookup_player_prop(live_prop_markets, pname, col)
+                    custom_val = _lookup_player_prop(custom_lines, pname, col)
+                    has_explicit_line = mkt_prop is not None or custom_val is not None
+
+                    if col == "rushing_yards" and ewma_val < (12.0 if has_explicit_line else 28.0):
                         continue
-                    if col == "receiving_yards" and ewma_val < 34.0:
+                    if col == "receiving_yards" and ewma_val < (15.0 if has_explicit_line else 34.0):
                         continue
-                    if col == "receptions" and ewma_val < 3.2:
+                    if col == "receptions" and ewma_val < (1.5 if has_explicit_line else 3.2):
                         continue
-                    if col == "passing_tds" and ewma_val < 1.05:
+                    if col == "passing_tds" and ewma_val < (0.6 if has_explicit_line else 1.05):
                         continue
 
                     opp_mult = float(opp_factors.get(col, 1.0))
@@ -613,11 +750,6 @@ class PlayerPropsEngine:
                     shrunk_base = 0.55 * season_avg + 0.45 * ewma_val
                     base_std = max(std_val, 0.25 * season_avg)
                     mkt_anchor = 0.60 * season_avg + 0.40 * ewma_val
-                    mkt_prop = (
-                        live_prop_markets.get((pname.lower(), col))
-                        if live_prop_markets
-                        else None
-                    )
 
                     if is_live:
                         cur_stat = float(p_live.get(col, 0.0) or 0.0) if p_live else 0.0
@@ -625,36 +757,54 @@ class PlayerPropsEngine:
                         proj_mean = cur_stat + rem_mean
                         eff_std = max(0.6, base_std * float(np.sqrt(max(0.04, rem_frac))))
 
-                        if custom_lines and (pname, col) in custom_lines:
-                            line_val = float(custom_lines[(pname, col)])
+                        sync_default_line = (
+                            float(mkt_prop["line"])
+                            if mkt_prop is not None
+                            else float(max(0.5, np.floor(cur_stat + rem_frac * mkt_anchor) + 0.5))
+                        )
+                        if custom_val is not None:
+                            line_val = float(custom_val)
+                            is_custom = True
                             line_src = "Custom Live Line"
                         elif mkt_prop is not None:
-                            line_val = float(mkt_prop["line"])
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = str(mkt_prop.get("source", "DraftKings"))
                         else:
-                            line_val = float(max(0.5, np.floor(cur_stat + rem_frac * mkt_anchor) + 0.5))
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = "Live Est Line"
 
                         rem_mkt_mean = rem_frac * mkt_anchor
-                        if (
-                            mkt_prop is None
-                            and not (custom_lines and (pname, col) in custom_lines)
-                            and rem_mkt_mean < 0.85
-                        ):
+                        if mkt_prop is None and custom_val is None and rem_mkt_mean < 0.85:
                             continue
 
-                        if cur_stat > line_val and not (custom_lines and (pname, col) in custom_lines):
+                        if cur_stat > line_val and custom_val is None:
                             continue
 
                         need_rem = line_val - cur_stat
                         raw_over_p = tail_fn(rem_mean, eff_std, need_rem)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
-                        est_mkt_over = clamp_prob(
-                            0.50 + 0.78 * (tail_fn(rem_mkt_mean, eff_std, need_rem) - 0.50)
+                        rem_mkt_center = (
+                            max(0.1, float(mkt_prop["line"]) - cur_stat)
+                            if mkt_prop is not None
+                            else rem_mkt_mean
                         )
-                        eff_mkt_over = mkt_prop["over_prob"] if mkt_prop else round(est_mkt_over, 4)
+                        est_mkt_over = clamp_prob(
+                            0.50 + 0.78 * (tail_fn(rem_mkt_center, eff_std, need_rem) - 0.50)
+                        )
+                        same_as_mkt = (
+                            mkt_prop is not None and abs(line_val - float(mkt_prop["line"])) < 0.01
+                        )
+                        eff_mkt_over = (
+                            mkt_prop["over_prob"]
+                            if same_as_mkt and mkt_prop.get("over_prob") is not None
+                            else round(est_mkt_over, 4)
+                        )
                         eff_dk_over = (
-                            mkt_prop.get("dk_over_prob") if mkt_prop else round(est_mkt_over, 4)
+                            mkt_prop["dk_over_prob"]
+                            if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
+                            else round(est_mkt_over, 4)
                         )
                         drivers = [
                             f"LIVE: Has {cur_stat:.0f} now + {rem_mean:.1f} rem ({rem_mins:.0f}m left) = {proj_mean:.1f} vs {line_val:.1f}"
@@ -666,29 +816,49 @@ class PlayerPropsEngine:
                         cur_stat = 0.0
                         raw_proj_mean = shrunk_base * float(np.clip(opp_mult, 0.93, 1.07)) * script_env
                         eff_std = base_std
-                        if custom_lines and (pname, col) in custom_lines:
-                            line_val = float(custom_lines[(pname, col)])
+                        sync_default_line = (
+                            float(mkt_prop["line"])
+                            if mkt_prop is not None
+                            else float(max(0.5, np.floor(mkt_anchor) + 0.5))
+                        )
+                        proj_mean = (
+                            raw_proj_mean
+                            if mkt_prop is not None
+                            else mkt_anchor + 0.65 * (raw_proj_mean - mkt_anchor)
+                        )
+                        if custom_val is not None:
+                            line_val = float(custom_val)
+                            is_custom = True
                             line_src = "Custom Line"
-                            proj_mean = raw_proj_mean
                         elif mkt_prop is not None:
-                            line_val = float(mkt_prop["line"])
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = str(mkt_prop.get("source", "DraftKings"))
-                            proj_mean = raw_proj_mean
                         else:
-                            line_val = float(max(0.5, np.floor(mkt_anchor) + 0.5))
+                            line_val = sync_default_line
+                            is_custom = False
                             line_src = "Model Ref Line"
-                            proj_mean = mkt_anchor + 0.65 * (raw_proj_mean - mkt_anchor)
 
                         raw_over_p = tail_fn(proj_mean, eff_std, line_val)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
+                        mkt_center = (
+                            float(mkt_prop["line"]) if mkt_prop is not None else mkt_anchor
+                        )
                         est_mkt_over = clamp_prob(
-                            0.50 + 0.78 * (tail_fn(mkt_anchor, eff_std, line_val) - 0.50)
+                            0.50 + 0.78 * (tail_fn(mkt_center, eff_std, line_val) - 0.50)
+                        )
+                        same_as_mkt = (
+                            mkt_prop is not None and abs(line_val - float(mkt_prop["line"])) < 0.01
                         )
                         eff_mkt_over = (
-                            mkt_prop["over_prob"] if mkt_prop else round(est_mkt_over, 4)
+                            mkt_prop["over_prob"]
+                            if same_as_mkt and mkt_prop.get("over_prob") is not None
+                            else round(est_mkt_over, 4)
                         )
                         eff_dk_over = (
-                            mkt_prop.get("dk_over_prob") if mkt_prop else round(est_mkt_over, 4)
+                            mkt_prop["dk_over_prob"]
+                            if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
+                            else round(est_mkt_over, 4)
                         )
                         src_note = f"{line_src} — verify DK line/¢" if line_src == "Model Ref Line" else line_src
                         drivers = [
@@ -721,6 +891,8 @@ class PlayerPropsEngine:
                             market_over_prob=eff_mkt_over,
                             dk_over_prob=eff_dk_over,
                             line_source=line_src,
+                            default_line_value=sync_default_line,
+                            is_custom_line=is_custom,
                         )
                     )
         return out

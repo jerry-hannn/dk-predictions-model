@@ -3,11 +3,26 @@
 from __future__ import annotations
 
 import math
+import re
+import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Literal
 
 Side = Literal["YES", "NO"]
 Tier = Literal["A+", "A", "B", "PASS"]
+
+
+def normalize_player_name(name: str) -> str:
+    """Canonical ASCII player key stripping diacritics, punctuation, and generational suffixes."""
+    folded = (
+        unicodedata.normalize("NFKD", str(name or ""))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+        .lower()
+    )
+    cleaned = re.sub(r"[^a-z0-9\s]", " ", folded)
+    tokens = [t for t in cleaned.split() if t not in ("jr", "sr", "ii", "iii", "iv", "v")]
+    return " ".join(tokens)
 
 
 def clamp_prob(p: float, eps: float = 1e-4) -> float:

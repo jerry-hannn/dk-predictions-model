@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import joblib
+from scipy.stats import norm
 
 from src.config import PROJECT_ROOT, Settings, get_settings
 from src.data.espn_client import ESPNClient
@@ -21,6 +23,7 @@ from src.engine.dk_math import (
     evaluate_two_way_contract,
     inv_logit,
     logit,
+    normalize_player_name,
 )
 from src.models.nba_game import NBAGameModel
 from src.models.nfl_game import NFLGameModel
@@ -123,7 +126,7 @@ class ModelHub:
     ) -> dict[str, Any]:
         """
         Lightweight live refresh: updates ONLY live ESPN scoreboards, injuries, live box scores,
-        and live Odds API lines (skipping slow multi-season historical CSV downloads).
+        DraftKings player props, and live Odds API lines (skipping slow historical CSV downloads).
         """
         sp = sport.lower()
         out: dict[str, Any] = {}
@@ -133,6 +136,7 @@ class ModelHub:
             for lev in live_evs:
                 self.espn.fetch_live_boxscore(lg, lev["event_id"], force_refresh=True)
             inj = self.espn.fetch_league_injuries(lg, force_refresh=True)
+            espn_props = self.espn.fetch_slate_player_props(lg, sb, force_refresh=True)
             odds = self.odds.fetch_game_odds(
                 lg, force_refresh=True, live_mode=bool(live_evs)
             )
@@ -140,6 +144,7 @@ class ModelHub:
                 "scoreboard_events": len(sb),
                 "live_in_play_events": len(live_evs),
                 "injured_teams_tracked": len(inj),
+                "espn_prop_events": len(espn_props),
                 "sharp_odds_events": len(odds),
             }
         out["odds_quota"] = self.odds.get_quota_status()
@@ -158,6 +163,7 @@ class ModelHub:
             for lev in nfl_live:
                 self.espn.fetch_live_boxscore("NFL", lev["event_id"], force_refresh=force)
             nfl_inj = self.espn.fetch_league_injuries("NFL", force_refresh=force)
+            nfl_props = self.espn.fetch_slate_player_props("NFL", nfl_sb, force_refresh=force)
             nfl_odds = self.odds.fetch_game_odds("NFL", force_refresh=force, live_mode=bool(nfl_live))
             summary["nfl"] = {
                 "historical_games": len(nfl_sched),
@@ -165,6 +171,7 @@ class ModelHub:
                 "live_scoreboard_events": len(nfl_sb),
                 "in_play_events": len(nfl_live),
                 "injured_teams_tracked": len(nfl_inj),
+                "espn_prop_events": len(nfl_props),
                 "sharp_odds_events": len(nfl_odds),
             }
         if sp in ("all", "nba"):
@@ -175,6 +182,7 @@ class ModelHub:
             for lev in nba_live:
                 self.espn.fetch_live_boxscore("NBA", lev["event_id"], force_refresh=force)
             nba_inj = self.espn.fetch_league_injuries("NBA", force_refresh=force)
+            nba_props = self.espn.fetch_slate_player_props("NBA", nba_sb, force_refresh=force)
             nba_odds = self.odds.fetch_game_odds("NBA", force_refresh=force, live_mode=bool(nba_live))
             summary["nba"] = {
                 "historical_games": len(nba_games),
@@ -182,6 +190,7 @@ class ModelHub:
                 "live_scoreboard_events": len(nba_sb),
                 "in_play_events": len(nba_live),
                 "injured_teams_tracked": len(nba_inj),
+                "espn_prop_events": len(nba_props),
                 "sharp_odds_events": len(nba_odds),
             }
         summary["odds_quota"] = self.odds.get_quota_status()
@@ -380,7 +389,8 @@ class ModelHub:
         bankroll: float | None = None,
         include_passes: bool = False,
         fresh: bool = False,
-        live_props: bool = False,
+        live_props: bool = True,
+        event_id_filter: str | None = None,
     ) -> list[dict[str, Any]]:
         self.ensure_loaded()
         assert self.nfl_model is not None
@@ -399,6 +409,7 @@ class ModelHub:
         eff_bankroll = bankroll if bankroll is not None else self.settings.bankroll
         slate_date = target_date or datetime.now().strftime("%Y-%m-%d")
 
+        overrides = self.db.get_line_overrides()
         sports = ["NFL", "NBA"] if sport.lower() == "all" else [sport.upper()]
         candidates: list[dict[str, Any]] = []
 
@@ -406,6 +417,10 @@ class ModelHub:
             events = self._get_upcoming_events(
                 sp, target_date=target_date, mode=mode, force_refresh=fresh
             )
+            if event_id_filter is not None:
+                events = [
+                    ev for ev in events if str(ev.get("event_id")) == str(event_id_filter)
+                ]
             if not events:
                 continue
             has_live = any(ev.get("state") == "IN" for ev in events)
@@ -413,17 +428,23 @@ class ModelHub:
             sharp_odds = self.odds.fetch_game_odds(
                 sp, force_refresh=fresh, live_mode=has_live
             )
+            espn_slate_props = (
+                self.espn.fetch_slate_player_props(sp, events, force_refresh=fresh)
+                if live_props and market_filter.lower() in ("all", "props")
+                else {}
+            )
 
             for ev in events:
                 h = ev["home_abbr"]
                 a = ev["away_abbr"]
+                ev_id = str(ev["event_id"])
                 is_live = ev.get("state") == "IN"
                 mkt = dict(ev.get("market", {}) or {})
 
                 live_box_players: dict[str, dict[str, Any]] | None = None
                 if is_live:
                     summary_data = self.espn.fetch_live_boxscore(
-                        sp, ev["event_id"], force_refresh=fresh
+                        sp, ev_id, force_refresh=fresh
                     )
                     live_box_players = summary_data.get("players") or {}
                     if ev.get("live_win_prob") is None and summary_data.get("live_win_prob") is not None:
@@ -467,18 +488,46 @@ class ModelHub:
                     if ev.get("live_win_prob") is not None:
                         mkt["home_win_prob"] = round(float(ev["live_win_prob"]), 4)
 
-                live_prop_mkts: dict[tuple[str, str], dict[str, Any]] | None = None
+                merged_prop_mkts: dict[tuple[str, str], dict[str, Any]] = dict(
+                    espn_slate_props.get(ev_id, {})
+                )
                 if (
                     live_props
                     and market_filter.lower() in ("all", "props")
                     and mkt.get("odds_event_id")
                 ):
-                    live_prop_mkts = self.odds.fetch_event_player_props(
+                    odds_props = self.odds.fetch_event_player_props(
                         sp,
                         str(mkt["odds_event_id"]),
                         force_refresh=fresh,
                         live_mode=is_live,
                     )
+                    if odds_props:
+                        merged_prop_mkts.update(odds_props)
+                live_prop_mkts = merged_prop_mkts if merged_prop_mkts else None
+
+                # Extract persistent user line overrides for this event
+                sp_ov_key = f"{sp}:{ev_id}:spread"
+                tot_ov_key = f"{sp}:{ev_id}:total"
+                sp_override = overrides.get(sp_ov_key)
+                tot_override = overrides.get(tot_ov_key)
+                prop_prefix = f"{sp}:{ev_id}:prop:"
+                custom_prop_lines: dict[tuple[str, str], float] = {}
+                for ok, ov_obj in overrides.items():
+                    if ok.startswith(prop_prefix):
+                        rest = ok[len(prop_prefix):]
+                        if ":" in rest:
+                            p_norm, p_col = rest.rsplit(":", 1)
+                            custom_prop_lines[(p_norm, p_col)] = float(ov_obj["line_value"])
+
+                default_home_spread = mkt.get("home_spread")
+                default_total_line = mkt.get("total_line")
+                eff_spread_line = (
+                    float(sp_override["line_value"]) if sp_override else default_home_spread
+                )
+                eff_total_line = (
+                    float(tot_override["line_value"]) if tot_override else default_total_line
+                )
 
                 inj_notes = self._format_injury_summary(injuries, h, a)
 
@@ -486,8 +535,8 @@ class ModelHub:
                     gpred = self.nfl_model.predict_matchup(
                         home_team=h,
                         away_team=a,
-                        spread_line=mkt.get("home_spread"),
-                        total_line=mkt.get("total_line"),
+                        spread_line=eff_spread_line,
+                        total_line=eff_total_line,
                         is_indoor=bool(ev.get("indoor", False)),
                         wind_mph=float(ev.get("wind_mph", 5.0)),
                         temp_f=float(ev.get("temp_f", 65.0)),
@@ -503,6 +552,7 @@ class ModelHub:
                             is_indoor=bool(ev.get("indoor", False)),
                             wind_mph=float(ev.get("wind_mph", 5.0)),
                             injuries_by_team=injuries,
+                            custom_lines=custom_prop_lines or None,
                             live_prop_markets=live_prop_mkts,
                             live_state=ev if is_live else None,
                             live_boxscore=live_box_players,
@@ -515,8 +565,8 @@ class ModelHub:
                         home_team=h,
                         away_team=a,
                         game_date=slate_date,
-                        spread_line=mkt.get("home_spread"),
-                        total_line=mkt.get("total_line"),
+                        spread_line=eff_spread_line,
+                        total_line=eff_total_line,
                         injuries_by_team=injuries,
                         live_state=ev if is_live else None,
                     )
@@ -527,6 +577,7 @@ class ModelHub:
                             expected_pace=gpred.expected_pace,
                             expected_spread=gpred.spread_line,
                             injuries_by_team=injuries,
+                            custom_lines=custom_prop_lines or None,
                             live_prop_markets=live_prop_mkts,
                             live_state=ev if is_live else None,
                             live_boxscore=live_box_players,
@@ -562,6 +613,8 @@ class ModelHub:
                             eff_bankroll=eff_bankroll,
                             eff_min_prob=eff_balanced_min_prob,
                             eff_min_edge=eff_min_edge,
+                            default_spread_line=default_home_spread,
+                            override=sp_override,
                         )
                     )
 
@@ -577,10 +630,13 @@ class ModelHub:
                             eff_bankroll=eff_bankroll,
                             eff_min_prob=eff_balanced_min_prob,
                             eff_min_edge=eff_min_edge,
+                            default_total_line=default_total_line,
+                            override=tot_override,
                         )
                     )
 
                 for pp in prop_preds:
+                    pp_ov_key = f"{sp}:{ev_id}:prop:{normalize_player_name(pp.player_name)}:{pp.prop_type}"
                     candidates.append(
                         self._build_prop_pick(
                             slate_date=slate_date,
@@ -592,6 +648,7 @@ class ModelHub:
                             eff_bankroll=eff_bankroll,
                             eff_min_prob=eff_balanced_min_prob,
                             eff_min_edge=eff_min_edge,
+                            override=overrides.get(pp_ov_key),
                         )
                     )
 
@@ -611,6 +668,64 @@ class ModelHub:
             self.db.save_predictions(actionable)
 
         return candidates if include_passes else actionable
+
+    def _evaluate_contract_with_override(
+        self,
+        *,
+        yes_true_prob: float,
+        yes_ask: float,
+        no_ask: float,
+        eff_fee: float,
+        eff_bankroll: float,
+        kelly_m: float,
+        max_bet_pct: float,
+        eff_min_prob: float,
+        eff_min_edge: float,
+        yes_anchor_prob: float | None,
+        uncertainty: float,
+        clarity: float,
+        override: dict[str, Any] | None = None,
+    ) -> ContractEvaluation:
+        if override and override.get("contract_price") is not None:
+            ov_px = float(override["contract_price"])
+            ov_side_raw = str(override.get("side") or "").upper()
+            if ov_side_raw in ("YES", "NO"):
+                side_lit: Any = "YES" if ov_side_raw == "YES" else "NO"
+                p_side = yes_true_prob if side_lit == "YES" else (1.0 - yes_true_prob)
+                anch_side = (
+                    (yes_anchor_prob if side_lit == "YES" else (1.0 - yes_anchor_prob))
+                    if yes_anchor_prob is not None
+                    else None
+                )
+                return evaluate_single_side(
+                    side=side_lit,
+                    side_true_prob=p_side,
+                    contract_price=ov_px,
+                    fee_per_contract=eff_fee,
+                    bankroll=eff_bankroll,
+                    kelly_multiplier=kelly_m,
+                    max_bet_pct=max_bet_pct,
+                    min_win_prob=eff_min_prob,
+                    min_net_edge=eff_min_edge,
+                    anchor_prob=anch_side,
+                    uncertainty=uncertainty,
+                    injury_clarity=clarity,
+                )
+        best, _, _ = evaluate_two_way_contract(
+            yes_true_prob=yes_true_prob,
+            yes_ask_price=yes_ask,
+            no_ask_price=no_ask,
+            fee_per_contract=eff_fee,
+            bankroll=eff_bankroll,
+            kelly_multiplier=kelly_m,
+            max_bet_pct=max_bet_pct,
+            min_win_prob=eff_min_prob,
+            min_net_edge=eff_min_edge,
+            yes_anchor_prob=yes_anchor_prob,
+            uncertainty=uncertainty,
+            injury_clarity=clarity,
+        )
+        return best
 
     def _live_safety_context(
         self, ev: dict[str, Any], mkt: dict[str, Any], base_clarity: float
@@ -743,6 +858,7 @@ class ModelHub:
 
         out = {
             "pick_id": f"{slate_date}:{ev['sport']}:{ev['event_id']}:winner",
+            "override_key": None,
             "slate_date": slate_date,
             "sport": ev["sport"],
             "event_id": ev["event_id"],
@@ -754,6 +870,8 @@ class ModelHub:
             "contract_question": f"Will {h} defeat {a}?",
             "player_name": None,
             "line_value": None,
+            "default_line_value": None,
+            "is_custom_line": False,
             "yes_true_prob": round(blended_home_p, 4),
             "recommended_side": best.side,
             "contract_price": best.contract_price,
@@ -798,15 +916,42 @@ class ModelHub:
         eff_bankroll: float,
         eff_min_prob: float,
         eff_min_edge: float,
+        default_spread_line: float | None = None,
+        override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         h, a = gpred.home_team, gpred.away_team
-        sp_line = gpred.spread_line
+        sp_line = float(gpred.spread_line)
+        default_sp = (
+            float(default_spread_line)
+            if default_spread_line is not None
+            else round(-gpred.expected_margin * 2.0) / 2.0
+        )
+        is_custom = override is not None
+        override_key = f"{ev['sport']}:{ev['event_id']}:spread"
+
         is_live, locked, kelly_m, clarity, safety_drivers = self._live_safety_context(
             ev, mkt, gpred.injury_clarity
         )
         mkt_cov = mkt.get("home_cover_prob")
         dk_cov = mkt.get("dk_home_cover_prob")
         has_real_book = str(mkt.get("line_source", "")) != "Offline Fallback" and mkt_cov is not None
+
+        if is_custom and mkt_cov is not None and abs(sp_line - default_sp) >= 0.01:
+            reg_mins = 60.0 if ev["sport"] == "NFL" else 48.0
+            rem_f = (
+                max(0.04, float(ev.get("remaining_minutes", reg_mins)) / reg_mins)
+                if is_live
+                else 1.0
+            )
+            sp_scale = (13.0 if ev["sport"] == "NFL" else 12.0) * math.sqrt(rem_f)
+            mkt_exp_margin = -default_sp + sp_scale * float(
+                norm.ppf(clamp_prob(float(mkt_cov), 0.02))
+            )
+            mkt_cov = round(
+                clamp_prob(float(1.0 - norm.cdf(-sp_line, loc=mkt_exp_margin, scale=sp_scale))),
+                4,
+            )
+            dk_cov = mkt_cov
 
         mkt_w = (0.68 if is_live else 0.62) if has_real_book else 0.30
         blended_cov = blend_probabilities(gpred.home_cover_prob, mkt_cov, market_weight=mkt_w)
@@ -818,21 +963,22 @@ class ModelHub:
             is_live=is_live,
         )
 
-        best, _, _ = evaluate_two_way_contract(
+        best = self._evaluate_contract_with_override(
             yes_true_prob=blended_cov,
-            yes_ask_price=yes_ask,
-            no_ask_price=no_ask,
-            fee_per_contract=eff_fee,
-            bankroll=eff_bankroll,
-            kelly_multiplier=kelly_m,
+            yes_ask=yes_ask,
+            no_ask=no_ask,
+            eff_fee=eff_fee,
+            eff_bankroll=eff_bankroll,
+            kelly_m=kelly_m,
             max_bet_pct=self.settings.max_single_bet_pct,
-            min_win_prob=eff_min_prob,
-            min_net_edge=eff_min_edge,
+            eff_min_prob=eff_min_prob,
+            eff_min_edge=eff_min_edge,
             yes_anchor_prob=mkt_cov if mkt_cov is not None else 0.50,
             uncertainty=0.15 if is_live else 0.12,
-            injury_clarity=clarity,
+            clarity=clarity,
+            override=override,
         )
-        if locked or (is_live and mkt_cov is None and dk_cov is None):
+        if locked or (is_live and mkt_cov is None and dk_cov is None and not is_custom):
             best = _force_pass_evaluation(best)
             if is_live and mkt_cov is None and dk_cov is None and not locked:
                 safety_drivers = safety_drivers + [
@@ -854,8 +1000,13 @@ class ModelHub:
         drivers.append(f"Model proj line {h} {-gpred.expected_margin:+.1f} vs {home_fmt}")
         drivers.extend(gpred.drivers[:2])
 
+        live_fields = self._event_live_fields(ev, mkt)
+        if is_custom:
+            live_fields["line_source"] = "Custom Live Line" if is_live else "Custom Line"
+
         out = {
             "pick_id": f"{slate_date}:{ev['sport']}:{ev['event_id']}:spread",
+            "override_key": override_key,
             "slate_date": slate_date,
             "sport": ev["sport"],
             "event_id": ev["event_id"],
@@ -867,6 +1018,8 @@ class ModelHub:
             "contract_question": f"Will {h} cover {home_fmt}?",
             "player_name": None,
             "line_value": sp_line,
+            "default_line_value": default_sp,
+            "is_custom_line": is_custom,
             "yes_true_prob": round(blended_cov, 4),
             "recommended_side": best.side,
             "contract_price": best.contract_price,
@@ -896,7 +1049,7 @@ class ModelHub:
             "drivers": drivers[:4],
             "injury_notes": inj_notes,
         }
-        out.update(self._event_live_fields(ev, mkt))
+        out.update(live_fields)
         return out
 
     def _build_total_pick(
@@ -911,14 +1064,41 @@ class ModelHub:
         eff_bankroll: float,
         eff_min_prob: float,
         eff_min_edge: float,
+        default_total_line: float | None = None,
+        override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        tot_line = gpred.total_line
+        tot_line = float(gpred.total_line)
+        default_tot = (
+            float(default_total_line)
+            if default_total_line is not None
+            else round(gpred.expected_total * 2.0) / 2.0
+        )
+        is_custom = override is not None
+        override_key = f"{ev['sport']}:{ev['event_id']}:total"
+
         is_live, locked, kelly_m, clarity, safety_drivers = self._live_safety_context(
             ev, mkt, gpred.injury_clarity
         )
         mkt_over = mkt.get("over_prob")
         dk_over = mkt.get("dk_over_prob")
         has_real_book = str(mkt.get("line_source", "")) != "Offline Fallback" and mkt_over is not None
+
+        if is_custom and mkt_over is not None and abs(tot_line - default_tot) >= 0.01:
+            reg_mins = 60.0 if ev["sport"] == "NFL" else 48.0
+            rem_f = (
+                max(0.04, float(ev.get("remaining_minutes", reg_mins)) / reg_mins)
+                if is_live
+                else 1.0
+            )
+            tot_scale = (11.5 if ev["sport"] == "NFL" else 14.5) * math.sqrt(rem_f)
+            mkt_exp_total = default_tot + tot_scale * float(
+                norm.ppf(clamp_prob(float(mkt_over), 0.02))
+            )
+            mkt_over = round(
+                clamp_prob(float(1.0 - norm.cdf(tot_line, loc=mkt_exp_total, scale=tot_scale))),
+                4,
+            )
+            dk_over = mkt_over
 
         mkt_w = (0.68 if is_live else 0.62) if has_real_book else 0.30
         blended_over = blend_probabilities(gpred.over_prob, mkt_over, market_weight=mkt_w)
@@ -930,21 +1110,22 @@ class ModelHub:
             is_live=is_live,
         )
 
-        best, _, _ = evaluate_two_way_contract(
+        best = self._evaluate_contract_with_override(
             yes_true_prob=blended_over,
-            yes_ask_price=yes_ask,
-            no_ask_price=no_ask,
-            fee_per_contract=eff_fee,
-            bankroll=eff_bankroll,
-            kelly_multiplier=kelly_m,
+            yes_ask=yes_ask,
+            no_ask=no_ask,
+            eff_fee=eff_fee,
+            eff_bankroll=eff_bankroll,
+            kelly_m=kelly_m,
             max_bet_pct=self.settings.max_single_bet_pct,
-            min_win_prob=eff_min_prob,
-            min_net_edge=eff_min_edge,
+            eff_min_prob=eff_min_prob,
+            eff_min_edge=eff_min_edge,
             yes_anchor_prob=mkt_over if mkt_over is not None else 0.50,
             uncertainty=0.15 if is_live else 0.12,
-            injury_clarity=clarity,
+            clarity=clarity,
+            override=override,
         )
-        if locked or (is_live and mkt_over is None and dk_over is None):
+        if locked or (is_live and mkt_over is None and dk_over is None and not is_custom):
             best = _force_pass_evaluation(best)
             if is_live and mkt_over is None and dk_over is None and not locked:
                 safety_drivers = safety_drivers + [
@@ -964,8 +1145,13 @@ class ModelHub:
         drivers.append(f"Model projected total {gpred.expected_total:.1f} vs {tot_line:.1f} line")
         drivers.extend(gpred.drivers[:2])
 
+        live_fields = self._event_live_fields(ev, mkt)
+        if is_custom:
+            live_fields["line_source"] = "Custom Live Line" if is_live else "Custom Line"
+
         out = {
             "pick_id": f"{slate_date}:{ev['sport']}:{ev['event_id']}:total",
+            "override_key": override_key,
             "slate_date": slate_date,
             "sport": ev["sport"],
             "event_id": ev["event_id"],
@@ -977,6 +1163,8 @@ class ModelHub:
             "contract_question": f"Will combined score go Over {tot_line:.1f}?",
             "player_name": None,
             "line_value": tot_line,
+            "default_line_value": default_tot,
+            "is_custom_line": is_custom,
             "yes_true_prob": round(blended_over, 4),
             "recommended_side": best.side,
             "contract_price": best.contract_price,
@@ -1006,7 +1194,7 @@ class ModelHub:
             "drivers": drivers[:4],
             "injury_notes": inj_notes,
         }
-        out.update(self._event_live_fields(ev, mkt))
+        out.update(live_fields)
         return out
 
     def _build_prop_pick(
@@ -1021,12 +1209,27 @@ class ModelHub:
         eff_bankroll: float,
         eff_min_prob: float,
         eff_min_edge: float,
+        override: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         is_live, locked, kelly_m, clarity, safety_drivers = self._live_safety_context(
             ev, mkt, pp.injury_clarity
         )
         prop_src = str(getattr(pp, "line_source", "Model Ref Line"))
-        has_real_prop_book = prop_src not in ("Model Ref Line", "Live Est Line")
+        is_custom = bool(getattr(pp, "is_custom_line", False) or override is not None)
+        default_ln = getattr(pp, "default_line_value", None)
+        if default_ln is None:
+            default_ln = float(pp.line_value)
+        override_key = (
+            f"{ev['sport']}:{ev['event_id']}:prop:"
+            f"{normalize_player_name(pp.player_name)}:{pp.prop_type}"
+        )
+
+        has_real_prop_book = prop_src not in (
+            "Model Ref Line",
+            "Live Est Line",
+            "Custom Line",
+            "Custom Live Line",
+        )
         prop_mkt_w = 0.58 if has_real_prop_book else 0.40
         blended_over = (
             blend_probabilities(pp.over_prob, pp.market_over_prob, market_weight=prop_mkt_w)
@@ -1051,19 +1254,20 @@ class ModelHub:
             else (0.21 if is_live else 0.17)
         )
 
-        best, _, _ = evaluate_two_way_contract(
+        best = self._evaluate_contract_with_override(
             yes_true_prob=blended_over,
-            yes_ask_price=yes_ask,
-            no_ask_price=no_ask,
-            fee_per_contract=eff_fee,
-            bankroll=eff_bankroll,
-            kelly_multiplier=kelly_m,
+            yes_ask=yes_ask,
+            no_ask=no_ask,
+            eff_fee=eff_fee,
+            eff_bankroll=eff_bankroll,
+            kelly_m=kelly_m,
             max_bet_pct=min(0.03, self.settings.max_single_bet_pct),
-            min_win_prob=eff_min_prob,
-            min_net_edge=eff_min_edge,
+            eff_min_prob=eff_min_prob,
+            eff_min_edge=eff_min_edge,
             yes_anchor_prob=pp.market_over_prob if pp.market_over_prob is not None else 0.50,
             uncertainty=prop_uncert,
-            injury_clarity=clarity,
+            clarity=clarity,
+            override=override,
         )
         if locked:
             best = _force_pass_evaluation(best)
@@ -1080,6 +1284,7 @@ class ModelHub:
 
         out = {
             "pick_id": f"{slate_date}:{ev['sport']}:{ev['event_id']}:prop:{slug}:{pp.prop_type}",
+            "override_key": override_key,
             "slate_date": slate_date,
             "sport": ev["sport"],
             "event_id": ev["event_id"],
@@ -1091,6 +1296,8 @@ class ModelHub:
             "contract_question": f"Will {pp.player_name} record Over {pp.line_value:.1f} {pp.prop_label}?",
             "player_name": pp.player_name,
             "line_value": pp.line_value,
+            "default_line_value": float(default_ln),
+            "is_custom_line": is_custom,
             "current_stat": getattr(pp, "current_stat", 0.0),
             "yes_true_prob": round(blended_over, 4),
             "recommended_side": best.side,
@@ -1263,3 +1470,65 @@ class ModelHub:
             uncertainty=0.15 if is_live else 0.12,
         )
         return res.to_dict()
+
+    def apply_line_override(
+        self,
+        *,
+        override_key: str,
+        sport: str,
+        event_id: str,
+        pick_id: str = "",
+        target_date: str | None = None,
+        line_value: float | None = None,
+        contract_price: float | None = None,
+        side: str | None = None,
+        reset: bool = False,
+        fee_per_contract: float | None = None,
+        bankroll: float | None = None,
+        min_win_prob: float | None = None,
+        min_net_edge: float | None = None,
+        live_props: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Persist or clear a custom line override in SQLite and immediately recompute
+        the updated market card using cached slate feeds.
+        """
+        if reset:
+            self.db.delete_line_override(override_key)
+        else:
+            if line_value is None:
+                raise ValueError("line_value is required unless reset=True.")
+            self.db.set_line_override(
+                override_key=override_key,
+                line_value=float(line_value),
+                contract_price=contract_price,
+                side=side,
+            )
+
+        candidates = self.generate_picks(
+            sport=sport,
+            market_filter="all",
+            mode="all",
+            target_date=target_date,
+            min_win_prob=min_win_prob,
+            min_net_edge=min_net_edge,
+            fee_per_contract=fee_per_contract,
+            bankroll=bankroll,
+            include_passes=True,
+            fresh=False,
+            live_props=live_props,
+            event_id_filter=str(event_id),
+        )
+        matched = next(
+            (
+                c
+                for c in candidates
+                if c.get("override_key") == override_key
+                or (pick_id and c.get("pick_id") == pick_id)
+            ),
+            None,
+        )
+        if matched is None:
+            raise KeyError(f"Market not found for override_key={override_key}")
+        return matched
+

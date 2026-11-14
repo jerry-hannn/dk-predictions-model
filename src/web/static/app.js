@@ -585,6 +585,46 @@ function filteredPicksWithIndices() {
     });
 }
 
+function formatSelectionLabelForSide(pick, side) {
+  const sideU = String(side || 'YES').toUpperCase() === 'NO' ? 'NO' : 'YES';
+  const parts = String(pick.short_name || '').split(' @ ').map((s) => s.trim());
+  const away = parts[0] || '';
+  const home = parts[1] || '';
+  const mktType = String(pick.market_type || '');
+
+  if (mktType.includes('Prop:') && pick.player_name && pick.line_value != null) {
+    const propLabel = mktType.split('Prop:')[1].trim();
+    const teamMatch = String(pick.selection_label || '').match(/\(([A-Z]{2,4})\)/);
+    const teamTag = teamMatch ? ` (${teamMatch[1]})` : '';
+    const ln = Number(pick.line_value).toFixed(1);
+    return sideU === 'YES'
+      ? `${pick.player_name}${teamTag} Over ${ln} ${propLabel}`
+      : `${pick.player_name}${teamTag} Under ${ln} ${propLabel} (Over: NO)`;
+  }
+
+  if (mktType.endsWith('Spread') && away && home && pick.line_value != null) {
+    const sp = Number(pick.line_value);
+    const homeFmt = `${sp >= 0 ? '+' : ''}${sp.toFixed(1)}`;
+    const awayFmt = `${-sp >= 0 ? '+' : ''}${(-sp).toFixed(1)}`;
+    return sideU === 'YES'
+      ? `${home} ${homeFmt} Cover`
+      : `${away} ${awayFmt} Cover (${home} ${homeFmt}: NO)`;
+  }
+
+  if (mktType.endsWith('Total') && pick.line_value != null) {
+    const tot = Number(pick.line_value).toFixed(1);
+    return sideU === 'YES'
+      ? `Over ${tot} Total Points`
+      : `Under ${tot} Total Points (Over: NO)`;
+  }
+
+  if (mktType.endsWith('Moneyline') && away && home) {
+    return sideU === 'YES' ? `${home} to Win` : `${away} to Win (${home}: NO)`;
+  }
+
+  return pick.selection_label;
+}
+
 function buildPickCardInnerHtml(p, idx) {
   const isLive = p.game_state === 'LIVE';
   const edgeCls = p.net_edge >= 0 ? 'positive' : 'negative';
@@ -612,6 +652,39 @@ function buildPickCardInnerHtml(p, idx) {
       </details>`
     : '';
 
+  const canEditLine = Boolean(p.override_key) && p.line_value !== null && p.line_value !== undefined;
+  const defLineVal = p.default_line_value != null ? Number(p.default_line_value) : Number(p.line_value);
+  const lineTooltip = p.is_custom_line
+    ? `Custom DK line (${Number(p.line_value)}) — synced default: ${defLineVal}`
+    : `Synced line (${defLineVal}) — edit if DraftKings offers a different line`;
+
+  const lineEditorHtml = canEditLine
+    ? `<div class="dk-line-wrap" title="${escapeHtml(lineTooltip)}">
+        <div class="dk-line-field">
+          <span class="line-prefix">Ln</span>
+          <input
+            id="dk-ln-${idx}"
+            class="dk-line-input ${p.is_custom_line ? 'is-custom' : ''}"
+            type="number"
+            step="0.5"
+            value="${Number(p.line_value)}"
+            data-idx="${idx}"
+            aria-label="Offered DraftKings line"
+          >
+        </div>
+        ${
+          p.is_custom_line
+            ? `<button type="button" class="line-reset-btn" data-reset-idx="${idx}" title="Reset to synced line (${escapeHtml(String(defLineVal))})" aria-label="Reset custom line">↺</button>`
+            : ''
+        }
+      </div>`
+    : '';
+
+  const lineSrcText =
+    p.is_custom_line && p.default_line_value != null
+      ? `${p.line_source || 'Custom Line'} (sync ${Number(p.default_line_value)})`
+      : p.line_source || 'ESPN/DK';
+
   const qty = Math.max(1, p.recommended_contracts || 1);
   const btnLabel =
     p.confidence_tier === 'PASS'
@@ -632,7 +705,7 @@ function buildPickCardInnerHtml(p, idx) {
 
     <div>
       <h3 class="pick-title">${escapeHtml(p.selection_label)}</h3>
-      <p class="pick-subtitle">${escapeHtml(p.short_name || p.event_name)}${startLabel ? ` · ${escapeHtml(startLabel)}` : ''} · ${escapeHtml(p.line_source || 'ESPN/DK')}${formatAgeText(p.odds_age_seconds)}</p>
+      <p class="pick-subtitle">${escapeHtml(p.short_name || p.event_name)}${startLabel ? ` · ${escapeHtml(startLabel)}` : ''} · ${escapeHtml(lineSrcText)}${formatAgeText(p.odds_age_seconds)}</p>
     </div>
 
     <div class="metrics-strip">
@@ -658,7 +731,8 @@ function buildPickCardInnerHtml(p, idx) {
     ${detailsHtml}
 
     <div class="pick-actions">
-      <div class="inline-pricer" title="Test live DraftKings contract ask price">
+      <div class="inline-pricer" title="Configure exact DraftKings line and contract ask price">
+        ${lineEditorHtml}
         <select id="dk-side-${idx}" class="dk-side-select" data-idx="${idx}" aria-label="Contract side">
           <option value="YES" ${p.recommended_side === 'YES' ? 'selected' : ''}>YES</option>
           <option value="NO" ${p.recommended_side === 'NO' ? 'selected' : ''}>NO</option>
@@ -715,9 +789,95 @@ async function logPickByIndex(idx) {
   }
 }
 
+async function applyCardLineOverride(idx, { reset = false, includePriceSide = false } = {}) {
+  const pick = state.picks[idx];
+  if (!pick || !pick.override_key) return;
+
+  let rawLine = null;
+  if (!reset) {
+    const lnEl = document.getElementById(`dk-ln-${idx}`);
+    rawLine = lnEl ? parseFloat(lnEl.value) : Number(pick.line_value);
+    if (!Number.isFinite(rawLine)) {
+      showBanner('Enter a valid numeric line (for example 20.5 or -3.5).', true);
+      return;
+    }
+    if (!includePriceSide && Math.abs(rawLine - Number(pick.line_value)) < 1e-6) {
+      return;
+    }
+  }
+
+  const minProb = parseFloat(document.getElementById('filter-min-prob').value) / 100;
+  const minEdge = parseFloat(document.getElementById('filter-min-edge').value) / 100;
+  const liveProps = document.getElementById('filter-live-props').checked;
+  const dateVal = document.getElementById('filter-date').value;
+
+  const payload = {
+    override_key: pick.override_key,
+    sport: pick.sport,
+    event_id: String(pick.event_id),
+    pick_id: pick.pick_id || '',
+    date: dateVal || null,
+    line_value: reset ? null : rawLine,
+    reset,
+    fee_per_contract: getFee(),
+    bankroll: getBankroll(),
+    min_win_prob: minProb,
+    min_net_edge: minEdge,
+    live_props: liveProps,
+  };
+
+  if (includePriceSide && !reset) {
+    const sideEl = document.getElementById(`dk-side-${idx}`);
+    const pxEl = document.getElementById(`dk-px-${idx}`);
+    const side = sideEl ? sideEl.value : pick.recommended_side;
+    const cents = Math.min(99, Math.max(1, parseFloat(pxEl ? pxEl.value : '50') || 50));
+    payload.side = side;
+    payload.contract_price = cents / 100;
+  }
+
+  try {
+    const resp = await apiFetch('/api/line-override', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!data || !data.pick) throw new Error('Invalid response payload');
+
+    state.picks[idx] = data.pick;
+    if (state.viewMode === 'grid') {
+      const cardEl = document.querySelector(`.pick-card[data-idx="${idx}"]`);
+      if (cardEl) {
+        cardEl.innerHTML = buildPickCardInnerHtml(data.pick, idx);
+        bindCardEvents(cardEl);
+      } else {
+        renderPicks();
+      }
+    } else {
+      renderPicks();
+    }
+    updateKPIs(null, state.picks);
+    updateSlateMetaBar();
+    if (reset) {
+      showBanner(`Reset "${data.pick.selection_label}" to synced line (${data.pick.line_value}).`);
+    } else if (!includePriceSide) {
+      showBanner(`Updated custom line: ${data.pick.selection_label} · Win ${(data.pick.model_prob * 100).toFixed(1)}%`);
+    }
+  } catch (err) {
+    showBanner(`Could not update custom line: ${err}`, true);
+  }
+}
+
 async function reevaluateSingleCard(idx) {
   const pick = state.picks[idx];
   if (!pick) return;
+
+  if (pick.is_custom_line && pick.override_key) {
+    await applyCardLineOverride(idx, { reset: false, includePriceSide: true });
+    return;
+  }
+
   const sideEl = document.getElementById(`dk-side-${idx}`);
   const pxEl = document.getElementById(`dk-px-${idx}`);
   const side = sideEl ? sideEl.value : pick.recommended_side;
@@ -743,6 +903,7 @@ async function reevaluateSingleCard(idx) {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const updated = await resp.json();
     pick.recommended_side = updated.side;
+    pick.selection_label = formatSelectionLabelForSide(pick, updated.side);
     Object.assign(pick, updated);
 
     const cardEl = document.querySelector(`.pick-card[data-idx="${idx}"]`);
@@ -757,6 +918,24 @@ async function reevaluateSingleCard(idx) {
 }
 
 function bindCardEvents(container) {
+  container.querySelectorAll('.dk-line-input').forEach((inp) => {
+    inp.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        applyCardLineOverride(parseInt(e.currentTarget.dataset.idx, 10));
+      }
+    });
+    inp.addEventListener('change', (e) => {
+      applyCardLineOverride(parseInt(e.currentTarget.dataset.idx, 10));
+    });
+  });
+
+  container.querySelectorAll('.line-reset-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      applyCardLineOverride(parseInt(e.currentTarget.dataset.resetIdx, 10), { reset: true });
+    });
+  });
+
   container.querySelectorAll('.dk-side-select').forEach((sel) => {
     sel.addEventListener('change', (e) => {
       reevaluateSingleCard(parseInt(e.currentTarget.dataset.idx, 10));
@@ -815,12 +994,15 @@ function renderPicks() {
         const stateLabel = isLive
           ? `<span class="live-indicator"><span class="live-dot"></span>${escapeHtml(p.score_display || p.status_detail || 'LIVE')}</span>`
           : `${escapeHtml(p.short_name || p.event_name)}${startTxt ? ` <span class="muted">· ${escapeHtml(startTxt)}</span>` : ''}`;
+        const customResetBtn = p.is_custom_line
+          ? ` <button type="button" class="line-reset-btn" data-reset-idx="${idx}" title="Reset to synced line (${escapeHtml(String(p.default_line_value ?? p.line_value))})">↺</button>`
+          : '';
         const qty = Math.max(1, p.recommended_contracts || 1);
         return `
           <tr>
             <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${p.confidence_score}</span></td>
             <td><span class="sport-label">${escapeHtml(p.sport)}</span> · ${stateLabel}</td>
-            <td><strong>${escapeHtml(p.selection_label)}</strong></td>
+            <td><strong>${escapeHtml(p.selection_label)}</strong>${customResetBtn}</td>
             <td class="mono">${escapeHtml(p.recommended_side)}</td>
             <td class="num-col">${(p.contract_price * 100).toFixed(0)}¢</td>
             <td class="num-col">${(p.fair_entry_max_price * 100).toFixed(0)}¢</td>

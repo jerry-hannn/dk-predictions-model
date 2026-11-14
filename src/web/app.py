@@ -119,6 +119,23 @@ class ContractEvalRequest(BaseModel):
     is_live: bool = False
 
 
+class LineOverrideRequest(BaseModel):
+    override_key: str = Field(..., min_length=3)
+    sport: str = Field(..., min_length=2)
+    event_id: str = Field(..., min_length=1)
+    pick_id: str = ""
+    date: Optional[str] = None
+    line_value: Optional[float] = Field(None, ge=-100.0, le=600.0)
+    contract_price: Optional[float] = Field(None, ge=0.01, le=0.99)
+    side: Optional[str] = Field(None, pattern="^(YES|NO|yes|no)$")
+    reset: bool = False
+    fee_per_contract: Optional[float] = Field(None, ge=0.0, le=0.10)
+    bankroll: Optional[float] = Field(None, gt=0.0)
+    min_win_prob: Optional[float] = Field(None, ge=0.50, le=0.95)
+    min_net_edge: Optional[float] = Field(None, ge=-0.20, le=0.30)
+    live_props: bool = True
+
+
 class CreateTradeRequest(BaseModel):
     sport: str
     event_name: str
@@ -208,6 +225,7 @@ def get_config() -> dict[str, Any]:
         "odds_api_key_masked": _mask_api_key(s.the_odds_api_key),
         "sharp_events_cached": len(nfl_cached or []) + len(nba_cached or []),
         "odds_quota": hub.odds.get_quota_status(),
+        "line_overrides_count": len(hub.db.get_line_overrides()),
         "auth_enabled": bool(s.app_passcode),
     }
 
@@ -248,7 +266,7 @@ def get_picks(
     bankroll: Optional[float] = Query(None, gt=0.0),
     include_passes: bool = Query(False),
     fresh: bool = Query(False),
-    live_props: bool = Query(False),
+    live_props: bool = Query(True),
 ) -> dict[str, Any]:
     hub = _get_hub()
     eff_bankroll = bankroll if bankroll is not None else hub.settings.bankroll
@@ -298,6 +316,42 @@ def evaluate_contract_endpoint(req: ContractEvalRequest) -> dict[str, Any]:
         min_net_edge=req.min_net_edge,
         is_live=req.is_live,
     )
+
+
+@app.post("/api/line-override")
+def line_override_endpoint(req: LineOverrideRequest) -> dict[str, Any]:
+    """Persist or reset a custom line override and recompute the market card."""
+    hub = _get_hub()
+    try:
+        updated_pick = hub.apply_line_override(
+            override_key=req.override_key,
+            sport=req.sport,
+            event_id=req.event_id,
+            pick_id=req.pick_id,
+            target_date=req.date,
+            line_value=req.line_value,
+            contract_price=req.contract_price,
+            side=req.side,
+            reset=req.reset,
+            fee_per_contract=req.fee_per_contract,
+            bankroll=req.bankroll,
+            min_win_prob=req.min_win_prob,
+            min_net_edge=req.min_net_edge,
+            live_props=req.live_props,
+        )
+        return {"pick": updated_pick}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.delete("/api/line-overrides")
+def clear_line_overrides_endpoint() -> dict[str, int]:
+    """Clear all saved custom line overrides."""
+    settings = get_settings()
+    db = Database(settings.db_path)
+    return {"cleared": db.clear_line_overrides()}
 
 
 @app.post("/api/refresh-live")

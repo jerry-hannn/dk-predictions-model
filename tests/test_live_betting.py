@@ -583,3 +583,158 @@ def test_recommender_latency_lock_open_position_monitor_and_live_api(
     r_ref = client.post("/api/refresh-live?sport=NBA")
     assert r_ref.status_code == 200
     assert "refreshed" in r_ref.json()
+
+
+def test_espn_draftkings_prop_sync_normalization_and_custom_lines() -> None:
+    from src.engine.dk_math import normalize_player_name
+
+    # 1. Unicode diacritic & suffix normalization
+    assert normalize_player_name("Nikola Jokić") == "nikola jokic"
+    assert normalize_player_name("Jimmy Butler III") == "jimmy butler"
+    assert normalize_player_name("P.J. Washington Jr.") == "p j washington"
+
+    # 2. ESPN Core API DraftKings prop parser (NBA with juice + multiple alt lines)
+    nba_items = [
+        {
+            "athlete": {"$ref": "http://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/athletes/3157465?lang=en"},
+            "type": {"id": "90", "name": "Total Points, Rebounds, and Assists"},
+            "odds": {
+                "american": "-121",
+                "total": {"value": 20.5, "alternative": "Over"},
+            },
+        },
+        {
+            "athlete": {"$ref": "http://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/athletes/3157465?lang=en"},
+            "type": {"id": "90", "name": "Total Points, Rebounds, and Assists"},
+            "odds": {
+                "american": "-109",
+                "total": {"value": 20.5, "alternative": "Under"},
+            },
+        },
+        # Alt line at 24.5 heavily skewed (+230 / -310) -> main 20.5 line must win
+        {
+            "athlete": {"$ref": "http://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/athletes/3157465?lang=en"},
+            "type": {"id": "90", "name": "Total Points, Rebounds, and Assists"},
+            "odds": {
+                "american": "+230",
+                "total": {"value": 24.5, "alternative": "Over"},
+            },
+        },
+        {
+            "athlete": {"$ref": "http://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/athletes/3157465?lang=en"},
+            "type": {"id": "90", "name": "Total Points, Rebounds, and Assists"},
+            "odds": {
+                "american": "-310",
+                "total": {"value": 24.5, "alternative": "Under"},
+            },
+        },
+    ]
+    parsed_nba = ESPNClient.extract_espn_prop_lines(
+        "NBA", nba_items, {"3157465": "Duncan Robinson"}
+    )
+    dr_pra = parsed_nba[("duncan robinson", "pra")]
+    assert dr_pra["line"] == 20.5
+    assert dr_pra["source"] == "DraftKings"
+    assert 0.505 < dr_pra["over_prob"] < 0.535
+
+    # 3. NFL ESPN Core API prop parser (when American juice is omitted by feed)
+    nfl_items = [
+        {
+            "athlete": {"$ref": "http://sports.core.api.espn.com/v2/sports/football/leagues/nfl/athletes/3139477"},
+            "type": {"id": "8", "name": "Total Passing Yards"},
+            "current": {"target": {"value": 271.5}},
+        }
+    ]
+    parsed_nfl = ESPNClient.extract_espn_prop_lines(
+        "NFL", nfl_items, {"3139477": "Patrick Mahomes"}
+    )
+    pm_pass = parsed_nfl[("patrick mahomes", "passing_yards")]
+    assert pm_pass["line"] == 271.5
+    assert pm_pass["over_prob"] is None
+
+    # 4. PlayerPropsEngine synced default_line_value vs custom_lines override
+    nfl_logs = NFLLoader().load_player_logs()
+    nba_logs = NBALoader().load_player_logs()
+    props_engine = PlayerPropsEngine()
+    props_engine.fit(nfl_logs, nba_logs)
+
+    synced_props = props_engine.project_nba_game_props(
+        home_team="MIA",
+        away_team="DET",
+        live_prop_markets={("duncan robinson", "pra"): dr_pra},
+    )
+    p_sync = next(
+        p for p in synced_props if normalize_player_name(p.player_name) == "duncan robinson" and p.prop_type == "pra"
+    )
+    assert p_sync.line_value == 20.5
+    assert p_sync.default_line_value == 20.5
+    assert p_sync.is_custom_line is False
+    assert p_sync.line_source == "DraftKings"
+
+    # Override to a higher 22.5 line -> Over probability drops monotonically & preserves default_line_value=20.5
+    custom_props = props_engine.project_nba_game_props(
+        home_team="MIA",
+        away_team="DET",
+        live_prop_markets={("duncan robinson", "pra"): dr_pra},
+        custom_lines={("duncan robinson", "pra"): 22.5},
+    )
+    p_cust = next(
+        p for p in custom_props if normalize_player_name(p.player_name) == "duncan robinson" and p.prop_type == "pra"
+    )
+    assert p_cust.line_value == 22.5
+    assert p_cust.default_line_value == 20.5
+    assert p_cust.is_custom_line is True
+    assert p_cust.line_source == "Custom Line"
+    assert p_cust.over_prob < p_sync.over_prob
+    assert p_cust.market_over_prob is not None and p_cust.market_over_prob < p_sync.market_over_prob
+
+    # NFL prop market without American juice still prices cleanly without crashing
+    nfl_synced = props_engine.project_nfl_game_props(
+        home_team="KC",
+        away_team="BUF",
+        live_prop_markets={("patrick mahomes", "passing_yards"): pm_pass},
+    )
+    pm_proj = next(
+        p for p in nfl_synced if normalize_player_name(p.player_name) == "patrick mahomes" and p.prop_type == "passing_yards"
+    )
+    assert pm_proj.line_value == 271.5
+    assert pm_proj.line_source == "DraftKings"
+
+    # 5. Verify fetch_event_player_props constructs /leagues/{lg}/ Core API path & caches cleanly
+    import tempfile
+    import src.data.espn_client as espn_mod
+
+    called_urls: list[str] = []
+
+    class _FakeResp:
+        status_code = 200
+
+        def raise_for_status(self) -> None:
+            pass
+
+        def json(self) -> dict:
+            return {"pageCount": 1, "items": nba_items}
+
+    orig_http_get = espn_mod.http_get
+    try:
+        def _spy_get(url: str, **kwargs):
+            called_urls.append(url)
+            if "propBets" in url:
+                return _FakeResp()
+            raise RuntimeError("unexpected url")
+
+        espn_mod.http_get = _spy_get  # type: ignore[assignment]
+        with tempfile.TemporaryDirectory() as td:
+             tmp_db = Database(Path(td) / "props_url.sqlite3")
+             tmp_db.set_cache("espn:roster:NBA:8", {"3157465": "Duncan Robinson"}, ttl_seconds=3600)
+             c_espn = ESPNClient(db=tmp_db)
+             fetched = c_espn.fetch_event_player_props("NBA", "401909982", home_id="14", away_id="8")
+             assert fetched[("duncan robinson", "pra")]["line"] == 20.5
+             assert any(
+                 "/sports/basketball/leagues/nba/events/401909982/competitions/401909982/odds/100/propBets" in u
+                 for u in called_urls
+             )
+    finally:
+        espn_mod.http_get = orig_http_get  # type: ignore[assignment]
+
+

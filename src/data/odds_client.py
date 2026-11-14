@@ -3,15 +3,41 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+import requests
 
 from src.config import get_settings
-from src.engine.dk_math import american_to_implied_prob, clamp_prob
+from src.engine.dk_math import american_to_implied_prob, clamp_prob, normalize_player_name
 from src.storage.db import Database
+
+
+def http_get(
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+    timeout: float = 10.0,
+    raise_for_status: bool = True,
+) -> Any:
+    """
+    Execute an HTTP GET via httpx, gracefully falling back to requests when container
+    NO_PROXY contains unbracketed IPv6 literals (e.g. `::1`) that trigger httpx.InvalidURL.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("ALLOW_PYTEST_NETWORK") != "1":
+        raise RuntimeError("Live network disabled during pytest")
+    try:
+        with httpx.Client(timeout=timeout, headers=headers) as client:
+            resp = client.get(url, params=params)
+    except httpx.InvalidURL:
+        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+    if raise_for_status:
+        resp.raise_for_status()
+    return resp
 
 # Sharpness weights when aggregating multi-book consensus
 BOOK_SHARPNESS_WEIGHTS: dict[str, float] = {
@@ -186,7 +212,7 @@ class OddsClient:
             "updated_at": q.get("updated_at"),
         }
 
-    def _record_quota_headers(self, headers: httpx.Headers) -> None:
+    def _record_quota_headers(self, headers: Any) -> None:
         rem_raw = headers.get("x-requests-remaining")
         used_raw = headers.get("x-requests-used")
         if rem_raw is None and used_raw is None:
@@ -247,11 +273,10 @@ class OddsClient:
             "oddsFormat": "american",
         }
         try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(url, params=params)
-                self._record_quota_headers(resp.headers)
-                resp.raise_for_status()
-                payload = resp.json()
+            resp = http_get(url, params=params, timeout=10.0, raise_for_status=False)
+            self._record_quota_headers(resp.headers)
+            resp.raise_for_status()
+            payload = resp.json()
             ttl = 90 if live_mode else 600
             self.db.set_cache(cache_key, payload, ttl_seconds=ttl)
             return payload
@@ -282,11 +307,16 @@ class OddsClient:
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if cached is not None:
-                return {
-                    (k.split("::", 1)[0], k.split("::", 1)[1]): v
-                    for k, v in cached.items()
-                    if "::" in k
-                }
+                out_cached: dict[tuple[str, str], dict[str, Any]] = {}
+                for k, v in cached.items():
+                    if "::" not in k:
+                        continue
+                    p_low, col = k.split("::", 1)
+                    out_cached[(p_low, col)] = v
+                    norm_p = normalize_player_name(p_low)
+                    if norm_p:
+                        out_cached.setdefault((norm_p, col), v)
+                return out_cached
 
         quota = self.get_quota_status()
         rem = quota.get("requests_remaining")
@@ -303,11 +333,10 @@ class OddsClient:
             "oddsFormat": "american",
         }
         try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(url, params=params)
-                self._record_quota_headers(resp.headers)
-                resp.raise_for_status()
-                payload = resp.json()
+            resp = http_get(url, params=params, timeout=10.0, raise_for_status=False)
+            self._record_quota_headers(resp.headers)
+            resp.raise_for_status()
+            payload = resp.json()
         except Exception:
             return {}
 
@@ -357,12 +386,16 @@ class OddsClient:
             target_line = dk_entry[1]
             same_line_probs = [p for _, ln, p in entries if abs(ln - target_line) < 0.01]
             mkt_over_p = sum(same_line_probs) / len(same_line_probs)
-            out_props[key] = {
+            val_obj = {
                 "line": target_line,
                 "over_prob": round(mkt_over_p, 4),
                 "dk_over_prob": round(dk_entry[2], 4),
                 "source": "DraftKings" if dk_entry[0] == "draftkings" else dk_entry[0].title(),
             }
+            out_props[key] = val_obj
+            norm_p = normalize_player_name(key[0])
+            if norm_p:
+                out_props.setdefault((norm_p, key[1]), val_obj)
         return out_props
 
     @staticmethod
