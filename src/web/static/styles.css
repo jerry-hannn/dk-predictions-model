@@ -1331,3 +1331,336 @@ dialog::backdrop {
     padding: 1.25rem;
   }
 }
+
+/* --- Traditional Sportsbooks (DK / FD) Mode Components --- */
+.mode-toggle-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 0.9rem;
+  background: var(--surface-subtle);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+}
+
+.mode-toggle-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.mode-toggle-title {
+  font-weight: 600;
+  font-size: 0.84rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.switch {
+  position: relative;
+  display: inline-block;
+  flex-shrink: 0;
+  width: 42px;
+  height: 24px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.switch-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border-strong);
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background 0.18s ease;
+}
+
+.switch-slider::before {
+  content: "";
+  position: absolute;
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  top: 3px;
+  background: var(--text);
+  border-radius: 50%;
+  transition: transform 0.18s ease;
+}
+
+.switch input:checked + .switch-slider {
+  background: var(--positive);
+}
+
+.switch input:checked + .switch-slider::before {
+  transform: translateX(18px);
+  background: #09090b;
+}
+
+.info-callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.65rem 0.9rem;
+  margin-bottom: 0.85rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
+.info-callout code {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+}
+
+/* Venue & Strategy Badges */
+.venue-pill,
+.strat-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.12rem 0.45rem;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+}
+
+.venue-dk {
+  border-color: rgba(52, 211, 153, 0.35);
+  background: rgba(52, 211, 153, 0.10);
+  color: var(--positive);
+}
+
+.venue-fd {
+  border-color: rgba(56, 189, 248, 0.35);
+  background: rgba(56, 189, 248, 0.10);
+  color: #38bdf8;
+}
+
+[data-theme="light"] .venue-fd {
+  color: #0284c7;
+  border-color: rgba(2, 132, 199, 0.28);
+  background: rgba(2, 132, 199, 0.08);
+}
+
+.venue-dkex {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.strat-arb,
+.verdict-verified {
+  border-color: var(--positive-border);
+  background: var(--positive-bg);
+  color: var(--positive);
+}
+
+.strat-middle,
+.strat-steam,
+.verdict-lift {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.strat-promo {
+  border-color: rgba(167, 139, 250, 0.35);
+  background: rgba(167, 139, 250, 0.10);
+  color: #a78bfa;
+}
+
+[data-theme="light"] .strat-promo {
+  color: #7c3aed;
+}
+
+/* DK vs FD Side-by-Side Odds Strip inside Market Cards */
+.book-odds-strip {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.5rem;
+}
+
+.book-odds-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.42rem 0.6rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 0.78rem;
+}
+
+.book-odds-box.is-best {
+  border-color: var(--positive-border);
+  background: var(--positive-bg);
+}
+
+/* Strategies Controls & Dual-Leg Cards */
+.strategy-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.9rem;
+  padding: 0.75rem 0.95rem;
+  margin-bottom: 1rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.strategies-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.strategy-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 0.6rem;
+}
+
+.strategy-section-head h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.strategy-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 0.85rem;
+}
+
+.strategy-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.95rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.strategy-legs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.55rem;
+}
+
+.strategy-leg {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 0.78rem;
+}
+
+.strategy-leg-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+}
+
+.strategy-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.78rem;
+}
+
+/* Per-Book Bankroll Breakdown Strip */
+.venue-bankroll-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+
+.venue-bankroll-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.75rem 0.9rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.venue-bankroll-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.venue-bankroll-meta {
+  display: flex;
+  gap: 0.85rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.status-badge.PUSH,
+.status-badge.VOID {
+  background: var(--surface-subtle);
+  color: var(--text-secondary);
+  border-color: var(--border-strong);
+}
+
+.status-badge.CASHOUT {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border-color: var(--warning-border);
+}
+
+/* Strategy Backtest Verification Grid */
+.bt-full-span {
+  grid-column: 1 / -1;
+}
+
+.scorecard-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.scorecard-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 0.8rem 0.9rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+}
+
+@media (max-width: 640px) {
+  .strategy-grid,
+  .strategy-legs {
+    grid-template-columns: 1fr;
+  }
+}
+

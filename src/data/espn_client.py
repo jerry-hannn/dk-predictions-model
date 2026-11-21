@@ -618,19 +618,35 @@ class ESPNClient:
                 continue
             over_prob: float | None = None
             dk_over_prob: float | None = None
+            dk_over_odds: int | None = None
+            dk_under_odds: int | None = None
             imbalance = 0.25
             if len(prices) >= 2 and prices[0] is not None and prices[1] is not None:
                 po, _ = devig_american_pair(float(prices[0]), float(prices[1]))
                 over_prob = round(po, 4)
                 dk_over_prob = round(po, 4)
+                dk_over_odds = int(round(float(prices[0])))
+                dk_under_odds = int(round(float(prices[1])))
                 imbalance = abs(po - 0.50)
 
-            candidate = {
+            candidate: dict[str, Any] = {
                 "line": line_val,
                 "over_prob": over_prob,
                 "dk_over_prob": dk_over_prob,
                 "source": "DraftKings",
             }
+            if dk_over_odds is not None and dk_under_odds is not None:
+                candidate["dk_line"] = line_val
+                candidate["dk_over_odds"] = dk_over_odds
+                candidate["dk_under_odds"] = dk_under_odds
+                candidate["books"] = {
+                    "draftkings": {
+                        "line": line_val,
+                        "over_odds": dk_over_odds,
+                        "under_odds": dk_under_odds,
+                        "over_prob": dk_over_prob,
+                    }
+                }
             existing = best_by_player_col.get((aid, col))
             if existing is None or imbalance < existing[0]:
                 best_by_player_col[(aid, col)] = (imbalance, candidate)

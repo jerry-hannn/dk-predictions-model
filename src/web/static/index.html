@@ -25,13 +25,17 @@
     <div class="header-inner">
       <div class="header-left">
         <h1 class="brand-title">
-          <span class="brand-mark">DKeX</span>
-          <span class="brand-sub">DraftKings Predictions Model</span>
+          <span id="brand-mark" class="brand-mark">DKeX</span>
+          <span id="brand-sub" class="brand-sub">DraftKings Predictions Model</span>
         </h1>
 
         <div class="nav-tabs" role="tablist" aria-label="Workspace navigation">
           <button type="button" role="tab" id="tab-picks" aria-selected="true" aria-controls="panel-picks">
             Markets
+          </button>
+          <button type="button" role="tab" id="tab-strategies" aria-selected="false" aria-controls="panel-strategies" hidden>
+            Strategies
+            <span id="strategies-badge" class="tab-count" hidden>0</span>
           </button>
           <button type="button" role="tab" id="tab-calculator" aria-selected="false" aria-controls="panel-calculator">
             Analyzer
@@ -55,7 +59,7 @@
           <span id="odds-api-text">ESPN Feed</span>
         </span>
 
-        <button type="button" id="open-settings-btn" class="btn btn-secondary mono" title="Configure bankroll, fees, API key, and model sync">
+        <button type="button" id="open-settings-btn" class="btn btn-secondary mono" title="Configure bankroll, sportsbook mode, fees, API key, and model sync">
           <span id="header-bankroll-chip">$1,000 · 1.5¢</span>
         </button>
 
@@ -94,6 +98,7 @@
       <div class="summary-item">
         <span class="summary-label">Bankroll</span>
         <strong id="kpi-bankroll" class="summary-value">—</strong>
+        <span id="kpi-book-split" class="summary-sub" hidden></span>
       </div>
       <div class="summary-item">
         <span class="summary-label">Realized P&amp;L</span>
@@ -110,7 +115,7 @@
         <span id="kpi-exp-hitrate" class="summary-sub"></span>
       </div>
       <div class="summary-item">
-        <span class="summary-label">Conviction Plays</span>
+        <span id="kpi-locks-label" class="summary-label">Conviction Plays</span>
         <strong id="kpi-locks" class="summary-value">0</strong>
         <span id="kpi-total-picks" class="summary-sub">0 active</span>
       </div>
@@ -146,12 +151,18 @@
             <button type="button" class="seg-btn" data-seg="market" data-val="game" id="seg-mkt-game">Games</button>
             <button type="button" class="seg-btn" data-seg="market" data-val="props" id="seg-mkt-props">Props</button>
           </div>
+
+          <div id="sb-book-filter" class="segmented" role="group" aria-label="Sportsbook filter" hidden>
+            <button type="button" class="seg-btn active" data-seg="book" data-val="all" id="seg-book-all">DK + FD</button>
+            <button type="button" class="seg-btn" data-seg="book" data-val="draftkings" id="seg-book-dk">DK</button>
+            <button type="button" class="seg-btn" data-seg="book" data-val="fanduel" id="seg-book-fd">FD</button>
+          </div>
         </div>
 
         <div class="toolbar-group">
           <input id="filter-search" class="search-input" type="search" placeholder="Search team or player..." aria-label="Search team or player">
 
-          <button type="button" id="toggle-filters-btn" class="btn btn-secondary" aria-expanded="false" aria-controls="advanced-filters-panel">
+          <button type="button" id="toggle-filters-btn" class="btn btn-secondary" aria-expanded="false" aria-controls="filters-form">
             Filters
           </button>
 
@@ -171,12 +182,12 @@
         <div class="field-inline">
           <label for="filter-min-prob">Min Win Prob (<span id="min-prob-val" class="mono">60%</span>)</label>
           <div class="range-wrap">
-            <input id="filter-min-prob" type="range" min="52" max="78" step="1" value="60">
+            <input id="filter-min-prob" type="range" min="35" max="78" step="1" value="60">
           </div>
         </div>
 
         <div class="field-inline">
-          <label for="filter-min-edge">Min Net Edge (<span id="min-edge-val" class="mono">+2.5%</span>)</label>
+          <label for="filter-min-edge"><span id="filter-edge-label">Min Net Edge</span> (<span id="min-edge-val" class="mono">+2.5%</span>)</label>
           <div class="range-wrap">
             <input id="filter-min-edge" type="range" min="0" max="8" step="0.5" value="2.5">
           </div>
@@ -184,12 +195,12 @@
 
         <label for="filter-show-all" class="toggle-check">
           <input id="filter-show-all" type="checkbox">
-          <span>Show PASS contracts</span>
+          <span id="filter-show-all-label">Show PASS contracts</span>
         </label>
 
-        <label for="filter-live-props" class="toggle-check" title="Sync live DraftKings player prop lines via ESPN &amp; Odds API">
+        <label for="filter-live-props" class="toggle-check" title="Sync live DraftKings &amp; FanDuel player prop lines via ESPN &amp; Odds API">
           <input id="filter-live-props" type="checkbox" checked>
-          <span>Sync DK prop lines</span>
+          <span>Sync live prop lines</span>
         </label>
 
         <label for="auto-refresh-live" class="toggle-check">
@@ -197,6 +208,11 @@
           <span>Auto-refresh (60s)</span>
         </label>
       </form>
+
+      <div id="sb-fanduel-notice" class="info-callout" hidden>
+        <span><strong>DraftKings lines active (zero-key ESPN feed).</strong> Add a free <code>THE_ODDS_API_KEY</code> in Settings to stream live FanDuel lines for automated DK ↔ FD line shopping, arbitrage, middles, and promo conversions.</span>
+        <button type="button" id="notice-open-settings-btn" class="link-btn">Open Settings</button>
+      </div>
 
       <div id="slate-meta-bar" class="slate-meta-bar" hidden>
         <span id="slate-meta-text"></span>
@@ -207,7 +223,7 @@
 
       <div id="picks-table-wrap" class="table-container" hidden>
         <table class="data-table">
-          <thead>
+          <thead id="picks-table-thead">
             <tr>
               <th scope="col">Tier</th>
               <th scope="col">Matchup / State</th>
@@ -226,9 +242,68 @@
       </div>
     </section>
 
+    <!-- VIEW 1B: TRADITIONAL DK/FD STRATEGIES (Shown when Traditional Mode is ON) -->
+    <section role="tabpanel" id="panel-strategies" aria-labelledby="tab-strategies" hidden>
+      <div class="view-header">
+        <div>
+          <h2>DK &amp; FD Strategy Scanner</h2>
+          <p>Cross-book Arbitrage, Key-Number Middles, Low-Hold / Bonus Bet Conversions, Profit Boosts, and Sharp Steam Lag.</p>
+        </div>
+        <div class="toolbar-group">
+          <div class="segmented" role="group" aria-label="Strategy category">
+            <button type="button" class="seg-btn active" data-strat-tab="all" id="strat-tab-all">All</button>
+            <button type="button" class="seg-btn" data-strat-tab="arbitrage" id="strat-tab-arb">
+              Arbitrage <span id="strat-cnt-arb" class="tab-count" hidden>0</span>
+            </button>
+            <button type="button" class="seg-btn" data-strat-tab="middles" id="strat-tab-mid">
+              Middles <span id="strat-cnt-mid" class="tab-count" hidden>0</span>
+            </button>
+            <button type="button" class="seg-btn" data-strat-tab="promos" id="strat-tab-promo">
+              Promos &amp; Hold <span id="strat-cnt-promo" class="tab-count" hidden>0</span>
+            </button>
+            <button type="button" class="seg-btn" data-strat-tab="steam" id="strat-tab-steam">
+              Steam Lag <span id="strat-cnt-steam" class="tab-count" hidden>0</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="strategy-controls">
+        <div class="field-inline">
+          <label for="strat-arb-stake">Arb / Middle Stake ($)</label>
+          <input id="strat-arb-stake" type="number" min="10" step="10" value="100">
+        </div>
+        <div class="field-inline">
+          <label for="strat-bonus-size">Bonus Bet Size ($)</label>
+          <input id="strat-bonus-size" type="number" min="5" step="5" value="50">
+        </div>
+        <div class="field-inline">
+          <label for="strat-boost-pct">Profit Boost</label>
+          <select id="strat-boost-pct">
+            <option value="0.25" selected>+25% Boost</option>
+            <option value="0.30">+30% Boost</option>
+            <option value="0.50">+50% Boost</option>
+            <option value="1.00">+100% Boost</option>
+          </select>
+        </div>
+        <label for="strat-include-dkex" class="toggle-check" title="Also check fee-adjusted DraftKings Predictions (DKeX) contracts vs DK/FD American odds">
+          <input id="strat-include-dkex" type="checkbox" checked>
+          <span>Include DKeX cross-arbs</span>
+        </label>
+      </div>
+
+      <div id="strat-fanduel-notice" class="info-callout" hidden>
+        <span><strong>FanDuel live lines require an Odds API key.</strong> Configure <code>THE_ODDS_API_KEY</code> in Settings to automatically scan live DK ↔ FD Arbitrage, Middles, and Low-Hold pairs — or test any matchup manually in the <strong>Analyzer</strong> tab.</span>
+        <button type="button" id="strat-open-settings-btn" class="link-btn">Add API Key</button>
+      </div>
+
+      <div id="strategies-container" class="strategies-stack" aria-live="polite"></div>
+    </section>
+
     <!-- VIEW 2: ANALYZER -->
     <section role="tabpanel" id="panel-calculator" aria-labelledby="tab-calculator" hidden>
-      <div class="analyzer-shell">
+      <!-- DKeX Contract Analyzer (Shown when Traditional Mode is OFF) -->
+      <div id="analyzer-dkex" class="analyzer-shell">
         <div class="surface-panel">
           <h2 class="panel-heading">Contract Analyzer</h2>
           <p class="panel-desc">Verify exact DraftKings ask prices, fee-adjusted break-even rates, Quarter-Kelly sizing, and mid-game take-profit targets.</p>
@@ -280,6 +355,179 @@
           </div>
         </div>
       </div>
+
+      <!-- Traditional Sportsbooks Analyzer (Shown when Traditional Mode is ON) -->
+      <div id="analyzer-sportsbook" hidden>
+        <div class="toolbar" style="margin-bottom: 1rem;">
+          <div class="segmented" role="group" aria-label="Sportsbook analyzer mode">
+            <button type="button" class="seg-btn active" data-sb-calc="ev" id="sb-calc-tab-ev">+EV &amp; Profit Boost</button>
+            <button type="button" class="seg-btn" data-sb-calc="arb" id="sb-calc-tab-arb">Arb &amp; Hedge</button>
+            <button type="button" class="seg-btn" data-sb-calc="bonus" id="sb-calc-tab-bonus">Bonus Bet Converter</button>
+          </div>
+        </div>
+
+        <!-- Mode A: +EV & Profit Boost -->
+        <div id="sb-calc-panel-ev" class="analyzer-shell">
+          <div class="surface-panel">
+            <h2 class="panel-heading">DK vs. FD +EV &amp; Profit Boost Analyzer</h2>
+            <p class="panel-desc">Compare DraftKings and FanDuel American odds against true win probability or sharp two-way odds (Shin de-vigged), with optional Profit Boost calculation.</p>
+            <form id="sb-ev-form" class="stack-form">
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="sb-ev-dk">DraftKings Odds</label>
+                  <input id="sb-ev-dk" type="number" step="1" value="-105" required>
+                </div>
+                <div class="field">
+                  <label for="sb-ev-fd">FanDuel Odds</label>
+                  <input id="sb-ev-fd" type="number" step="1" value="-115">
+                </div>
+              </div>
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="sb-ev-prob">True Win Prob (% — optional if Sharp Odds entered)</label>
+                  <input id="sb-ev-prob" type="number" min="1" max="99" step="0.5" value="55.0">
+                </div>
+                <div class="field">
+                  <label for="sb-ev-boost">Profit Boost (%)</label>
+                  <select id="sb-ev-boost">
+                    <option value="0" selected>No Boost (0%)</option>
+                    <option value="0.25">+25% Profit Boost</option>
+                    <option value="0.30">+30% Profit Boost</option>
+                    <option value="0.50">+50% Profit Boost</option>
+                    <option value="1.00">+100% Profit Boost</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="sb-ev-sharp-a">Sharp Side Odds (Optional De-Vig)</label>
+                  <input id="sb-ev-sharp-a" type="number" step="1" placeholder="e.g. -125">
+                </div>
+                <div class="field">
+                  <label for="sb-ev-sharp-b">Sharp Opp Odds (Optional)</label>
+                  <input id="sb-ev-sharp-b" type="number" step="1" placeholder="e.g. +110">
+                </div>
+              </div>
+              <button type="submit" class="btn btn-primary">Evaluate DK vs. FD</button>
+            </form>
+          </div>
+          <div class="surface-panel">
+            <div class="verdict-header">
+              <div>
+                <h3 id="sb-ev-verdict" class="verdict-title">Evaluating...</h3>
+                <span id="sb-ev-sub" class="field-hint">Best-book routing &amp; fractional Kelly sizing</span>
+              </div>
+              <span id="sb-ev-tier" class="tier-pill">—</span>
+            </div>
+            <div id="sb-ev-output" class="kv-list"></div>
+          </div>
+        </div>
+
+        <!-- Mode B: Arb & Hedge -->
+        <div id="sb-calc-panel-arb" class="analyzer-shell" hidden>
+          <div class="surface-panel">
+            <h2 class="panel-heading">Arbitrage &amp; Live Hedge Calculator</h2>
+            <p class="panel-desc">Calculate exact and anti-limiting rounded stakes for DK ↔ FD or DKeX ↔ DK/FD arbs and live hedges.</p>
+            <form id="sb-arb-form" class="stack-form">
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="sb-arb-book-a">Leg 1 Venue</label>
+                  <select id="sb-arb-book-a">
+                    <option value="DRAFTKINGS" selected>DraftKings</option>
+                    <option value="FANDUEL">FanDuel</option>
+                    <option value="DKEX">DKeX (¢ + fee)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="sb-arb-odds-a" id="sb-arb-odds-a-lbl">Leg 1 Odds (American)</label>
+                  <input id="sb-arb-odds-a" type="number" step="any" value="130" required>
+                </div>
+                <div class="field">
+                  <label for="sb-arb-book-b">Leg 2 Venue</label>
+                  <select id="sb-arb-book-b">
+                    <option value="FANDUEL" selected>FanDuel</option>
+                    <option value="DRAFTKINGS">DraftKings</option>
+                    <option value="DKEX">DKeX (¢ + fee)</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="sb-arb-odds-b" id="sb-arb-odds-b-lbl">Leg 2 Odds (American)</label>
+                  <input id="sb-arb-odds-b" type="number" step="any" value="-115" required>
+                </div>
+                <div class="field">
+                  <label for="sb-arb-total">Total Outlay ($)</label>
+                  <input id="sb-arb-total" type="number" min="1" step="10" value="100" required>
+                </div>
+                <div class="field">
+                  <label for="sb-arb-round">Stake Rounding</label>
+                  <select id="sb-arb-round">
+                    <option value="0">Exact ($0.01)</option>
+                    <option value="1" selected>Nearest $1</option>
+                    <option value="5">Nearest $5</option>
+                  </select>
+                </div>
+              </div>
+              <div class="field">
+                <label for="sb-arb-fixed-a">Fixed Leg 1 Stake ($ — optional for live hedge)</label>
+                <input id="sb-arb-fixed-a" type="number" min="0" step="1" placeholder="Leave blank to split Total Outlay">
+              </div>
+              <button type="submit" class="btn btn-primary">Calculate Arb / Hedge</button>
+            </form>
+          </div>
+          <div class="surface-panel">
+            <div class="verdict-header">
+              <div>
+                <h3 id="sb-arb-verdict" class="verdict-title">Evaluating...</h3>
+                <span id="sb-arb-sub" class="field-hint">Exact &amp; rounded payout verification</span>
+              </div>
+              <span id="sb-arb-pill" class="tier-pill">—</span>
+            </div>
+            <div id="sb-arb-output" class="kv-list"></div>
+          </div>
+        </div>
+
+        <!-- Mode C: Bonus Bet Converter -->
+        <div id="sb-calc-panel-bonus" class="analyzer-shell" hidden>
+          <div class="surface-panel">
+            <h2 class="panel-heading">Bonus Bet / Free-Bet Converter</h2>
+            <p class="panel-desc">Convert DK or FD Bonus Bets (profit-only payout) into guaranteed withdrawable cash by hedging the opposing favorite. Target 70%+ retention on +300 to +550 underdogs.</p>
+            <form id="sb-bonus-form" class="stack-form">
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="sb-bon-book">Bonus Bet Book</label>
+                  <select id="sb-bon-book">
+                    <option value="DRAFTKINGS" selected>DraftKings</option>
+                    <option value="FANDUEL">FanDuel</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="sb-bon-amt">Bonus Bet Amount ($)</label>
+                  <input id="sb-bon-amt" type="number" min="1" step="5" value="50" required>
+                </div>
+                <div class="field">
+                  <label for="sb-bon-odds">Underdog Bonus Odds</label>
+                  <input id="sb-bon-odds" type="number" step="1" value="380" required>
+                </div>
+                <div class="field">
+                  <label for="sb-bon-hedge-odds">Opposing Cash Hedge Odds</label>
+                  <input id="sb-bon-hedge-odds" type="number" step="1" value="-440" required>
+                </div>
+              </div>
+              <button type="submit" class="btn btn-primary">Calculate Guaranteed Cash</button>
+            </form>
+          </div>
+          <div class="surface-panel">
+            <div class="verdict-header">
+              <div>
+                <h3 id="sb-bon-verdict" class="verdict-title">Evaluating...</h3>
+                <span id="sb-bon-sub" class="field-hint">Risk-free promo retention math</span>
+              </div>
+              <span id="sb-bon-pill" class="tier-pill">—</span>
+            </div>
+            <div id="sb-bon-output" class="kv-list"></div>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- VIEW 3: LEDGER -->
@@ -290,6 +538,12 @@
           <p id="ledger-sub-meta">Itemized contract fees, live hold-vs-exit signals, Closing Line Value (CLV), and $1.00 settlements.</p>
         </div>
         <div class="toolbar-group">
+          <div id="ledger-venue-filters" class="segmented" role="group" aria-label="Filter by venue" hidden>
+            <button type="button" class="seg-btn active" data-venue-filter="ALL">All Venues</button>
+            <button type="button" class="seg-btn" data-venue-filter="DRAFTKINGS">DK</button>
+            <button type="button" class="seg-btn" data-venue-filter="FANDUEL">FD</button>
+            <button type="button" class="seg-btn" data-venue-filter="DKEX">DKeX</button>
+          </div>
           <div class="segmented" role="group" aria-label="Filter trade status">
             <button type="button" class="seg-btn active" data-ledger-filter="ALL" id="ledger-filter-all">All</button>
             <button type="button" class="seg-btn" data-ledger-filter="OPEN" id="ledger-filter-open">Open</button>
@@ -299,15 +553,17 @@
         </div>
       </div>
 
+      <div id="ledger-venue-strip" class="venue-bankroll-strip" hidden></div>
+
       <div class="table-container" role="region" aria-labelledby="ledger-table-caption" tabindex="0">
         <table class="data-table">
           <thead>
             <tr>
-              <th scope="col">Contract</th>
+              <th scope="col">Position / Venue</th>
               <th scope="col">League</th>
               <th scope="col">Side</th>
-              <th scope="col" class="num-col">Qty @ Entry</th>
-              <th scope="col" class="num-col">All-In Cost</th>
+              <th scope="col" class="num-col">Size @ Price</th>
+              <th scope="col" class="num-col">Cost / Risk</th>
               <th scope="col" class="num-col">Win % (Entry → Live)</th>
               <th scope="col">Guidance / Exit</th>
               <th scope="col">Status</th>
@@ -324,8 +580,8 @@
     <section role="tabpanel" id="panel-backtest" aria-labelledby="tab-backtest" hidden>
       <div class="view-header">
         <div>
-          <h2>Walk-Forward Calibration &amp; Model Engine</h2>
-          <p>Strict chronological out-of-sample evaluation with zero lookahead bias and itemized contract fee accounting.</p>
+          <h2 id="backtest-heading">Walk-Forward Calibration &amp; Model Engine</h2>
+          <p id="backtest-sub">Strict chronological out-of-sample evaluation with zero lookahead bias and itemized contract fee accounting.</p>
         </div>
         <div class="toolbar-group">
           <button type="button" id="run-backtest-btn" class="btn btn-secondary">Re-run Backtest</button>
@@ -369,19 +625,40 @@
         <button type="button" id="close-settings-btn" class="close-x" aria-label="Close settings">&times;</button>
       </div>
 
+      <!-- Global Exclusive Mode Switch: DKeX vs Traditional DK/FD -->
+      <div class="mode-toggle-card">
+        <div class="mode-toggle-copy">
+          <label for="setting-traditional-mode" class="mode-toggle-title">Traditional Sportsbooks Mode (DK &amp; FD)</label>
+          <span class="field-hint">Switch workspace exclusively from DKeX contracts to DraftKings &amp; FanDuel American odds, arbitrage, middles, promos, and steam lag.</span>
+        </div>
+        <label class="switch" aria-label="Toggle Traditional Sportsbooks Mode">
+          <input id="setting-traditional-mode" type="checkbox">
+          <span class="switch-slider"></span>
+        </label>
+      </div>
+
       <div class="form-grid-2">
         <div class="field">
-          <label for="global-bankroll">Bankroll ($)</label>
+          <label for="global-bankroll">Total Bankroll ($)</label>
           <input id="global-bankroll" type="number" min="1" step="any" value="1000.00" required>
         </div>
 
-        <div class="field">
+        <div class="field" id="setting-dkex-fee-wrap">
           <label for="global-fee">Exchange Fee / Contract</label>
           <select id="global-fee">
             <option value="0.015" selected>1.5¢ Standard</option>
             <option value="0.01">1.0¢ Base Tier</option>
             <option value="0.02">2.0¢ High Tier</option>
             <option value="0.0">0.0¢ Promo</option>
+          </select>
+        </div>
+
+        <div class="field" id="setting-arb-round-wrap" hidden>
+          <label for="setting-arb-rounding">Arb Stake Rounding</label>
+          <select id="setting-arb-rounding">
+            <option value="0">Exact ($0.01)</option>
+            <option value="1" selected>Nearest $1 (Recommended)</option>
+            <option value="5">Nearest $5 (Stealth)</option>
           </select>
         </div>
 
@@ -393,6 +670,30 @@
         <div class="field">
           <label for="setting-max-bet">Max Single Bet (%)</label>
           <input id="setting-max-bet" type="number" min="1" max="25" step="0.5" value="4.0" required>
+        </div>
+      </div>
+
+      <!-- Traditional Sportsbooks Per-Book Allocation & Arb Settings -->
+      <div id="setting-sb-extras" hidden>
+        <div class="form-grid-2" style="margin-bottom: 0.75rem;">
+          <div class="field">
+            <label for="setting-dk-bankroll">DraftKings Bankroll ($ opt.)</label>
+            <input id="setting-dk-bankroll" type="number" min="0" step="any" placeholder="Auto 50/50 split">
+          </div>
+          <div class="field">
+            <label for="setting-fd-bankroll">FanDuel Bankroll ($ opt.)</label>
+            <input id="setting-fd-bankroll" type="number" min="0" step="any" placeholder="Auto 50/50 split">
+          </div>
+          <div class="field">
+            <label for="setting-min-arb-roi">Min Arb ROI (%)</label>
+            <input id="setting-min-arb-roi" type="number" min="0" max="15" step="0.1" value="0.5">
+          </div>
+          <div class="field" style="justify-content: flex-end;">
+            <label for="setting-include-dkex-arb" class="toggle-check" style="margin-top: 1.1rem;">
+              <input id="setting-include-dkex-arb" type="checkbox" checked>
+              <span>Include DKeX cross-arbs</span>
+            </label>
+          </div>
         </div>
       </div>
 
@@ -420,6 +721,25 @@
       </div>
 
       <div class="form-grid-2">
+        <div class="field" id="nt-venue-wrap" hidden>
+          <label for="nt-venue">Sportsbook / Venue</label>
+          <select id="nt-venue">
+            <option value="DRAFTKINGS" selected>DraftKings</option>
+            <option value="FANDUEL">FanDuel</option>
+            <option value="DKEX">DKeX Contract</option>
+          </select>
+        </div>
+        <div class="field" id="nt-strategy-wrap" hidden>
+          <label for="nt-strategy">Strategy</label>
+          <select id="nt-strategy">
+            <option value="EV" selected>+EV Line Shop</option>
+            <option value="ARB">Arbitrage</option>
+            <option value="MIDDLE">Middle</option>
+            <option value="BONUS_BET">Bonus Bet</option>
+            <option value="BOOST">Profit Boost</option>
+            <option value="STEAM">Steam Lag</option>
+          </select>
+        </div>
         <div class="field">
           <label for="nt-sport">League</label>
           <select id="nt-sport">
@@ -444,11 +764,12 @@
       </div>
 
       <div class="field">
-        <label for="nt-selection">Contract Selection</label>
+        <label for="nt-selection">Selection</label>
         <input id="nt-selection" type="text" placeholder="e.g. BOS to Win or Jayson Tatum Over 27.5 Pts" required>
       </div>
 
-      <div class="form-grid-2">
+      <!-- DKeX Contract Entry Fields -->
+      <div id="nt-dkex-fields" class="form-grid-2">
         <div class="field">
           <label for="nt-side">Side</label>
           <select id="nt-side">
@@ -458,16 +779,47 @@
         </div>
         <div class="field">
           <label for="nt-contracts">Contracts (Qty)</label>
-          <input id="nt-contracts" type="number" min="1" step="1" value="10" required>
+          <input id="nt-contracts" type="number" min="1" step="1" value="10">
         </div>
         <div class="field">
           <label for="nt-price">Entry Price (¢)</label>
-          <input id="nt-price" type="number" min="1" max="99" step="0.5" value="58" required>
+          <input id="nt-price" type="number" min="1" max="99" step="0.5" value="58">
         </div>
         <div class="field">
           <label for="nt-prob">Model Win Prob (%)</label>
-          <input id="nt-prob" type="number" min="1" max="99" step="0.5" value="66" required>
+          <input id="nt-prob" type="number" min="1" max="99" step="0.5" value="66">
         </div>
+      </div>
+
+      <!-- Traditional Sportsbook Entry Fields -->
+      <div id="nt-sb-fields" hidden>
+        <div class="form-grid-2">
+          <div class="field">
+            <label for="nt-sb-side">Side</label>
+            <select id="nt-sb-side">
+              <option value="HOME">HOME</option>
+              <option value="AWAY">AWAY</option>
+              <option value="OVER">OVER</option>
+              <option value="UNDER">UNDER</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="nt-sb-odds">American Odds</label>
+            <input id="nt-sb-odds" type="number" step="1" value="-110">
+          </div>
+          <div class="field">
+            <label for="nt-sb-stake">Stake ($)</label>
+            <input id="nt-sb-stake" type="number" min="0.5" step="any" value="25">
+          </div>
+          <div class="field">
+            <label for="nt-sb-prob">Model Win Prob (%)</label>
+            <input id="nt-sb-prob" type="number" min="1" max="99" step="0.5" value="56">
+          </div>
+        </div>
+        <label for="nt-sb-bonus" class="toggle-check" style="margin-top: 0.5rem;">
+          <input id="nt-sb-bonus" type="checkbox">
+          <span>Bonus Bet / Free Bet ($0 cash risk, profit-only payout)</span>
+        </label>
       </div>
 
       <div class="dialog-foot">
@@ -477,7 +829,7 @@
     </form>
   </dialog>
 
-  <!-- DIALOG 4: SETTLE / SELL EARLY -->
+  <!-- DIALOG 4: SETTLE / SELL EARLY / CASHOUT -->
   <dialog id="settle-dialog" closedby="any" aria-labelledby="settle-dialog-title">
     <form id="settle-form" class="dialog-form">
       <div class="dialog-head">
@@ -485,14 +837,18 @@
         <button type="button" id="close-dialog-btn" class="close-x" aria-label="Close dialog">&times;</button>
       </div>
       <input type="hidden" id="settle-trade-id">
+      <input type="hidden" id="settle-trade-format" value="CONTRACT">
       <p id="settle-trade-summary" class="field-hint" style="margin: 0;"></p>
 
       <div class="field">
         <label for="settle-status">Resolution</label>
         <select id="settle-status">
-          <option value="WON">Settled WON ($1.00 / contract, $0 exit fee)</option>
-          <option value="LOST">Settled LOST ($0.00 / contract)</option>
-          <option value="SOLD">Sold Early Mid-Game / Pre-Game</option>
+          <option value="WON">Settled WON</option>
+          <option value="LOST">Settled LOST</option>
+          <option value="SOLD" id="opt-settle-sold">Sold Early Mid-Game / Pre-Game</option>
+          <option value="PUSH" id="opt-settle-push" hidden>PUSH (Stake Refunded)</option>
+          <option value="VOID" id="opt-settle-void" hidden>VOID (Stake Refunded)</option>
+          <option value="CASHOUT" id="opt-settle-cashout" hidden>Early Cashout ($)</option>
         </select>
       </div>
 
@@ -507,9 +863,19 @@
         </div>
       </div>
 
-      <div class="field">
+      <div id="cashout-fields" class="field" hidden>
+        <label for="settle-cashout-amt">Cashout Payout Received ($)</label>
+        <input id="settle-cashout-amt" type="number" min="0" step="0.01" value="30.00">
+      </div>
+
+      <div class="field" id="settle-clv-cents-wrap">
         <label for="settle-closing-price">Closing Pre-Game Price (¢, optional for CLV)</label>
         <input id="settle-closing-price" type="number" min="1" max="99" step="0.5" placeholder="e.g. 66">
+      </div>
+
+      <div class="field" id="settle-clv-odds-wrap" hidden>
+        <label for="settle-closing-odds">Closing American Odds (optional for CLV)</label>
+        <input id="settle-closing-odds" type="number" step="1" placeholder="e.g. -125">
       </div>
 
       <div class="dialog-foot">

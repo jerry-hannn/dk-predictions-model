@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from src.backtest.sportsbook_backtest import run_sportsbook_backtest
 from src.backtest.walk_forward import run_walk_forward_backtest
 from src.config import PROJECT_ROOT, get_settings, update_env_settings
 from src.engine.recommender import ModelHub
@@ -33,8 +34,8 @@ STATIC_DIR = _resolve_static_dir()
 SESSION_COOKIE_NAME = "dkex_session"
 
 app = FastAPI(
-    title="DraftKings Predictions NFL & NBA Live Model API",
-    version="2.0.0",
+    title="DraftKings Predictions & Sportsbook Live Model API",
+    version="2.1.0",
 )
 
 
@@ -105,6 +106,13 @@ class ConfigUpdateRequest(BaseModel):
     max_same_game_pct: Optional[float] = Field(None, ge=0.01, le=0.35)
     min_win_prob: Optional[float] = Field(None, ge=0.50, le=0.95)
     min_net_edge: Optional[float] = Field(None, ge=-0.10, le=0.30)
+    traditional_sportsbooks_enabled: Optional[bool] = None
+    dk_bankroll: Optional[float] = Field(None, ge=0.0)
+    fd_bankroll: Optional[float] = Field(None, ge=0.0)
+    arb_stake_rounding: Optional[float] = Field(None, ge=0.0, le=25.0)
+    min_arb_roi: Optional[float] = Field(None, ge=0.0, le=0.20)
+    min_sb_ev_edge: Optional[float] = Field(None, ge=0.0, le=0.25)
+    include_dkex_cross_arb: Optional[bool] = None
     the_odds_api_key: Optional[str] = None
 
 
@@ -117,6 +125,33 @@ class ContractEvalRequest(BaseModel):
     min_win_prob: float = Field(0.60, ge=0.50, le=0.95)
     min_net_edge: float = Field(0.025, ge=-0.10, le=0.30)
     is_live: bool = False
+
+
+class SportsbookEvalRequest(BaseModel):
+    true_prob: Optional[float] = Field(None, gt=0.01, lt=0.99)
+    sharp_odds_side: Optional[float] = None
+    sharp_odds_opp: Optional[float] = None
+    dk_odds: Optional[float] = None
+    fd_odds: Optional[float] = None
+    bankroll: Optional[float] = Field(None, gt=0.0)
+    profit_boost_pct: float = Field(0.0, ge=0.0, le=2.0)
+    is_live: bool = False
+
+
+class SportsbookArbCalcRequest(BaseModel):
+    calc_mode: str = Field("arb", pattern="^(arb|bonus_bet)$")
+    book_a: str = "DRAFTKINGS"
+    odds_a: Optional[float] = None
+    dkex_ask_a: Optional[float] = Field(None, ge=0.01, le=0.99)
+    dkex_fee_a: Optional[float] = Field(None, ge=0.0, le=0.10)
+    book_b: str = "FANDUEL"
+    odds_b: Optional[float] = None
+    dkex_ask_b: Optional[float] = Field(None, ge=0.01, le=0.99)
+    dkex_fee_b: Optional[float] = Field(None, ge=0.0, le=0.10)
+    total_stake: float = Field(100.0, gt=0.0)
+    fixed_stake_a: Optional[float] = Field(None, gt=0.0)
+    rounding_step: Optional[float] = Field(None, ge=0.0, le=25.0)
+    bonus_amount: float = Field(50.0, gt=0.0)
 
 
 class LineOverrideRequest(BaseModel):
@@ -141,26 +176,44 @@ class CreateTradeRequest(BaseModel):
     event_name: str
     market_type: str
     selection_label: str
-    side: str = Field(..., pattern="^(YES|NO|yes|no)$")
-    entry_price: float = Field(..., ge=0.01, le=0.99)
+    side: str = Field(..., min_length=1)
+    entry_price: float = Field(0.50, ge=0.01, le=0.99)
     fee_per_contract: float = Field(0.015, ge=0.0, le=0.10)
-    contracts: int = Field(..., ge=1)
-    model_prob: float = Field(..., gt=0.0, lt=1.0)
-    fair_exit_price: float = Field(..., ge=0.01, le=0.99)
+    contracts: int = Field(1, ge=1)
+    model_prob: float = Field(0.50, gt=0.0, lt=1.0)
+    fair_exit_price: float = Field(0.50, ge=0.01, le=0.99)
     notes: str = ""
+    venue: str = "DKEX"
+    bet_format: Optional[str] = None
+    odds_american: Optional[int] = None
+    stake: Optional[float] = Field(None, gt=0.0)
+    is_bonus_bet: bool = False
+    strategy_tag: str = "EV"
+    group_id: Optional[str] = None
+
+
+class CreateTradePairRequest(BaseModel):
+    leg_a: CreateTradeRequest
+    leg_b: CreateTradeRequest
+    group_id: Optional[str] = None
 
 
 class UpdateTradeRequest(BaseModel):
-    status: str = Field(..., pattern="^(OPEN|WON|LOST|SOLD|open|won|lost|sold)$")
-    exit_or_settle_price: Optional[float] = Field(None, ge=0.0, le=1.0)
+    status: str = Field(
+        ...,
+        pattern="^(OPEN|WON|LOST|SOLD|PUSH|VOID|CASHOUT|open|won|lost|sold|push|void|cashout)$",
+    )
+    exit_or_settle_price: Optional[float] = Field(None, ge=0.0)
     exit_fee_per_contract: float = Field(0.0, ge=0.0, le=0.10)
     closing_price: Optional[float] = Field(None, ge=0.01, le=0.99)
+    closing_odds_american: Optional[int] = None
+    cashout_amount: Optional[float] = Field(None, ge=0.0)
     notes: Optional[str] = None
 
 
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.1.0"}
 
 
 @app.get("/")
@@ -221,6 +274,13 @@ def get_config() -> dict[str, Any]:
         "max_same_game_pct": s.max_same_game_pct,
         "min_win_prob": s.min_win_prob,
         "min_net_edge": s.min_net_edge,
+        "traditional_sportsbooks_enabled": s.traditional_sportsbooks_enabled,
+        "dk_bankroll": s.dk_bankroll,
+        "fd_bankroll": s.fd_bankroll,
+        "arb_stake_rounding": s.arb_stake_rounding,
+        "min_arb_roi": s.min_arb_roi,
+        "min_sb_ev_edge": s.min_sb_ev_edge,
+        "include_dkex_cross_arb": s.include_dkex_cross_arb,
         "odds_api_connected": bool(s.the_odds_api_key),
         "odds_api_key_masked": _mask_api_key(s.the_odds_api_key),
         "sharp_events_cached": len(nfl_cached or []) + len(nba_cached or []),
@@ -247,6 +307,22 @@ def save_config(req: ConfigUpdateRequest) -> dict[str, Any]:
         updates["MIN_WIN_PROB"] = f"{req.min_win_prob:.3f}"
     if req.min_net_edge is not None:
         updates["MIN_NET_EDGE"] = f"{req.min_net_edge:.3f}"
+    if req.traditional_sportsbooks_enabled is not None:
+        updates["TRADITIONAL_SPORTSBOOKS_ENABLED"] = (
+            "true" if req.traditional_sportsbooks_enabled else "false"
+        )
+    if req.dk_bankroll is not None:
+        updates["DK_BANKROLL"] = "" if req.dk_bankroll <= 0 else f"{req.dk_bankroll:.2f}"
+    if req.fd_bankroll is not None:
+        updates["FD_BANKROLL"] = "" if req.fd_bankroll <= 0 else f"{req.fd_bankroll:.2f}"
+    if req.arb_stake_rounding is not None:
+        updates["ARB_STAKE_ROUNDING"] = f"{req.arb_stake_rounding:.2f}"
+    if req.min_arb_roi is not None:
+        updates["MIN_ARB_ROI"] = f"{req.min_arb_roi:.4f}"
+    if req.min_sb_ev_edge is not None:
+        updates["MIN_SB_EV_EDGE"] = f"{req.min_sb_ev_edge:.4f}"
+    if req.include_dkex_cross_arb is not None:
+        updates["INCLUDE_DKEX_CROSS_ARB"] = "true" if req.include_dkex_cross_arb else "false"
     if req.the_odds_api_key is not None:
         updates["THE_ODDS_API_KEY"] = req.the_odds_api_key.strip()
     if updates:
@@ -288,7 +364,11 @@ def get_picks(
         if include_passes
         else [c for c in all_candidates if c["confidence_tier"] != "PASS"]
     )
-    ledger = hub.db.ledger_summary(starting_bankroll=eff_bankroll)
+    ledger = hub.db.ledger_summary(
+        starting_bankroll=eff_bankroll,
+        dk_bankroll=hub.settings.dk_bankroll,
+        fd_bankroll=hub.settings.fd_bankroll,
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "count": len(picks),
@@ -301,6 +381,138 @@ def get_picks(
         "picks": picks,
         "ledger_summary": ledger,
     }
+
+
+@app.get("/api/sportsbook/slate")
+def get_sportsbook_slate(
+    sport: str = Query("all"),
+    market: str = Query("all"),
+    mode: str = Query("all"),
+    book: str = Query("all"),
+    date: Optional[str] = Query(None),
+    min_ev: Optional[float] = Query(None, ge=-0.20, le=0.30),
+    min_prob: Optional[float] = Query(None, ge=0.20, le=0.95),
+    bankroll: Optional[float] = Query(None, gt=0.0),
+    arb_stake: float = Query(100.0, gt=0.0),
+    arb_rounding: Optional[float] = Query(None, ge=0.0, le=25.0),
+    min_arb_roi: Optional[float] = Query(None, ge=0.0, le=0.20),
+    bonus_bet_size: float = Query(50.0, gt=0.0),
+    boost_pct: float = Query(0.25, ge=0.0, le=2.0),
+    include_passes: bool = Query(False),
+    include_dkex_cross_arb: Optional[bool] = Query(None),
+    fresh: bool = Query(False),
+    live_props: bool = Query(True),
+) -> dict[str, Any]:
+    """Traditional DraftKings & FanDuel slate: +EV line shopping, arbitrage, middles, promos, & steam lag."""
+    hub = _get_hub()
+    eff_bankroll = bankroll if bankroll is not None else hub.settings.bankroll
+    slate = hub.generate_sportsbook_slate(
+        sport=sport,
+        market_filter=market,
+        mode=mode,
+        book_filter=book,
+        target_date=date,
+        min_ev=min_ev,
+        min_prob=min_prob,
+        bankroll=eff_bankroll,
+        arb_stake=arb_stake,
+        arb_rounding=arb_rounding,
+        min_arb_roi=min_arb_roi,
+        bonus_bet_size=bonus_bet_size,
+        boost_pct=boost_pct,
+        include_passes=include_passes,
+        include_dkex_cross_arb=include_dkex_cross_arb,
+        fresh=fresh,
+        live_props=live_props,
+    )
+    slate["ledger_summary"] = hub.db.ledger_summary(
+        starting_bankroll=eff_bankroll,
+        dk_bankroll=hub.settings.dk_bankroll,
+        fd_bankroll=hub.settings.fd_bankroll,
+    )
+    return slate
+
+
+@app.post("/api/sportsbook/evaluate")
+def evaluate_sportsbook_endpoint(req: SportsbookEvalRequest) -> dict[str, Any]:
+    hub = _get_hub()
+    try:
+        return hub.reevaluate_sportsbook_bet(
+            true_prob=req.true_prob,
+            sharp_odds_side=req.sharp_odds_side,
+            sharp_odds_opp=req.sharp_odds_opp,
+            dk_odds=req.dk_odds,
+            fd_odds=req.fd_odds,
+            bankroll=req.bankroll,
+            profit_boost_pct=req.profit_boost_pct,
+            is_live=req.is_live,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/sportsbook/arb-calc")
+def sportsbook_arb_calc_endpoint(req: SportsbookArbCalcRequest) -> dict[str, Any]:
+    hub = _get_hub()
+    try:
+        if req.calc_mode == "bonus_bet":
+            return hub.calculate_bonus_bet_conversion(
+                bonus_book=req.book_a,
+                bonus_odds=float(req.odds_a if req.odds_a is not None else 350),
+                hedge_book=req.book_b,
+                hedge_odds=float(req.odds_b if req.odds_b is not None else -400),
+                bonus_amount=req.bonus_amount,
+            )
+        return hub.calculate_arb_or_hedge(
+            book_a=req.book_a,
+            odds_a=req.odds_a,
+            dkex_ask_a=req.dkex_ask_a,
+            dkex_fee_a=req.dkex_fee_a,
+            book_b=req.book_b,
+            odds_b=req.odds_b,
+            dkex_ask_b=req.dkex_ask_b,
+            dkex_fee_b=req.dkex_fee_b,
+            total_stake=req.total_stake,
+            fixed_stake_a=req.fixed_stake_a,
+            rounding_step=req.rounding_step,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/sportsbook/backtest-metrics")
+def sportsbook_backtest_metrics_endpoint() -> dict[str, Any]:
+    settings = get_settings()
+    metrics_file = settings.models_dir / "sportsbook_backtest_metrics.json"
+    if metrics_file.exists():
+        return json.loads(metrics_file.read_text(encoding="utf-8"))
+    bundled = PROJECT_ROOT / "models" / "sportsbook_backtest_metrics.json"
+    if bundled.exists():
+        return json.loads(bundled.read_text(encoding="utf-8"))
+    return run_sportsbook_backtest(
+        sport="all",
+        arb_rounding=settings.arb_stake_rounding,
+        include_dkex_cross=settings.include_dkex_cross_arb,
+        save_artifact=True,
+    )
+
+
+@app.post("/api/sportsbook/backtest")
+def run_sportsbook_backtest_endpoint(
+    sport: str = Query("all"),
+    regime: str = Query("standard"),
+    arb_rounding: float = Query(1.0, ge=0.0, le=25.0),
+    include_dkex_cross: bool = Query(True),
+) -> dict[str, Any]:
+    """Run fresh zero-lookahead walk-forward Traditional DK/FD strategy verification backtest."""
+    save_artifact = sport.lower() == "all" and regime == "standard"
+    return run_sportsbook_backtest(
+        sport=sport,
+        regime=regime,
+        arb_rounding=arb_rounding,
+        include_dkex_cross=include_dkex_cross,
+        save_artifact=save_artifact,
+    )
 
 
 @app.post("/api/evaluate-contract")
@@ -410,10 +622,13 @@ def run_backtest_endpoint(
 
 
 @app.get("/api/ledger")
-def list_ledger(bankroll: Optional[float] = Query(None, gt=0.0)) -> dict[str, Any]:
+def list_ledger(
+    bankroll: Optional[float] = Query(None, gt=0.0),
+    venue: Optional[str] = Query(None),
+) -> dict[str, Any]:
     hub = _get_hub()
     bk = bankroll if bankroll is not None else hub.settings.bankroll
-    trades = hub.db.list_trades()
+    trades = hub.db.list_trades(venue=venue)
     open_guidance = (
         {op["id"]: op for op in hub.evaluate_open_positions(fresh=False)}
         if any(t["status"] == "OPEN" for t in trades)
@@ -432,8 +647,36 @@ def list_ledger(bankroll: Optional[float] = Query(None, gt=0.0)) -> dict[str, An
         for t in trades
     ]
     return {
-        "summary": hub.db.ledger_summary(starting_bankroll=bk),
+        "summary": hub.db.ledger_summary(
+            starting_bankroll=bk,
+            dk_bankroll=hub.settings.dk_bankroll,
+            fd_bankroll=hub.settings.fd_bankroll,
+        ),
         "trades": enriched,
+    }
+
+
+def _trade_req_to_kwargs(req: CreateTradeRequest, created_at: str) -> dict[str, Any]:
+    return {
+        "created_at": created_at,
+        "sport": req.sport,
+        "event_name": req.event_name,
+        "market_type": req.market_type,
+        "selection_label": req.selection_label,
+        "side": req.side,
+        "entry_price": req.entry_price,
+        "fee_per_contract": req.fee_per_contract,
+        "contracts": req.contracts,
+        "model_prob": req.model_prob,
+        "fair_exit_price": req.fair_exit_price,
+        "notes": req.notes,
+        "venue": req.venue,
+        "bet_format": req.bet_format,
+        "odds_american": req.odds_american,
+        "stake": req.stake,
+        "is_bonus_bet": req.is_bonus_bet,
+        "strategy_tag": req.strategy_tag,
+        "group_id": req.group_id,
     }
 
 
@@ -441,21 +684,30 @@ def list_ledger(bankroll: Optional[float] = Query(None, gt=0.0)) -> dict[str, An
 def create_ledger_trade(req: CreateTradeRequest) -> dict[str, Any]:
     settings = get_settings()
     db = Database(settings.db_path)
-    created = db.log_trade(
-        created_at=datetime.now().strftime("%Y-%m-%d %H:%M"),
-        sport=req.sport,
-        event_name=req.event_name,
-        market_type=req.market_type,
-        selection_label=req.selection_label,
-        side=req.side,
-        entry_price=req.entry_price,
-        fee_per_contract=req.fee_per_contract,
-        contracts=req.contracts,
-        model_prob=req.model_prob,
-        fair_exit_price=req.fair_exit_price,
-        notes=req.notes,
-    )
+    try:
+        created = db.log_trade(
+            **_trade_req_to_kwargs(req, datetime.now().strftime("%Y-%m-%d %H:%M"))
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return created
+
+
+@app.post("/api/ledger/pair")
+def create_ledger_trade_pair(req: CreateTradePairRequest) -> dict[str, Any]:
+    """Atomically log both legs of an Arbitrage, Middle, or Bonus Bet Hedge with shared group_id."""
+    settings = get_settings()
+    db = Database(settings.db_path)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        legs = db.log_trade_pair(
+            _trade_req_to_kwargs(req.leg_a, ts),
+            _trade_req_to_kwargs(req.leg_b, ts),
+            group_id=req.group_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"group_id": legs[0]["group_id"], "trades": legs}
 
 
 @app.patch("/api/ledger/{trade_id}")
@@ -469,6 +721,8 @@ def update_ledger_trade(trade_id: int, req: UpdateTradeRequest) -> dict[str, Any
             exit_or_settle_price=req.exit_or_settle_price,
             exit_fee_per_contract=req.exit_fee_per_contract,
             closing_price=req.closing_price,
+            closing_odds_american=req.closing_odds_american,
+            cashout_amount=req.cashout_amount,
             notes=req.notes,
         )
     except ValueError as exc:

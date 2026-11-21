@@ -58,6 +58,30 @@ def _parse_int(raw: str | None, default: int) -> int:
         return default
 
 
+def _parse_bool(raw: str | None, default: bool = False) -> bool:
+    if raw is None:
+        return default
+    cleaned = str(raw).strip().lower()
+    if cleaned in ("1", "true", "yes", "on"):
+        return True
+    if cleaned in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+def _parse_optional_float(raw: str | None) -> float | None:
+    if raw is None:
+        return None
+    cleaned = str(raw).replace("$", "").replace(",", "").strip()
+    if not cleaned:
+        return None
+    try:
+        val = float(cleaned)
+        return val if val > 0 else None
+    except ValueError:
+        return None
+
+
 def _read_sqlite_settings(db_path: Path) -> dict[str, str]:
     if not db_path.exists():
         return {}
@@ -78,6 +102,13 @@ class Settings:
     max_same_game_pct: float = 0.06
     min_win_prob: float = 0.60
     min_net_edge: float = 0.025
+    traditional_sportsbooks_enabled: bool = False
+    dk_bankroll: float | None = None
+    fd_bankroll: float | None = None
+    arb_stake_rounding: float = 1.0
+    min_arb_roi: float = 0.005
+    min_sb_ev_edge: float = 0.02
+    include_dkex_cross_arb: bool = True
     the_odds_api_key: str = ""
     app_passcode: str = ""
     host: str = "0.0.0.0"
@@ -143,6 +174,17 @@ class Settings:
             max_same_game_pct=_parse_float(_lookup("MAX_SAME_GAME_PCT", "0.06"), 0.06),
             min_win_prob=_parse_float(_lookup("MIN_WIN_PROB", "0.60"), 0.60),
             min_net_edge=_parse_float(_lookup("MIN_NET_EDGE", "0.025"), 0.025),
+            traditional_sportsbooks_enabled=_parse_bool(
+                _lookup("TRADITIONAL_SPORTSBOOKS_ENABLED", "false"), False
+            ),
+            dk_bankroll=_parse_optional_float(_lookup("DK_BANKROLL", "")),
+            fd_bankroll=_parse_optional_float(_lookup("FD_BANKROLL", "")),
+            arb_stake_rounding=_parse_float(_lookup("ARB_STAKE_ROUNDING", "1.0"), 1.0),
+            min_arb_roi=_parse_float(_lookup("MIN_ARB_ROI", "0.005"), 0.005),
+            min_sb_ev_edge=_parse_float(_lookup("MIN_SB_EV_EDGE", "0.02"), 0.02),
+            include_dkex_cross_arb=_parse_bool(
+                _lookup("INCLUDE_DKEX_CROSS_ARB", "true"), True
+            ),
             the_odds_api_key=_lookup("THE_ODDS_API_KEY", "").strip(),
             app_passcode=_base_lookup("APP_PASSCODE", "").strip(),
             host=_base_lookup("HOST", "0.0.0.0").strip() or "0.0.0.0",

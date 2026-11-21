@@ -285,3 +285,23 @@ def run_walk_forward_backtest(
         out_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
     return results
+
+
+def run_traditional_sportsbook_backtest(
+    sport: str = "all",
+    *,
+    regime: str = "standard",
+    arb_rounding: float = 1.0,
+    include_dkex_cross: bool = True,
+    save_artifact: bool = True,
+) -> dict[str, Any]:
+    """Convenience wrapper executing the full Traditional DK/FD strategy walk-forward backtest."""
+    from src.backtest.sportsbook_backtest import run_sportsbook_backtest
+
+    return run_sportsbook_backtest(
+        sport=sport,
+        regime=regime,
+        arb_rounding=arb_rounding,
+        include_dkex_cross=include_dkex_cross,
+        save_artifact=save_artifact,
+    )

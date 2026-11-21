@@ -1,0 +1,570 @@
+{
+  "mode": "traditional_sportsbooks",
+  "primary_regime": "standard",
+  "arb_rounding": 1.0,
+  "include_dkex_cross": true,
+  "chronological_verified": true,
+  "combined": {
+    "regime": "standard",
+    "regime_label": "Standard US Market (4.5% Vig)",
+    "oos_games": 842,
+    "combined_net_pnl": 2476.09,
+    "combined_roi_pct": 0.1076,
+    "ev_line_shopping": {
+      "total_bets": 227,
+      "wins": 111,
+      "losses": 113,
+      "pushes": 3,
+      "hit_rate": 0.4955,
+      "total_staked": 3417.33,
+      "net_pnl": -236.12,
+      "roi_pct": -0.0691,
+      "ending_bankroll": 763.88,
+      "max_drawdown_pct": 0.3758,
+      "avg_clv_pct": 0.0159,
+      "sharpe_ratio": -0.07,
+      "t_stat": -0.07,
+      "p_value": 0.5297,
+      "by_tier": {
+        "A+": {
+          "bets": 127,
+          "wins": 53,
+          "win_rate": 0.4173,
+          "roi_pct": -0.1581,
+          "net_pnl": -375.58
+        },
+        "A": {
+          "bets": 54,
+          "wins": 34,
+          "win_rate": 0.6296,
+          "roi_pct": 0.1873,
+          "net_pnl": 118.54
+        },
+        "B": {
+          "bets": 46,
+          "wins": 24,
+          "win_rate": 0.5217,
+          "roi_pct": 0.0512,
+          "net_pnl": 20.92
+        }
+      },
+      "by_market": {
+        "Moneyline": {
+          "bets": 127,
+          "wins": 68,
+          "win_rate": 0.5354,
+          "roi_pct": 0.0218,
+          "net_pnl": 42.52
+        },
+        "Spread": {
+          "bets": 50,
+          "wins": 22,
+          "win_rate": 0.44,
+          "roi_pct": -0.183,
+          "net_pnl": -135.19
+        },
+        "Total": {
+          "bets": 50,
+          "wins": 21,
+          "win_rate": 0.42,
+          "roi_pct": -0.1965,
+          "net_pnl": -143.44
+        }
+      },
+      "single_book_dk_roi_pct": -0.0003,
+      "single_book_dk_net_pnl": -0.7,
+      "line_shopping_roi_lift_pct": -0.0688
+    },
+    "arbitrage": {
+      "arbs_found": 123,
+      "arbs_executed_exact": 123,
+      "arbs_executed_rounded": 104,
+      "rounding_filtered_count": 19,
+      "dkex_cross_arbs_executed": 58,
+      "exact_total_staked": 12300.0,
+      "exact_net_pnl": 188.61,
+      "exact_realized_roi_pct": 0.0153,
+      "exact_min_trade_pnl": 0.22,
+      "rounded_total_staked": 10400.93,
+      "rounded_net_pnl": 181.89,
+      "realized_roi_pct": 0.0175,
+      "min_trade_pnl": 0.02,
+      "max_drawdown_pct": 0.0
+    },
+    "middles": {
+      "total_middles": 56,
+      "double_wins": 0,
+      "polish_half_wins": 1,
+      "misses": 55,
+      "key_number_middles": 12,
+      "predicted_hit_rate": 0.0311,
+      "realized_hit_rate": 0.0089,
+      "total_staked": 5600.0,
+      "net_pnl": -63.51,
+      "roi_pct": -0.0113,
+      "blind_middles_count": 436,
+      "blind_roi_pct": -0.0163,
+      "blind_vs_filtered_roi_lift_pct": 0.005
+    },
+    "promos_and_boosts": {
+      "bonus_conversions_count": 108,
+      "bonus_face_total": 5400.0,
+      "bonus_expected_cash": 4135.72,
+      "bonus_realized_cash": 4135.78,
+      "bonus_realized_retention_pct": 0.7659,
+      "bonus_theoretical_retention_pct": 0.7659,
+      "bonus_max_outcome_drift": 0.007,
+      "low_hold_pairs_found": 204,
+      "low_hold_avg_pct": 0.011,
+      "low_hold_savings_vs_vig_pct": 0.0345,
+      "boost_25_bets": 800,
+      "boost_25_wins": 310,
+      "boost_25_net_pnl": 2341.15,
+      "boost_25_roi_pct": 0.1171,
+      "unboosted_baseline_roi_pct": -0.0289,
+      "boost_25_roi_lift_pct": 0.146,
+      "boost_50_bets": 831,
+      "boost_50_wins": 302,
+      "boost_50_net_pnl": 4950.87,
+      "boost_50_roi_pct": 0.2383
+    },
+    "steam_lag": {
+      "total_bets": 224,
+      "wins": 124,
+      "losses": 100,
+      "hit_rate": 0.5536,
+      "total_staked": 3583.72,
+      "net_pnl": 252.68,
+      "roi_pct": 0.0705,
+      "ending_bankroll": 1252.68,
+      "max_drawdown_pct": 0.2028,
+      "avg_clv_pct": 0.0217,
+      "sharpe_ratio": 1.07,
+      "t_stat": 1.07,
+      "p_value": 0.1419
+    },
+    "verdicts": {
+      "ev_line_shopping": "MIXED",
+      "arbitrage": "VERIFIED_PROFITABLE",
+      "middles": "POSITIVE_FILTER_LIFT",
+      "bonus_bet_conversion": "VERIFIED_PROFITABLE",
+      "profit_boost": "VERIFIED_PROFITABLE",
+      "steam_lag": "VERIFIED_PROFITABLE"
+    }
+  },
+  "by_league": {
+    "nfl": {
+      "oos_games": 282,
+      "chronological_verified": true,
+      "brier_score": 0.2226,
+      "log_loss": 0.6336,
+      "calibration_bins": [
+        {
+          "bin_label": "50%-57%",
+          "count": 91,
+          "predicted_prob": 0.5389,
+          "actual_win_rate": 0.5604
+        },
+        {
+          "bin_label": "57%-66%",
+          "count": 81,
+          "predicted_prob": 0.6203,
+          "actual_win_rate": 0.5556
+        },
+        {
+          "bin_label": "66%-74%",
+          "count": 61,
+          "predicted_prob": 0.6944,
+          "actual_win_rate": 0.6885
+        },
+        {
+          "bin_label": "74%-82%",
+          "count": 38,
+          "predicted_prob": 0.771,
+          "actual_win_rate": 0.7632
+        },
+        {
+          "bin_label": "82%-90%",
+          "count": 11,
+          "predicted_prob": 0.8567,
+          "actual_win_rate": 1.0
+        }
+      ],
+      "regime": "standard",
+      "regime_label": "Standard US Market (4.5% Vig)",
+      "combined_net_pnl": 686.38,
+      "combined_roi_pct": 0.0919,
+      "ev_line_shopping": {
+        "total_bets": 111,
+        "wins": 51,
+        "losses": 60,
+        "pushes": 0,
+        "hit_rate": 0.4595,
+        "total_staked": 1891.96,
+        "net_pnl": -185.76,
+        "roi_pct": -0.0982,
+        "ending_bankroll": 814.24,
+        "max_drawdown_pct": 0.3617,
+        "avg_clv_pct": 0.0081,
+        "sharpe_ratio": -0.33,
+        "t_stat": -0.33,
+        "p_value": 0.6277,
+        "by_tier": {
+          "A+": {
+            "bets": 77,
+            "wins": 30,
+            "win_rate": 0.3896,
+            "roi_pct": -0.1639,
+            "net_pnl": -257.97
+          },
+          "A": {
+            "bets": 18,
+            "wins": 13,
+            "win_rate": 0.7222,
+            "roi_pct": 0.3454,
+            "net_pnl": 68.05
+          },
+          "B": {
+            "bets": 16,
+            "wins": 8,
+            "win_rate": 0.5,
+            "roi_pct": 0.0344,
+            "net_pnl": 4.16
+          }
+        },
+        "by_market": {
+          "Moneyline": {
+            "bets": 48,
+            "wins": 19,
+            "win_rate": 0.3958,
+            "roi_pct": -0.1019,
+            "net_pnl": -85.28
+          },
+          "Spread": {
+            "bets": 24,
+            "wins": 13,
+            "win_rate": 0.5417,
+            "roi_pct": 0.0373,
+            "net_pnl": 16.22
+          },
+          "Total": {
+            "bets": 39,
+            "wins": 19,
+            "win_rate": 0.4872,
+            "roi_pct": -0.1881,
+            "net_pnl": -116.7
+          }
+        },
+        "single_book_dk_roi_pct": -0.0942,
+        "single_book_dk_net_pnl": -113.06,
+        "line_shopping_roi_lift_pct": -0.004
+      },
+      "arbitrage": {
+        "arbs_found": 33,
+        "arbs_executed_exact": 33,
+        "arbs_executed_rounded": 21,
+        "rounding_filtered_count": 12,
+        "dkex_cross_arbs_executed": 8,
+        "exact_total_staked": 3300.0,
+        "exact_net_pnl": 47.32,
+        "exact_realized_roi_pct": 0.0143,
+        "exact_min_trade_pnl": 0.23,
+        "rounded_total_staked": 2098.91,
+        "rounded_net_pnl": 38.29,
+        "realized_roi_pct": 0.0182,
+        "min_trade_pnl": 0.04,
+        "max_drawdown_pct": 0.0
+      },
+      "middles": {
+        "total_middles": 28,
+        "double_wins": 0,
+        "polish_half_wins": 0,
+        "misses": 28,
+        "key_number_middles": 18,
+        "predicted_hit_rate": 0.0324,
+        "realized_hit_rate": 0.0,
+        "total_staked": 2800.0,
+        "net_pnl": -58.57,
+        "roi_pct": -0.0209,
+        "blind_middles_count": 154,
+        "blind_roi_pct": -0.0298,
+        "blind_vs_filtered_roi_lift_pct": 0.0089
+      },
+      "promos_and_boosts": {
+        "bonus_conversions_count": 37,
+        "bonus_face_total": 1850.0,
+        "bonus_expected_cash": 1435.51,
+        "bonus_realized_cash": 1435.48,
+        "bonus_realized_retention_pct": 0.7759,
+        "bonus_theoretical_retention_pct": 0.776,
+        "bonus_max_outcome_drift": 0.006,
+        "low_hold_pairs_found": 71,
+        "low_hold_avg_pct": 0.0105,
+        "low_hold_savings_vs_vig_pct": 0.035,
+        "boost_25_bets": 268,
+        "boost_25_wins": 96,
+        "boost_25_net_pnl": 954.84,
+        "boost_25_roi_pct": 0.1425,
+        "unboosted_baseline_roi_pct": -0.0143,
+        "boost_25_roi_lift_pct": 0.1568,
+        "boost_50_bets": 280,
+        "boost_50_wins": 102,
+        "boost_50_net_pnl": 2304.91,
+        "boost_50_roi_pct": 0.3293
+      },
+      "steam_lag": {
+        "total_bets": 52,
+        "wins": 22,
+        "losses": 30,
+        "hit_rate": 0.4231,
+        "total_staked": 674.68,
+        "net_pnl": -62.42,
+        "roi_pct": -0.0925,
+        "ending_bankroll": 937.58,
+        "max_drawdown_pct": 0.247,
+        "avg_clv_pct": 0.0198,
+        "sharpe_ratio": -0.68,
+        "t_stat": -0.68,
+        "p_value": 0.752
+      },
+      "verdicts": {
+        "ev_line_shopping": "MIXED",
+        "arbitrage": "VERIFIED_PROFITABLE",
+        "middles": "POSITIVE_FILTER_LIFT",
+        "bonus_bet_conversion": "VERIFIED_PROFITABLE",
+        "profit_boost": "VERIFIED_PROFITABLE",
+        "steam_lag": "POSITIVE_CLV"
+      }
+    },
+    "nba": {
+      "oos_games": 560,
+      "chronological_verified": true,
+      "brier_score": 0.1941,
+      "log_loss": 0.5734,
+      "calibration_bins": [
+        {
+          "bin_label": "50%-57%",
+          "count": 172,
+          "predicted_prob": 0.5411,
+          "actual_win_rate": 0.5291
+        },
+        {
+          "bin_label": "57%-66%",
+          "count": 133,
+          "predicted_prob": 0.6203,
+          "actual_win_rate": 0.6992
+        },
+        {
+          "bin_label": "66%-74%",
+          "count": 128,
+          "predicted_prob": 0.6984,
+          "actual_win_rate": 0.7969
+        },
+        {
+          "bin_label": "74%-82%",
+          "count": 92,
+          "predicted_prob": 0.773,
+          "actual_win_rate": 0.8478
+        },
+        {
+          "bin_label": "82%-90%",
+          "count": 35,
+          "predicted_prob": 0.85,
+          "actual_win_rate": 0.9143
+        }
+      ],
+      "regime": "standard",
+      "regime_label": "Standard US Market (4.5% Vig)",
+      "combined_net_pnl": 2247.95,
+      "combined_roi_pct": 0.139,
+      "ev_line_shopping": {
+        "total_bets": 91,
+        "wins": 52,
+        "losses": 39,
+        "pushes": 0,
+        "hit_rate": 0.5714,
+        "total_staked": 1640.99,
+        "net_pnl": 246.71,
+        "roi_pct": 0.1503,
+        "ending_bankroll": 1246.71,
+        "max_drawdown_pct": 0.0574,
+        "avg_clv_pct": 0.0298,
+        "sharpe_ratio": 0.86,
+        "t_stat": 0.86,
+        "p_value": 0.1961,
+        "by_tier": {
+          "A+": {
+            "bets": 29,
+            "wins": 20,
+            "win_rate": 0.6897,
+            "roi_pct": 0.3305,
+            "net_pnl": 233.35
+          },
+          "A": {
+            "bets": 23,
+            "wins": 13,
+            "win_rate": 0.5652,
+            "roi_pct": 0.0422,
+            "net_pnl": 18.28
+          },
+          "B": {
+            "bets": 39,
+            "wins": 19,
+            "win_rate": 0.4872,
+            "roi_pct": -0.0098,
+            "net_pnl": -4.93
+          }
+        },
+        "by_market": {
+          "Moneyline": {
+            "bets": 72,
+            "wins": 46,
+            "win_rate": 0.6389,
+            "roi_pct": 0.2316,
+            "net_pnl": 323.02
+          },
+          "Spread": {
+            "bets": 8,
+            "wins": 2,
+            "win_rate": 0.25,
+            "roi_pct": -0.4361,
+            "net_pnl": -43.17
+          },
+          "Total": {
+            "bets": 11,
+            "wins": 4,
+            "win_rate": 0.3636,
+            "roi_pct": -0.2254,
+            "net_pnl": -33.14
+          }
+        },
+        "single_book_dk_roi_pct": 0.31,
+        "single_book_dk_net_pnl": 322.96,
+        "line_shopping_roi_lift_pct": -0.1597
+      },
+      "arbitrage": {
+        "arbs_found": 81,
+        "arbs_executed_exact": 81,
+        "arbs_executed_rounded": 66,
+        "rounding_filtered_count": 15,
+        "dkex_cross_arbs_executed": 40,
+        "exact_total_staked": 8100.0,
+        "exact_net_pnl": 133.56,
+        "exact_realized_roi_pct": 0.0165,
+        "exact_min_trade_pnl": 0.2,
+        "rounded_total_staked": 6600.16,
+        "rounded_net_pnl": 121.56,
+        "realized_roi_pct": 0.0184,
+        "min_trade_pnl": 0.11,
+        "max_drawdown_pct": 0.0
+      },
+      "middles": {
+        "total_middles": 40,
+        "double_wins": 1,
+        "polish_half_wins": 0,
+        "misses": 39,
+        "key_number_middles": 0,
+        "predicted_hit_rate": 0.0284,
+        "realized_hit_rate": 0.025,
+        "total_staked": 4000.0,
+        "net_pnl": 31.37,
+        "roi_pct": 0.0078,
+        "blind_middles_count": 293,
+        "blind_roi_pct": -0.0236,
+        "blind_vs_filtered_roi_lift_pct": 0.0314
+      },
+      "promos_and_boosts": {
+        "bonus_conversions_count": 63,
+        "bonus_face_total": 3150.0,
+        "bonus_expected_cash": 2460.03,
+        "bonus_realized_cash": 2460.01,
+        "bonus_realized_retention_pct": 0.781,
+        "bonus_theoretical_retention_pct": 0.781,
+        "bonus_max_outcome_drift": 0.006,
+        "low_hold_pairs_found": 140,
+        "low_hold_avg_pct": 0.011,
+        "low_hold_savings_vs_vig_pct": 0.0345,
+        "boost_25_bets": 524,
+        "boost_25_wins": 206,
+        "boost_25_net_pnl": 1144.48,
+        "boost_25_roi_pct": 0.0874,
+        "unboosted_baseline_roi_pct": -0.0515,
+        "boost_25_roi_lift_pct": 0.1389,
+        "boost_50_bets": 550,
+        "boost_50_wins": 187,
+        "boost_50_net_pnl": 1649.76,
+        "boost_50_roi_pct": 0.12
+      },
+      "steam_lag": {
+        "total_bets": 189,
+        "wins": 114,
+        "losses": 75,
+        "hit_rate": 0.6032,
+        "total_staked": 3927.44,
+        "net_pnl": 703.83,
+        "roi_pct": 0.1792,
+        "ending_bankroll": 1703.83,
+        "max_drawdown_pct": 0.0846,
+        "avg_clv_pct": 0.0222,
+        "sharpe_ratio": 2.29,
+        "t_stat": 2.29,
+        "p_value": 0.0112
+      },
+      "verdicts": {
+        "ev_line_shopping": "MIXED",
+        "arbitrage": "VERIFIED_PROFITABLE",
+        "middles": "VERIFIED_PROFITABLE",
+        "bonus_bet_conversion": "VERIFIED_PROFITABLE",
+        "profit_boost": "VERIFIED_PROFITABLE",
+        "steam_lag": "VERIFIED_PROFITABLE"
+      }
+    }
+  },
+  "stress_regimes": {
+    "standard": {
+      "label": "Standard US Market (4.5% Vig)",
+      "combined_net_pnl": 2476.09,
+      "combined_roi_pct": 0.1076,
+      "ev_roi_pct": -0.0691,
+      "ev_line_shopping_lift_pct": -0.0688,
+      "arb_roi_pct": 0.0175,
+      "arb_count": 104,
+      "middles_roi_pct": -0.0113,
+      "middles_count": 56,
+      "bonus_retention_pct": 0.7659,
+      "boost_25_roi_pct": 0.1171,
+      "steam_roi_pct": 0.0705,
+      "steam_clv_pct": 0.0217
+    },
+    "tight_vig": {
+      "label": "Tight Retail Stress (4.8% Vig)",
+      "combined_net_pnl": 1689.64,
+      "combined_roi_pct": 0.138,
+      "ev_roi_pct": -0.0386,
+      "ev_line_shopping_lift_pct": -0.0697,
+      "arb_roi_pct": 0.0188,
+      "arb_count": 22,
+      "middles_roi_pct": 0.0032,
+      "middles_count": 45,
+      "bonus_retention_pct": 0.7502,
+      "boost_25_roi_pct": 0.077,
+      "steam_roi_pct": 0.1027,
+      "steam_clv_pct": 0.02
+    },
+    "active_steam": {
+      "label": "Active Steam / High Dispersion",
+      "combined_net_pnl": 3968.38,
+      "combined_roi_pct": 0.0851,
+      "ev_roi_pct": 0.0854,
+      "ev_line_shopping_lift_pct": 0.0112,
+      "arb_roi_pct": 0.0259,
+      "arb_count": 224,
+      "middles_roi_pct": 0.0045,
+      "middles_count": 90,
+      "bonus_retention_pct": 0.8009,
+      "boost_25_roi_pct": 0.1076,
+      "steam_roi_pct": 0.0661,
+      "steam_clv_pct": 0.0265
+    }
+  }
+}

@@ -34,6 +34,7 @@ class PlayerPropProjection:
     line_source: str = "Model Ref Line"
     default_line_value: float | None = None
     is_custom_line: bool = False
+    book_lines: dict[str, dict[str, Any]] | None = None
 
 
 def _lookup_player_prop(
@@ -123,6 +124,29 @@ def _scoring_over_prob(mean: float, std: float, line: float) -> float:
         return clamp_prob(0.995)
     sigma = max(0.85, std)
     return clamp_prob(float(1.0 - student_t.cdf(line, df=10, loc=mean, scale=sigma * 0.92)))
+
+
+def prop_over_prob_for_line(
+    sport: str,
+    prop_type: str,
+    mean: float,
+    std: float,
+    line: float,
+    *,
+    shrink_factor: float = 0.78,
+) -> float:
+    """
+    Evaluate calibrated Over probability P(X > line) using the exact stat-appropriate
+    parametric distribution (Student-t for scoring, NegBin/Poisson for counts, Gamma for yards).
+    """
+    pt = str(prop_type).lower()
+    if pt in ("points", "pra"):
+        raw = _scoring_over_prob(mean, std, line)
+    elif pt in ("passing_yards", "rushing_yards", "receiving_yards"):
+        raw = _yardage_over_prob(mean, std, line)
+    else:
+        raw = _count_over_prob(mean, std, line)
+    return clamp_prob(0.50 + shrink_factor * (raw - 0.50))
 
 
 class PlayerPropsEngine:
@@ -572,6 +596,7 @@ class PlayerPropsEngine:
                             line_source=line_src,
                             default_line_value=sync_default_line,
                             is_custom_line=is_custom,
+                            book_lines=mkt_prop.get("books") if mkt_prop else None,
                         )
                     )
         return out
@@ -893,6 +918,7 @@ class PlayerPropsEngine:
                             line_source=line_src,
                             default_line_value=sync_default_line,
                             is_custom_line=is_custom,
+                            book_lines=mkt_prop.get("books") if mkt_prop else None,
                         )
                     )
         return out

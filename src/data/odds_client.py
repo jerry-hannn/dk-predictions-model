@@ -349,7 +349,7 @@ class OddsClient:
     def extract_player_prop_lines(
         sport: str, event_payload: dict[str, Any]
     ) -> dict[tuple[str, str], dict[str, Any]]:
-        """Extract DraftKings-prioritized player prop lines & de-vigged probabilities."""
+        """Extract DraftKings, FanDuel, and consensus player prop lines, American odds, & de-vigged probabilities."""
         prop_map = (
             PROP_MARKET_MAP_NBA if sport.upper() == "NBA" else PROP_MARKET_MAP_NFL
         )
@@ -357,7 +357,7 @@ class OddsClient:
         books = list(event_payload.get("bookmakers") or [])
         books.sort(key=lambda b: 1 if str(b.get("key", "")).lower() == "draftkings" else 0)
 
-        accum: dict[tuple[str, str], list[tuple[str, float, float]]] = {}
+        accum: dict[tuple[str, str], list[tuple[str, float, float, int, int]]] = {}
         for book in books:
             bkey = str(book.get("key", "")).lower()
             for mkt in book.get("markets") or []:
@@ -375,23 +375,52 @@ class OddsClient:
                 for pname, pair in by_player.items():
                     if "over" in pair and "under" in pair:
                         ln = float(pair["over"]["point"])
-                        po, _ = devig_american_pair(
-                            float(pair["over"]["price"]), float(pair["under"]["price"])
+                        o_px = float(pair["over"]["price"])
+                        u_px = float(pair["under"]["price"])
+                        po, _ = devig_american_pair(o_px, u_px)
+                        accum.setdefault((pname, col), []).append(
+                            (bkey, ln, po, int(round(o_px)), int(round(u_px)))
                         )
-                        accum.setdefault((pname, col), []).append((bkey, ln, po))
 
         out_props: dict[tuple[str, str], dict[str, Any]] = {}
         for key, entries in accum.items():
-            dk_entry = next((e for e in entries if e[0] == "draftkings"), entries[-1])
-            target_line = dk_entry[1]
-            same_line_probs = [p for _, ln, p in entries if abs(ln - target_line) < 0.01]
+            dk_entry = next((e for e in entries if e[0] == "draftkings"), None)
+            fd_entry = next((e for e in entries if e[0] == "fanduel"), None)
+            anchor_entry = dk_entry or entries[-1]
+            target_line = anchor_entry[1]
+            same_line_probs = [p for _, ln, p, _, _ in entries if abs(ln - target_line) < 0.01]
             mkt_over_p = sum(same_line_probs) / len(same_line_probs)
-            val_obj = {
+
+            book_lines: dict[str, dict[str, Any]] = {}
+            for bkey, ln, po, o_px, u_px in entries:
+                book_lines[bkey] = {
+                    "line": ln,
+                    "over_odds": o_px,
+                    "under_odds": u_px,
+                    "over_prob": round(po, 4),
+                }
+
+            val_obj: dict[str, Any] = {
                 "line": target_line,
                 "over_prob": round(mkt_over_p, 4),
-                "dk_over_prob": round(dk_entry[2], 4),
-                "source": "DraftKings" if dk_entry[0] == "draftkings" else dk_entry[0].title(),
+                "dk_over_prob": round(anchor_entry[2], 4),
+                "source": (
+                    "DraftKings"
+                    if anchor_entry[0] == "draftkings"
+                    else anchor_entry[0].title()
+                ),
+                "books": book_lines,
             }
+            if dk_entry is not None:
+                val_obj["dk_line"] = dk_entry[1]
+                val_obj["dk_over_odds"] = dk_entry[3]
+                val_obj["dk_under_odds"] = dk_entry[4]
+            if fd_entry is not None:
+                val_obj["fd_line"] = fd_entry[1]
+                val_obj["fd_over_odds"] = fd_entry[3]
+                val_obj["fd_under_odds"] = fd_entry[4]
+                val_obj["fd_over_prob"] = round(fd_entry[2], 4)
+
             out_props[key] = val_obj
             norm_p = normalize_player_name(key[0])
             if norm_p:
@@ -415,24 +444,32 @@ class OddsClient:
     ) -> dict[str, Any] | None:
         """
         Compute sharpness-weighted de-vigged h2h, spread, and total consensus AND extract
-        exact DraftKings lines, prices, book dispersion, and timestamp freshness.
+        exact DraftKings & FanDuel lines/prices, sharp-only consensus, book dispersion, and freshness.
         """
         matched = cls.find_matching_event(odds_events, home_team, away_team)
         if matched is None:
             return None
 
         h2h_num, h2h_den = 0.0, 0.0
+        sharp_h2h_num, sharp_h2h_den = 0.0, 0.0
         spread_lines: list[tuple[str, float, float, float]] = []  # (bkey, weight, home_line, home_prob)
+        sharp_spread_lines: list[tuple[str, float, float, float]] = []
         total_lines: list[tuple[str, float, float, float]] = []   # (bkey, weight, total_pts, over_prob)
+        sharp_total_lines: list[tuple[str, float, float, float]] = []
 
         dk_data: dict[str, Any] = {}
+        fd_data: dict[str, Any] = {}
         freshest_age: float | None = None
         books_seen = 0
+        sharp_books_seen = 0
 
         for book in matched.get("bookmakers", []):
             bkey = str(book.get("key", "")).lower()
             w = BOOK_SHARPNESS_WEIGHTS.get(bkey, 1.0)
             books_seen += 1
+            is_non_dk_fd = bkey not in ("draftkings", "fanduel")
+            if is_non_dk_fd:
+                sharp_books_seen += 1
 
             b_age = _iso_age_seconds(book.get("last_update"))
             if b_age is not None:
@@ -459,11 +496,19 @@ class OddsClient:
                         ph, _ = devig_american_pair(h_px, a_px)
                         h2h_num += w * ph
                         h2h_den += w
+                        if is_non_dk_fd:
+                            sharp_h2h_num += w * ph
+                            sharp_h2h_den += w
                         if bkey == "draftkings":
                             dk_data["dk_home_ml"] = int(round(h_px))
                             dk_data["dk_away_ml"] = int(round(a_px))
                             dk_data["dk_home_win_prob"] = round(ph, 4)
                             dk_data["dk_age_seconds"] = m_age or b_age
+                        elif bkey == "fanduel":
+                            fd_data["fd_home_ml"] = int(round(h_px))
+                            fd_data["fd_away_ml"] = int(round(a_px))
+                            fd_data["fd_home_win_prob"] = round(ph, 4)
+                            fd_data["fd_age_seconds"] = m_age or b_age
 
                 elif mkey == "spreads":
                     home_out = next(
@@ -477,12 +522,20 @@ class OddsClient:
                         a_px = float(away_out["price"])
                         ph, _ = devig_american_pair(h_px, a_px)
                         spread_lines.append((bkey, w, h_pt, ph))
+                        if is_non_dk_fd:
+                            sharp_spread_lines.append((bkey, w, h_pt, ph))
                         if bkey == "draftkings":
                             dk_data["dk_home_spread"] = h_pt
                             dk_data["dk_home_spread_odds"] = int(round(h_px))
                             dk_data["dk_away_spread_odds"] = int(round(a_px))
                             dk_data["dk_home_cover_prob"] = round(ph, 4)
                             dk_data["dk_age_seconds"] = m_age or b_age
+                        elif bkey == "fanduel":
+                            fd_data["fd_home_spread"] = h_pt
+                            fd_data["fd_home_spread_odds"] = int(round(h_px))
+                            fd_data["fd_away_spread_odds"] = int(round(a_px))
+                            fd_data["fd_home_cover_prob"] = round(ph, 4)
+                            fd_data["fd_age_seconds"] = m_age or b_age
 
                 elif mkey == "totals":
                     over_out = next(
@@ -499,29 +552,52 @@ class OddsClient:
                         u_px = float(under_out["price"])
                         po, _ = devig_american_pair(o_px, u_px)
                         total_lines.append((bkey, w, t_pt, po))
+                        if is_non_dk_fd:
+                            sharp_total_lines.append((bkey, w, t_pt, po))
                         if bkey == "draftkings":
                             dk_data["dk_total_line"] = t_pt
                             dk_data["dk_over_odds"] = int(round(o_px))
                             dk_data["dk_under_odds"] = int(round(u_px))
                             dk_data["dk_over_prob"] = round(po, 4)
                             dk_data["dk_age_seconds"] = m_age or b_age
+                        elif bkey == "fanduel":
+                            fd_data["fd_total_line"] = t_pt
+                            fd_data["fd_over_odds"] = int(round(o_px))
+                            fd_data["fd_under_odds"] = int(round(u_px))
+                            fd_data["fd_over_prob"] = round(po, 4)
+                            fd_data["fd_age_seconds"] = m_age or b_age
+
+        if dk_data and fd_data:
+            src_label = f"DK + FD + {books_seen}-Book Sharp"
+        elif dk_data:
+            src_label = f"DraftKings + {books_seen}-Book Sharp"
+        elif fd_data:
+            src_label = f"FanDuel + {books_seen}-Book Sharp"
+        else:
+            src_label = f"{books_seen}-Book Sharp Consensus"
 
         result: dict[str, Any] = {
             "odds_event_id": str(matched.get("id", "")),
             "books_count": books_seen,
-            "odds_age_seconds": dk_data.get("dk_age_seconds", freshest_age),
-            "line_source": (
-                f"DraftKings + {books_seen}-Book Sharp"
-                if dk_data
-                else f"{books_seen}-Book Sharp Consensus"
-            ),
+            "sharp_books_count": sharp_books_seen,
+            "has_draftkings": bool(dk_data),
+            "has_fanduel": bool(fd_data),
+            "odds_age_seconds": dk_data.get("dk_age_seconds", fd_data.get("fd_age_seconds", freshest_age)),
+            "line_source": src_label,
+            "books_detail": {
+                "draftkings": dict(dk_data),
+                "fanduel": dict(fd_data),
+            },
         }
         result.update(dk_data)
+        result.update(fd_data)
 
         if h2h_den > 0:
             sharp_ml_p = round(h2h_num / h2h_den, 4)
             result["home_win_prob"] = sharp_ml_p
             result["sharp_home_win_prob"] = sharp_ml_p
+        if sharp_h2h_den > 0:
+            result["sharp_only_home_win_prob"] = round(sharp_h2h_num / sharp_h2h_den, 4)
 
         if spread_lines:
             modal_line = max(
@@ -532,7 +608,21 @@ class OddsClient:
             all_pts = [ln for _, _, ln, _ in spread_lines]
             result["spread_dispersion"] = round(max(all_pts) - min(all_pts), 2)
 
-            # Evaluate the actual DraftKings spread line when available so picks match what's tradable on DK!
+            if sharp_spread_lines:
+                sharp_modal_sp = max(
+                    {ln for _, _, ln, _ in sharp_spread_lines},
+                    key=lambda x: sum(w for _, w, ln, _ in sharp_spread_lines if abs(ln - x) < 0.01),
+                )
+                result["sharp_only_home_spread"] = sharp_modal_sp
+                same_sharp_sp = [
+                    (w, p) for _, w, ln, p in sharp_spread_lines if abs(ln - sharp_modal_sp) < 0.01
+                ]
+                if same_sharp_sp:
+                    result["sharp_only_home_cover_prob"] = round(
+                        sum(w * p for w, p in same_sharp_sp) / sum(w for w, _ in same_sharp_sp), 4
+                    )
+
+            # Evaluate the actual DraftKings spread line when available so DKeX picks match what's tradable on DK!
             target_sp = dk_data.get("dk_home_spread", modal_line)
             result["home_spread"] = target_sp
             same_sp = [(w, p) for _, w, ln, p in spread_lines if abs(ln - target_sp) < 0.01]
@@ -551,6 +641,20 @@ class OddsClient:
             result["sharp_total_line"] = modal_tot
             all_tots = [ln for _, _, ln, _ in total_lines]
             result["total_dispersion"] = round(max(all_tots) - min(all_tots), 2)
+
+            if sharp_total_lines:
+                sharp_modal_tot = max(
+                    {ln for _, _, ln, _ in sharp_total_lines},
+                    key=lambda x: sum(w for _, w, ln, _ in sharp_total_lines if abs(ln - x) < 0.01),
+                )
+                result["sharp_only_total_line"] = sharp_modal_tot
+                same_sharp_tot = [
+                    (w, p) for _, w, ln, p in sharp_total_lines if abs(ln - sharp_modal_tot) < 0.01
+                ]
+                if same_sharp_tot:
+                    result["sharp_only_over_prob"] = round(
+                        sum(w * p for w, p in same_sharp_tot) / sum(w for w, _ in same_sharp_tot), 4
+                    )
 
             target_tot = dk_data.get("dk_total_line", modal_tot)
             result["total_line"] = target_tot
