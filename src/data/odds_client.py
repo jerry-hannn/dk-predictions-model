@@ -303,7 +303,7 @@ class OddsClient:
         if not sport_key:
             return {}
 
-        cache_key = f"odds_api:v2:{sport_u}:props:{odds_event_id}"
+        cache_key = f"odds_api:v3:{sport_u}:props:{odds_event_id}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if cached is not None:
@@ -327,6 +327,7 @@ class OddsClient:
         url = f"{self.BASE_URL}/sports/{sport_key}/events/{odds_event_id}/odds"
         params = {
             "apiKey": self.api_key,
+            "regions": "us",
             "markets": ",".join(prop_map.keys()),
             "bookmakers": "draftkings,fanduel,betmgm",
             "oddsFormat": "american",

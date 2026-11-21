@@ -1809,7 +1809,8 @@ class ModelHub:
                             if st_dt.tzinfo is None:
                                 st_dt = st_dt.replace(tzinfo=_tz.utc)
                             hrs_away = (st_dt - datetime.now(_tz.utc)).total_seconds() / 3600.0
-                            within_prop_window = -6.0 <= hrs_away <= 36.0
+                            max_hrs = 72.0 if sp == "NFL" else 48.0
+                            within_prop_window = -6.0 <= hrs_away <= max_hrs
                         except ValueError:
                             within_prop_window = True
                     else:
@@ -2627,6 +2628,23 @@ class ModelHub:
                         else ("DraftKings" if dk_p is not None else "FanDuel")
                     )
 
+                    # Cross-book consensus over probability when both DK & FD post the same line
+                    same_ln_probs = [
+                        float(e["over_prob"])
+                        for e in (dk_p, fd_p)
+                        if e and e.get("over_prob") is not None
+                    ]
+                    consensus_same_line = (
+                        (sum(same_ln_probs) / len(same_ln_probs))
+                        if (
+                            dk_p is not None
+                            and fd_p is not None
+                            and abs(float(dk_p["line"]) - float(fd_p["line"])) < 0.01
+                            and same_ln_probs
+                        )
+                        else None
+                    )
+
                     pp_evals: list[dict[str, Any]] = []
                     for bk, entry in (("DRAFTKINGS", dk_p), ("FANDUEL", fd_p)):
                         if not entry:
@@ -2641,9 +2659,9 @@ class ModelHub:
                             if abs(ln_v - float(pp.line_value)) < 0.01
                             else prop_over_prob_for_line(sp, pp.prop_type, pp.projected_mean, pp.projected_std, ln_v)
                         )
-                        mkt_ov = entry.get("over_prob")
+                        mkt_ov = consensus_same_line if consensus_same_line is not None else entry.get("over_prob")
                         blend_ov = (
-                            blend_probabilities(mod_ov, float(mkt_ov), market_weight=0.58)
+                            blend_probabilities(mod_ov, float(mkt_ov), market_weight=0.52)
                             if mkt_ov is not None
                             else mod_ov
                         )
@@ -2664,7 +2682,7 @@ class ModelHub:
                                 anchor_prob=sh_s,
                                 uncertainty=0.16,
                                 injury_clarity=pp.injury_clarity,
-                                max_neg_clv=0.025,
+                                max_neg_clv=0.055,
                             )
                             pp_evals.append({"eval": ev_res, "label": lbl, "line": ln_v, "blend_ov": blend_ov})
 

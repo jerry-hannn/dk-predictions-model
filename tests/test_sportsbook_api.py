@@ -660,13 +660,13 @@ def test_prop_book_merging_multiline_fanduel_and_no_fake_dk_fabrication(
                 "dk_over_prob": 0.50,
                 "source": "DraftKings",
                 "dk_line": 25.5,
-                "dk_over_odds": -110,
-                "dk_under_odds": -110,
+                "dk_over_odds": -115,
+                "dk_under_odds": -115,
                 "books": {
                     "draftkings": {
                         "line": 25.5,
-                        "over_odds": -110,
-                        "under_odds": -110,
+                        "over_odds": -115,
+                        "under_odds": -115,
                         "over_prob": 0.50,
                     }
                 },
@@ -765,6 +765,8 @@ def test_prop_book_merging_multiline_fanduel_and_no_fake_dk_fabrication(
     assert p["fd_line"] == 26.5
     assert p["dk_odds"] is not None
     assert p["fd_odds"] is not None
+    assert p["confidence_tier"] != "PASS"
+    assert p["recommended_stake"] > 0.0
     # And because DK=25.5 vs FD=26.5, a Player Prop Middle is automatically detected!
     assert any("Points" in m["market_type"] for m in slate["middles"])
 

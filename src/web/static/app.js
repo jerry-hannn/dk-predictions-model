@@ -1270,7 +1270,7 @@ function buildSportsbookCardInnerHtml(p, idx) {
   const fdLnTxt = p.fd_line != null ? ` (${p.fd_line > 0 && p.market_type.includes('Spread') ? '+' : ''}${p.fd_line})` : '';
   const shopPill =
     p.line_shopping_gain_pct != null && p.line_shopping_gain_pct >= 0.004
-      ? `<span class="strat-pill strat-arb">SHOP +${(p.line_shopping_gain_pct * 100).toFixed(1)}%</span>`
+      ? `<span class="strat-pill strat-arb" title="Line Shopping Gain: betting this side on ${dkBest ? 'DraftKings' : 'FanDuel'} yields +${(p.line_shopping_gain_pct * 100).toFixed(1)}% more EV than the other book">SHOP +${(p.line_shopping_gain_pct * 100).toFixed(1)}%</span>`
       : '';
 
   const drivers = p.drivers || [];
