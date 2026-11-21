@@ -16,6 +16,7 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from src.models import atomic_joblib_dump
 from src.config import get_settings
 from src.engine.dk_math import clamp_prob, inv_logit, logit
 
@@ -491,9 +492,7 @@ class NFLGameModel:
 
     def save(self, path: Path | None = None) -> Path:
         target = path or (get_settings().models_dir / "nfl_game_model.joblib")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(self, target)
-        return target
+        return atomic_joblib_dump(self, target)
 
     @classmethod
     def load(cls, path: Path | None = None) -> "NFLGameModel":

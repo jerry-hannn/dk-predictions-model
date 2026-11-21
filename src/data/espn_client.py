@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -71,20 +72,51 @@ TEAM_NAME_TO_ABBR = {
 
 def _parse_american_str(val: Any) -> float | None:
     """Parse American odds values like '-118', '+114', 'EVEN', or numeric -110."""
-    if val is None:
+    if val is None or isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
-        return 100.0 if float(val) == 0.0 else float(val)
-    s = str(val).strip().upper()
-    if not s or s in ("N/A", "-", "OFF"):
+        parsed = float(val)
+    else:
+        s = str(val).strip().upper()
+        if not s or s in ("N/A", "-", "OFF"):
+            return None
+        if s in ("EVEN", "EV", "PK"):
+            return 100.0
+        try:
+            parsed = float(s)
+        except ValueError:
+            return None
+    if math.isnan(parsed) or math.isinf(parsed):
         return None
-    if s in ("EVEN", "EV", "PK"):
+    if parsed == 0.0:
         return 100.0
+    # |odds| < 100 is not a valid American price and would yield nonsense implied probabilities
+    return parsed if abs(parsed) >= 100.0 else None
+
+
+def _safe_float(val: Any, default: float) -> float:
+    """float() that tolerates None / '' / malformed strings from loosely-typed ESPN JSON."""
+    if val is None or val == "":
+        return default
     try:
-        parsed = float(s)
-        return 100.0 if parsed == 0.0 else parsed
-    except ValueError:
-        return None
+        f = float(val)
+    except (TypeError, ValueError):
+        return default
+    return default if math.isnan(f) or math.isinf(f) else f
+
+
+def _deserialize_props(cached: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
+    """Rebuild `(player_key, stat_col)` prop dict (incl. normalized-name aliases) from cache JSON."""
+    out: dict[tuple[str, str], dict[str, Any]] = {}
+    for k, v in (cached or {}).items():
+        if "::" not in k:
+            continue
+        p_low, col = k.split("::", 1)
+        out[(p_low, col)] = v
+        norm_p = normalize_player_name(p_low)
+        if norm_p:
+            out.setdefault((norm_p, col), v)
+    return out
 
 
 def _parse_line_number(val: Any) -> float | None:
@@ -219,7 +251,7 @@ class ESPNClient:
         normalized_events: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
 
-        for d_param in dates_to_check:
+        def _load_date(d_param: str | None) -> dict[str, Any] | None:
             cache_key = f"espn:scoreboard:{sport_u}:{d_param or 'current_week'}"
             payload = None if force_refresh else self.db.get_cache(cache_key)
             if payload is None:
@@ -228,31 +260,47 @@ class ESPNClient:
                 try:
                     resp = http_get(url, params=params, headers=HEADERS, timeout=10.0)
                     payload = resp.json()
+                    if not isinstance(payload, dict):
+                        raise ValueError("Unexpected ESPN scoreboard payload")
                     has_live = any(
                         str(
-                            ev.get("competitions", [{}])[0]
-                            .get("status", {})
+                            ((ev.get("competitions") or [{}])[0].get("status") or {})
                             .get("type", {})
                             .get("state", "")
                         ).lower()
                         == "in"
-                        for ev in payload.get("events", [])
-                        if ev.get("competitions")
+                        for ev in payload.get("events") or []
+                        if isinstance(ev, dict) and ev.get("competitions")
                     )
                     # Keep short 45s TTL while games are actively in progress; 300s otherwise
                     ttl = 45 if has_live else 300
                     self.db.set_cache(cache_key, payload, ttl_seconds=ttl)
                 except Exception:
                     payload, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
+            return payload if isinstance(payload, dict) else None
 
+        # Multi-day NBA slates: fetch the dates concurrently (results kept in date order)
+        if len(dates_to_check) > 1:
+            with ThreadPoolExecutor(max_workers=len(dates_to_check)) as pool:
+                payloads = list(pool.map(_load_date, dates_to_check))
+        else:
+            payloads = [_load_date(d) for d in dates_to_check]
+
+        for payload in payloads:
             if not payload:
                 continue
 
-            for ev in payload.get("events", []):
+            for ev in payload.get("events") or []:
+                if not isinstance(ev, dict):
+                    continue
                 ev_id = str(ev.get("id", ""))
                 if not ev_id or ev_id in seen_ids:
                     continue
-                parsed = self._parse_event(sport_u, ev)
+                try:
+                    parsed = self._parse_event(sport_u, ev)
+                except (TypeError, ValueError, AttributeError, KeyError, IndexError):
+                    # One malformed event must not drop the entire slate
+                    parsed = None
                 if parsed is not None:
                     seen_ids.add(ev_id)
                     normalized_events.append(parsed)
@@ -528,12 +576,17 @@ class ESPNClient:
         sp, lg = SPORT_PATHS[sport_u]
         cache_key = f"espn:athlete:{sport_u}:{aid}"
         cached = self.db.get_cache(cache_key)
-        if isinstance(cached, str) and cached:
+        if isinstance(cached, str):
+            # "" is a short-lived negative-cache entry for unknown athlete IDs
             return cached
 
         url = f"{self.CORE_BASE}/{sp}/leagues/{lg}/athletes/{aid}"
         try:
-            resp = http_get(url, headers=HEADERS, timeout=6.0)
+            resp = http_get(url, headers=HEADERS, timeout=6.0, raise_for_status=False)
+            if resp.status_code == 404:
+                self.db.set_cache(cache_key, "", ttl_seconds=6 * 3600)
+                return ""
+            resp.raise_for_status()
             data = resp.json()
             name = str(data.get("displayName") or data.get("fullName") or "").strip()
             if name:
@@ -682,20 +735,12 @@ class ESPNClient:
         cache_key = f"espn:v2:props:{sport_u}:{eid}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
-            if cached is not None:
-                out_cached: dict[tuple[str, str], dict[str, Any]] = {}
-                for k, v in cached.items():
-                    if "::" not in k:
-                        continue
-                    p_low, col = k.split("::", 1)
-                    out_cached[(p_low, col)] = v
-                    norm_p = normalize_player_name(p_low)
-                    if norm_p:
-                        out_cached.setdefault((norm_p, col), v)
-                return out_cached
+            if isinstance(cached, dict):
+                return _deserialize_props(cached)
 
         url = f"{self.CORE_BASE}/{sp}/leagues/{lg}/events/{eid}/competitions/{eid}/odds/100/propBets"
         all_items: list[dict[str, Any]] = []
+        partial = False
         try:
             resp = http_get(
                 url,
@@ -712,21 +757,23 @@ class ESPNClient:
             all_items.extend(first_page.get("items") or [])
             page_count = int(first_page.get("pageCount", 1) or 1)
             for p_idx in range(2, min(4, page_count + 1)):
-                p_resp = http_get(
-                    url,
-                    params={"lang": "en", "region": "us", "limit": 1000, "page": p_idx},
-                    headers=HEADERS,
-                    timeout=8.5,
-                )
-                all_items.extend(p_resp.json().get("items") or [])
+                try:
+                    p_resp = http_get(
+                        url,
+                        params={"lang": "en", "region": "us", "limit": 1000, "page": p_idx},
+                        headers=HEADERS,
+                        timeout=8.5,
+                    )
+                    all_items.extend(p_resp.json().get("items") or [])
+                except Exception:
+                    # Keep the page(s) already fetched instead of discarding everything
+                    partial = True
+                    break
         except Exception:
             stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
-            if stale:
-                return {
-                    (k.split("::", 1)[0], k.split("::", 1)[1]): v
-                    for k, v in stale.items()
-                    if "::" in k
-                }
+            if isinstance(stale, dict) and stale:
+                # Same shape as the fresh-cache path (incl. normalized-name aliases)
+                return _deserialize_props(stale)
             return {}
 
         if not all_items:
@@ -749,21 +796,27 @@ class ESPNClient:
             type_id = str((item.get("type") or {}).get("id", "")).strip()
             if type_id not in prop_map:
                 continue
-            ref = str((item.get("athlete") or {}).get("$ref", ""))
-            m = re.search(r"/athletes/(\d+)", ref)
-            if m:
-                aid = m.group(1)
-                if aid not in athlete_names and aid not in missing_aids:
-                    missing_aids.append(aid)
+            ath_obj = item.get("athlete") or {}
+            aid = str(ath_obj.get("id", "")).strip()
+            if not aid:
+                m = re.search(r"/athletes/(\d+)", str(ath_obj.get("$ref", "")))
+                aid = m.group(1) if m else ""
+            if aid and aid not in athlete_names and aid not in missing_aids:
+                missing_aids.append(aid)
 
-        for aid in missing_aids[:8]:
-            nm = self.fetch_athlete_name(sport_u, aid)
-            if nm:
-                athlete_names[aid] = nm
+        lookup_aids = missing_aids[:8]
+        if lookup_aids:
+            # Independent single-athlete lookups: run concurrently instead of N serial round-trips
+            with ThreadPoolExecutor(max_workers=min(4, len(lookup_aids))) as pool:
+                names = list(pool.map(lambda a: self.fetch_athlete_name(sport_u, a), lookup_aids))
+            for aid, nm in zip(lookup_aids, names):
+                if nm:
+                    athlete_names[aid] = nm
 
         parsed = self.extract_espn_prop_lines(sport_u, all_items, athlete_names)
         serializable = {f"{p_low}::{col}": val for (p_low, col), val in parsed.items()}
-        self.db.set_cache(cache_key, serializable, ttl_seconds=90 if live_mode else 300)
+        ttl = 90 if (live_mode or partial) else 300
+        self.db.set_cache(cache_key, serializable, ttl_seconds=ttl)
         return parsed
 
     def fetch_slate_player_props(
@@ -837,8 +890,8 @@ class ESPNClient:
             or status_type.get("detail")
             or status_name
         )
-        period = int(status_obj.get("period", 0) or 0)
-        clock_seconds = float(status_obj.get("clock", 0.0) or 0.0)
+        period = int(_safe_float(status_obj.get("period"), 0.0))
+        clock_seconds = _safe_float(status_obj.get("clock"), 0.0)
         display_clock = str(status_obj.get("displayClock", "0:00") or "0:00")
 
         try:
@@ -898,7 +951,8 @@ class ESPNClient:
                 m = re.search(r"(\d+(?:\.\d+)?)\s*mph", str(weather["displayValue"]), re.I)
                 if m:
                     wind_mph = float(m.group(1))
-        temp_f = float(weather.get("temperature", 68.0) or 68.0) if isinstance(weather, dict) else 68.0
+        # NB: 0°F is a legitimate kickoff temperature; only missing/malformed values default to 68°F
+        temp_f = _safe_float(weather.get("temperature"), 68.0) if isinstance(weather, dict) else 68.0
 
         odds_list = comp.get("odds", []) or []
         market_info = self._extract_embedded_odds(odds_list, home_abbr)
@@ -1015,12 +1069,17 @@ class ESPNClient:
             if details and details.upper() not in ("EVEN", "PK"):
                 parts = details.split()
                 if len(parts) == 2:
-                    fav_abbr = cls._normalize_abbr("NFL", parts[0])
+                    raw_fav = parts[0].upper()
+                    # Normalize with BOTH league maps: the NFL-only map left NBA short codes
+                    # (GS, NY, SA, NO, UTAH) unmatched, flipping the home spread sign.
+                    fav_is_home = home_abbr in (
+                        raw_fav,
+                        cls._normalize_abbr("NFL", raw_fav),
+                        cls._normalize_abbr("NBA", raw_fav),
+                    )
                     val = _parse_line_number(parts[1])
                     if val is not None:
-                        out["home_spread"] = -abs(val) if fav_abbr in (home_abbr, parts[0].upper()) and parts[0].upper() == home_abbr else (
-                            -abs(val) if fav_abbr == home_abbr else abs(val)
-                        )
+                        out["home_spread"] = -abs(val) if fav_is_home else abs(val)
                         out["home_cover_prob"] = 0.50
             elif details.upper() in ("EVEN", "PK"):
                 out["home_spread"] = 0.0

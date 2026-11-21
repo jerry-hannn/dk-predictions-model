@@ -123,7 +123,7 @@
   </section>
 
   <main class="workspace">
-    <div id="status-banner" class="toast-banner" role="status" hidden>
+    <div id="status-banner" class="toast-banner" role="status" aria-live="polite" hidden>
       <span id="status-banner-text"></span>
       <button type="button" id="dismiss-banner-btn" class="close-x" aria-label="Dismiss message">&times;</button>
     </div>
@@ -221,7 +221,7 @@
 
       <div id="picks-grid" class="picks-grid" aria-live="polite"></div>
 
-      <div id="picks-table-wrap" class="table-container" hidden>
+      <div id="picks-table-wrap" class="table-container" role="region" aria-label="Markets table" tabindex="0" hidden>
         <table class="data-table">
           <thead id="picks-table-thead">
             <tr>
@@ -310,8 +310,8 @@
 
           <form id="custom-calc-form" class="stack-form">
             <div class="field">
-              <label>Contract Side</label>
-              <div class="segmented" role="group" aria-label="Contract side">
+              <span id="calc-side-lbl" class="field-label">Contract Side</span>
+              <div class="segmented" role="group" aria-labelledby="calc-side-lbl">
                 <button type="button" class="seg-btn active" id="calc-side-yes" data-side="YES">YES Contract</button>
                 <button type="button" class="seg-btn" id="calc-side-no" data-side="NO">NO Contract</button>
               </div>
@@ -375,7 +375,7 @@
               <div class="form-grid-2">
                 <div class="field">
                   <label for="sb-ev-dk">DraftKings Odds</label>
-                  <input id="sb-ev-dk" type="number" step="1" value="-105" required>
+                  <input id="sb-ev-dk" type="number" step="1" value="-105" placeholder="e.g. -105">
                 </div>
                 <div class="field">
                   <label for="sb-ev-fd">FanDuel Odds</label>
@@ -554,6 +554,8 @@
       </div>
 
       <div id="ledger-venue-strip" class="venue-bankroll-strip" hidden></div>
+
+      <div id="ledger-guidance-notice" class="info-callout" role="status" hidden></div>
 
       <div class="table-container" role="region" aria-labelledby="ledger-table-caption" tabindex="0">
         <table class="data-table">
@@ -859,7 +861,7 @@
         </div>
         <div class="field">
           <label for="settle-sell-fee">Exit Fee / Contract (¢)</label>
-          <input id="settle-sell-fee" type="number" min="0" max="5" step="0.5" value="1.5">
+          <input id="settle-sell-fee" type="number" min="0" max="10" step="0.5" value="1.5">
         </div>
       </div>
 

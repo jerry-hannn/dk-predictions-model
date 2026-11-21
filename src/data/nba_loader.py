@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,61 @@ import pandas as pd
 from src.config import PROJECT_ROOT
 
 DATA_DIR = PROJECT_ROOT / "data"
+
+# --- mtime-keyed CSV cache ----------------------------------------------------------------
+# The recommender re-loads these multi-MB CSVs on every slate request; parse once per file
+# version and hand out copies (callers are free to mutate their frame).
+_CSV_CACHE: dict[str, tuple[int, int, pd.DataFrame]] = {}
+_CSV_CACHE_LOCK = threading.Lock()
+
+
+def read_csv_cached(path: Path) -> pd.DataFrame:
+    """`pd.read_csv` memoized on (path, mtime_ns, size); returns a defensive copy."""
+    key = str(Path(path).absolute())
+    st = os.stat(path)
+    with _CSV_CACHE_LOCK:
+        hit = _CSV_CACHE.get(key)
+    if hit is not None and hit[0] == st.st_mtime_ns and hit[1] == st.st_size:
+        return hit[2].copy()
+    df = pd.read_csv(path)
+    with _CSV_CACHE_LOCK:
+        _CSV_CACHE[key] = (st.st_mtime_ns, st.st_size, df)
+    return df.copy()
+
+
+def write_csv_atomic(df: pd.DataFrame, path: Path) -> None:
+    """Write via temp file + os.replace so concurrent readers never see a half-written CSV."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        df.to_csv(tmp, index=False)
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    with _CSV_CACHE_LOCK:
+        _CSV_CACHE.pop(str(path.absolute()), None)
+
+
+def _col(df: pd.DataFrame, name: str, default: Any) -> pd.Series:
+    """Column accessor whose fallback is a Series aligned to `df.index` (never a bare scalar)."""
+    if name in df.columns:
+        return df[name]
+    return pd.Series([default] * len(df), index=df.index, dtype=object if isinstance(default, str) else None)
+
+
+def _parse_minutes_series(raw: pd.Series) -> pd.Series:
+    """Parse NBA minutes that may be numeric (34) or clock strings ('34:12') into float minutes."""
+    numeric = pd.to_numeric(raw, errors="coerce")
+    as_str = raw.astype(str)
+    clock_mask = numeric.isna() & as_str.str.contains(":", regex=False)
+    if clock_mask.any():
+        parts = as_str[clock_mask].str.split(":", n=1, expand=True)
+        mins = pd.to_numeric(parts[0], errors="coerce") + pd.to_numeric(parts[1], errors="coerce") / 60.0
+        numeric = numeric.copy()
+        numeric[clock_mask] = mins
+    return numeric.fillna(0.0)
+
 
 NBA_TEAMS = [
     "BOS", "OKC", "CLE", "DEN", "NYK", "MIN", "DAL", "PHX",
@@ -33,7 +90,7 @@ class NBALoader:
     ) -> pd.DataFrame:
         """Load NBA team game results with Four Factors & pace proxies."""
         if self.games_csv.exists() and not force_refresh:
-            return pd.read_csv(self.games_csv)
+            return read_csv_cached(self.games_csv)
 
         season_strs = seasons or ["2025-26", "2026-27"]
         try:
@@ -57,13 +114,16 @@ class NBALoader:
                 raw = pd.concat(frames, ignore_index=True)
                 paired = self._pair_team_logs(raw)
                 if len(paired) >= 80:
-                    paired.to_csv(self.games_csv, index=False)
+                    write_csv_atomic(paired, self.games_csv)
                     return paired
         except Exception:
             pass
 
+        # A failed forced refresh must not clobber previously fetched real data with synthetic rows
+        if self.games_csv.exists():
+            return read_csv_cached(self.games_csv)
         df = self.generate_synthetic_nba_games()
-        df.to_csv(self.games_csv, index=False)
+        write_csv_atomic(df, self.games_csv)
         return df
 
     def load_player_logs(
@@ -71,7 +131,7 @@ class NBALoader:
     ) -> pd.DataFrame:
         """Load NBA player box-score logs (minutes, PTS, REB, AST, FG3M, usage proxy)."""
         if self.player_logs_csv.exists() and not force_refresh:
-            return pd.read_csv(self.player_logs_csv)
+            return read_csv_cached(self.player_logs_csv)
 
         season_strs = seasons or ["2025-26", "2026-27"]
         try:
@@ -94,13 +154,15 @@ class NBALoader:
                 raw = pd.concat(frames, ignore_index=True)
                 df = self._normalize_player_logs(raw)
                 if len(df) >= 200:
-                    df.to_csv(self.player_logs_csv, index=False)
+                    write_csv_atomic(df, self.player_logs_csv)
                     return df
         except Exception:
             pass
 
+        if self.player_logs_csv.exists():
+            return read_csv_cached(self.player_logs_csv)
         df = self.generate_synthetic_nba_player_logs()
-        df.to_csv(self.player_logs_csv, index=False)
+        write_csv_atomic(df, self.player_logs_csv)
         return df
 
     @staticmethod
@@ -172,22 +234,25 @@ class NBALoader:
             ].copy()
         if len(work) == 0:
             return pd.DataFrame()
-        matchup = work.get("MATCHUP", pd.Series(["BOS vs. NYK"] * len(work))).astype(str)
+        # Fallback columns are index-aligned: `work` was filtered above, so a default
+        # RangeIndex Series would silently misalign and inject NaNs.
+        matchup = _col(work, "MATCHUP", "BOS vs. NYK").astype(str)
         opp = matchup.str.extract(r"(?:vs\.|@)\s*([A-Z]{2,4})")[0].fillna("UNK")
+        names = _col(work, "PLAYER_NAME", "Player")
         df = pd.DataFrame(
             {
-                "player_id": work.get("PLAYER_ID", work.get("PLAYER_NAME")).astype(str),
-                "player_name": work.get("PLAYER_NAME", "Player").astype(str),
-                "team": work.get("TEAM_ABBREVIATION", "UNK").astype(str).str.upper(),
+                "player_id": (work["PLAYER_ID"] if "PLAYER_ID" in work.columns else names).astype(str),
+                "player_name": names.astype(str),
+                "team": _col(work, "TEAM_ABBREVIATION", "UNK").astype(str).str.upper(),
                 "opponent": opp.str.upper(),
                 "gameday": pd.to_datetime(work["GAME_DATE"]).dt.strftime("%Y-%m-%d"),
-                "minutes": pd.to_numeric(work.get("MIN", 0), errors="coerce").fillna(0.0),
-                "points": pd.to_numeric(work.get("PTS", 0), errors="coerce").fillna(0.0),
-                "rebounds": pd.to_numeric(work.get("REB", 0), errors="coerce").fillna(0.0),
-                "assists": pd.to_numeric(work.get("AST", 0), errors="coerce").fillna(0.0),
-                "fg3m": pd.to_numeric(work.get("FG3M", 0), errors="coerce").fillna(0.0),
-                "fga": pd.to_numeric(work.get("FGA", 0), errors="coerce").fillna(0.0),
-                "fta": pd.to_numeric(work.get("FTA", 0), errors="coerce").fillna(0.0),
+                "minutes": _parse_minutes_series(_col(work, "MIN", 0)),
+                "points": pd.to_numeric(_col(work, "PTS", 0), errors="coerce").fillna(0.0),
+                "rebounds": pd.to_numeric(_col(work, "REB", 0), errors="coerce").fillna(0.0),
+                "assists": pd.to_numeric(_col(work, "AST", 0), errors="coerce").fillna(0.0),
+                "fg3m": pd.to_numeric(_col(work, "FG3M", 0), errors="coerce").fillna(0.0),
+                "fga": pd.to_numeric(_col(work, "FGA", 0), errors="coerce").fillna(0.0),
+                "fta": pd.to_numeric(_col(work, "FTA", 0), errors="coerce").fillna(0.0),
             }
         )
         df["pra"] = df["points"] + df["rebounds"] + df["assists"]

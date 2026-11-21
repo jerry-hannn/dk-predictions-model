@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,20 @@ from src.engine.sportsbook_math import (
     evaluate_steam_lag,
     format_american,
 )
+from src.models import atomic_joblib_dump
 from src.models.nba_game import NBAGameModel
 from src.models.nfl_game import NFLGameModel
 from src.models.player_props import PlayerPropsEngine, prop_over_prob_for_line
 from src.storage.db import Database
+
+
+def _num_or(value: Any, default: float) -> float:
+    """Coerce to float, falling back to ``default`` for None/NaN/inf/unparseable values."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
 
 
 def blend_probabilities(
@@ -85,6 +96,43 @@ def _infer_dkex_ask_pair(
     yes_ask = round(min(0.98, max(0.02, mid_yes + half_spread)), 2)
     no_ask = round(min(0.98, max(0.02, (1.0 - mid_yes) + half_spread)), 2)
     return yes_ask, no_ask
+
+
+# Process-wide cache of deserialized model artifacts. ModelHub is constructed per HTTP request,
+# so without this every request re-reads and unpickles all joblib artifacts from disk. Entries are
+# keyed on the resolved artifact path and invalidated whenever the file's mtime/size changes
+# (e.g. after retraining). Models are read-only at prediction time, so sharing them is safe.
+_ARTIFACT_CACHE: dict[str, tuple[tuple[float, int], Any]] = {}
+_ARTIFACT_CACHE_LOCK = threading.Lock()
+# Serializes training so concurrent cold-start requests don't all retrain simultaneously.
+_TRAIN_LOCK = threading.RLock()
+
+
+def _artifact_signature(path: Path) -> tuple[float, int]:
+    st = path.stat()
+    return (st.st_mtime, st.st_size)
+
+
+def _load_cached_artifact(path: Path, loader: Any) -> Any:
+    key = str(path.resolve())
+    sig = _artifact_signature(path)
+    with _ARTIFACT_CACHE_LOCK:
+        hit = _ARTIFACT_CACHE.get(key)
+        if hit is not None and hit[0] == sig:
+            return hit[1]
+    obj = loader(path)
+    with _ARTIFACT_CACHE_LOCK:
+        _ARTIFACT_CACHE[key] = (sig, obj)
+    return obj
+
+
+def _store_cached_artifact(path: Path, obj: Any) -> None:
+    try:
+        sig = _artifact_signature(path)
+    except OSError:
+        return
+    with _ARTIFACT_CACHE_LOCK:
+        _ARTIFACT_CACHE[str(path.resolve())] = (sig, obj)
 
 
 def _force_pass_evaluation(ev: ContractEvaluation) -> ContractEvaluation:
@@ -210,6 +258,10 @@ class ModelHub:
         return summary
 
     def train_all(self, sport: str = "all") -> dict[str, Any]:
+        with _TRAIN_LOCK:
+            return self._train_all_locked(sport)
+
+    def _train_all_locked(self, sport: str = "all") -> dict[str, Any]:
         sp = sport.lower()
         metrics: dict[str, Any] = {}
         self.settings.models_dir.mkdir(parents=True, exist_ok=True)
@@ -221,17 +273,20 @@ class ModelHub:
             nfl_sched = self.nfl_loader.load_schedules()
             self.nfl_model = NFLGameModel()
             metrics["nfl_game"] = self.nfl_model.fit(nfl_sched)
-            self.nfl_model.save(self.settings.models_dir / "nfl_game_model.joblib")
+            nfl_target = self.nfl_model.save(self.settings.models_dir / "nfl_game_model.joblib")
+            _store_cached_artifact(nfl_target, self.nfl_model)
 
         if sp in ("all", "nba"):
             nba_games = self.nba_loader.load_games()
             self.nba_model = NBAGameModel()
             metrics["nba_game"] = self.nba_model.fit(nba_games, player_logs=nba_logs)
-            self.nba_model.save(self.settings.models_dir / "nba_game_model.joblib")
+            nba_target = self.nba_model.save(self.settings.models_dir / "nba_game_model.joblib")
+            _store_cached_artifact(nba_target, self.nba_model)
 
         self.props_engine = PlayerPropsEngine()
         self.props_engine.fit(nfl_logs=nfl_logs, nba_logs=nba_logs)
-        joblib.dump(self.props_engine, self.props_path)
+        atomic_joblib_dump(self.props_engine, self.props_path)
+        _store_cached_artifact(self.props_path, self.props_engine)
         metrics["player_props"] = {
             "nfl_log_rows": len(nfl_logs),
             "nba_log_rows": len(nba_logs),
@@ -257,14 +312,20 @@ class ModelHub:
         nba_path = _find_artifact("nba_game_model.joblib")
         props_path = _find_artifact("player_props_engine.joblib")
         if not (nfl_path and nba_path and props_path):
-            self.train_all("all")
-            return
+            with _TRAIN_LOCK:
+                # Another request may have finished training while we waited on the lock
+                nfl_path = _find_artifact("nfl_game_model.joblib")
+                nba_path = _find_artifact("nba_game_model.joblib")
+                props_path = _find_artifact("player_props_engine.joblib")
+                if not (nfl_path and nba_path and props_path):
+                    self.train_all("all")
+                    return
         if self.nfl_model is None:
-            self.nfl_model = NFLGameModel.load(nfl_path)
+            self.nfl_model = _load_cached_artifact(nfl_path, NFLGameModel.load)
         if self.nba_model is None:
-            self.nba_model = NBAGameModel.load(nba_path)
+            self.nba_model = _load_cached_artifact(nba_path, NBAGameModel.load)
         if self.props_engine is None:
-            self.props_engine = joblib.load(props_path)
+            self.props_engine = _load_cached_artifact(props_path, joblib.load)
 
     def _get_upcoming_events(
         self,
@@ -551,8 +612,8 @@ class ModelHub:
                         spread_line=eff_spread_line,
                         total_line=eff_total_line,
                         is_indoor=bool(ev.get("indoor", False)),
-                        wind_mph=float(ev.get("wind_mph", 5.0)),
-                        temp_f=float(ev.get("temp_f", 65.0)),
+                        wind_mph=_num_or(ev.get("wind_mph"), 5.0),
+                        temp_f=_num_or(ev.get("temp_f"), 65.0),
                         injuries_by_team=injuries,
                         live_state=ev if is_live else None,
                     )
@@ -563,7 +624,7 @@ class ModelHub:
                             expected_spread=gpred.spread_line,
                             expected_total=gpred.expected_total,
                             is_indoor=bool(ev.get("indoor", False)),
-                            wind_mph=float(ev.get("wind_mph", 5.0)),
+                            wind_mph=_num_or(ev.get("wind_mph"), 5.0),
                             injuries_by_team=injuries,
                             custom_lines=custom_prop_lines or None,
                             live_prop_markets=live_prop_mkts,
@@ -800,7 +861,7 @@ class ModelHub:
             "game_state": "LIVE" if is_live else str(ev.get("state", "PRE")),
             "status_detail": str(ev.get("status_detail", "")),
             "score_display": score_disp,
-            "remaining_minutes": float(ev.get("remaining_minutes", 48.0)),
+            "remaining_minutes": _num_or(ev.get("remaining_minutes"), 48.0),
             "line_source": str(mkt.get("line_source", "ESPN/DK")),
             "odds_age_seconds": mkt.get("odds_age_seconds"),
             "line_movement": " | ".join(moves),
@@ -952,7 +1013,7 @@ class ModelHub:
         if is_custom and mkt_cov is not None and abs(sp_line - default_sp) >= 0.01:
             reg_mins = 60.0 if ev["sport"] == "NFL" else 48.0
             rem_f = (
-                max(0.04, float(ev.get("remaining_minutes", reg_mins)) / reg_mins)
+                max(0.04, _num_or(ev.get("remaining_minutes"), reg_mins) / reg_mins)
                 if is_live
                 else 1.0
             )
@@ -1099,7 +1160,7 @@ class ModelHub:
         if is_custom and mkt_over is not None and abs(tot_line - default_tot) >= 0.01:
             reg_mins = 60.0 if ev["sport"] == "NFL" else 48.0
             rem_f = (
-                max(0.04, float(ev.get("remaining_minutes", reg_mins)) / reg_mins)
+                max(0.04, _num_or(ev.get("remaining_minutes"), reg_mins) / reg_mins)
                 if is_live
                 else 1.0
             )
@@ -1351,9 +1412,20 @@ class ModelHub:
         if not open_trades:
             return []
 
+        open_sports = {str(t.get("sport") or "").upper() for t in open_trades}
+        sport_arg = (
+            next(iter(open_sports)).lower()
+            if len(open_sports) == 1 and open_sports <= {"NFL", "NBA"}
+            else "all"
+        )
+        game_markets = {"moneyline", "spread", "total"}
+        only_game_markets = all(
+            str(t.get("market_type") or "").replace("Live ", "").strip().lower() in game_markets
+            for t in open_trades
+        )
         all_candidates = self.generate_picks(
-            sport="all",
-            market_filter="all",
+            sport=sport_arg,
+            market_filter="game" if only_game_markets else "all",
             mode="all",
             include_passes=True,
             fresh=fresh,
@@ -1364,22 +1436,27 @@ class ModelHub:
         for trade in open_trades:
             sel_low = str(trade["selection_label"]).lower()
             ev_low = str(trade["event_name"]).lower()
+            trade_mkt = str(trade["market_type"]).replace("Live ", "").lower()
+            same_sport = [c for c in all_candidates if c["sport"] == trade["sport"]]
             matched = next(
-                (
-                    c
-                    for c in all_candidates
-                    if c["sport"] == trade["sport"]
-                    and (
-                        c["selection_label"].lower() == sel_low
-                        or (
-                            c["short_name"].lower() in ev_low
-                            and c["market_type"].replace("Live ", "").lower()
-                            == str(trade["market_type"]).replace("Live ", "").lower()
-                        )
-                    )
-                ),
+                (c for c in same_sport if c["selection_label"].lower() == sel_low),
                 None,
             )
+            if matched is None:
+                matched = next(
+                    (
+                        c
+                        for c in same_sport
+                        if c["short_name"].lower() in ev_low
+                        and c["market_type"].replace("Live ", "").lower() == trade_mkt
+                        # Player props: never mark a position to a different player's prop
+                        and (
+                            not c.get("player_name")
+                            or str(c["player_name"]).lower() in sel_low
+                        )
+                    ),
+                    None,
+                )
             if matched is None:
                 results.append(
                     {
@@ -1772,7 +1849,7 @@ class ModelHub:
                 ev_id = str(ev["event_id"])
                 games_seen.add(ev_id)
                 is_live = ev.get("state") == "IN"
-                rem_mins = float(ev.get("remaining_minutes", 60.0 if sp == "NFL" else 48.0))
+                rem_mins = _num_or(ev.get("remaining_minutes"), 60.0 if sp == "NFL" else 48.0)
                 mkt = dict(ev.get("market", {}) or {})
 
                 live_box_players: dict[str, dict[str, Any]] | None = None
@@ -1884,8 +1961,8 @@ class ModelHub:
                         spread_line=mkt.get("home_spread"),
                         total_line=mkt.get("total_line"),
                         is_indoor=bool(ev.get("indoor", False)),
-                        wind_mph=float(ev.get("wind_mph", 5.0)),
-                        temp_f=float(ev.get("temp_f", 65.0)),
+                        wind_mph=_num_or(ev.get("wind_mph"), 5.0),
+                        temp_f=_num_or(ev.get("temp_f"), 65.0),
                         injuries_by_team=injuries,
                         live_state=ev if is_live else None,
                     )
@@ -1896,7 +1973,7 @@ class ModelHub:
                             expected_spread=gpred.spread_line,
                             expected_total=gpred.expected_total,
                             is_indoor=bool(ev.get("indoor", False)),
-                            wind_mph=float(ev.get("wind_mph", 5.0)),
+                            wind_mph=_num_or(ev.get("wind_mph"), 5.0),
                             injuries_by_team=injuries,
                             live_prop_markets=live_prop_mkts,
                             live_state=ev if is_live else None,

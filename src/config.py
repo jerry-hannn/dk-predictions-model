@@ -257,9 +257,9 @@ def update_env_settings(updates: dict[str, str], env_path: Path | None = None) -
 
         for key, val in updates.items():
             pattern = re.compile(rf"^{re.escape(key)}=.*$", flags=re.MULTILINE)
-            line = f"{key}={val}"
+            line = f"{key}={str(val).replace(chr(13), '').replace(chr(10), '')}"
             if pattern.search(content):
-                content = pattern.sub(line, content)
+                content = pattern.sub(lambda _m, _line=line: _line, content)
             else:
                 content = content.rstrip() + f"\n{line}\n"
 

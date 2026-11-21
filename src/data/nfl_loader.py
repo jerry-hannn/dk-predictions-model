@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import PROJECT_ROOT
+from src.data.nba_loader import _col, read_csv_cached, write_csv_atomic
 
 DATA_DIR = PROJECT_ROOT / "data"
 
@@ -33,7 +34,7 @@ class NFLLoader:
     ) -> pd.DataFrame:
         """Load NFL game schedules & results (with Vegas lines, rest, roof, wind, temp)."""
         if self.schedules_csv.exists() and not force_refresh:
-            return pd.read_csv(self.schedules_csv)
+            return read_csv_cached(self.schedules_csv)
 
         years = seasons or [2024, 2025, 2026]
         try:
@@ -51,13 +52,16 @@ class NFLLoader:
             if valid_years:
                 raw = pd.concat(valid_years, ignore_index=True)
                 df = self._normalize_schedules(raw)
-                df.to_csv(self.schedules_csv, index=False)
+                write_csv_atomic(df, self.schedules_csv)
                 return df
         except Exception:
             pass
 
+        # A failed forced refresh must not clobber previously fetched real data with synthetic rows
+        if self.schedules_csv.exists():
+            return read_csv_cached(self.schedules_csv)
         df = self.generate_synthetic_nfl_schedules()
-        df.to_csv(self.schedules_csv, index=False)
+        write_csv_atomic(df, self.schedules_csv)
         return df
 
     def load_player_logs(
@@ -65,7 +69,7 @@ class NFLLoader:
     ) -> pd.DataFrame:
         """Load weekly NFL player stats (passing, rushing, receiving) for prop modeling."""
         if self.player_logs_csv.exists() and not force_refresh:
-            return pd.read_csv(self.player_logs_csv)
+            return read_csv_cached(self.player_logs_csv)
 
         years = seasons or [2025, 2026]
         try:
@@ -83,38 +87,44 @@ class NFLLoader:
             if frames:
                 raw = pd.concat(frames, ignore_index=True)
                 df = self._normalize_player_logs(raw)
-                df.to_csv(self.player_logs_csv, index=False)
+                write_csv_atomic(df, self.player_logs_csv)
                 return df
         except Exception:
             pass
 
+        if self.player_logs_csv.exists():
+            return read_csv_cached(self.player_logs_csv)
         df = self.generate_synthetic_nfl_player_logs()
-        df.to_csv(self.player_logs_csv, index=False)
+        write_csv_atomic(df, self.player_logs_csv)
         return df
 
     @staticmethod
     def _normalize_schedules(raw: pd.DataFrame) -> pd.DataFrame:
-        df = pd.DataFrame()
-        df["game_id"] = raw.get("game_id", pd.Series(range(len(raw)))).astype(str)
-        df["season"] = pd.to_numeric(raw.get("season", 2025), errors="coerce").fillna(2025).astype(int)
-        df["week"] = pd.to_numeric(raw.get("week", 1), errors="coerce").fillna(1).astype(int)
-        df["gameday"] = raw.get("gameday", "2025-09-07").astype(str)
-        df["home_team"] = raw.get("home_team", "KC").astype(str).str.upper()
-        df["away_team"] = raw.get("away_team", "BUF").astype(str).str.upper()
-        df["home_score"] = pd.to_numeric(raw.get("home_score"), errors="coerce")
-        df["away_score"] = pd.to_numeric(raw.get("away_score"), errors="coerce")
+        # `_col` fallbacks are index-aligned Series (bare scalar defaults like "KC" have no
+        # .astype and previously raised AttributeError when nflreadpy dropped a column).
+        df = pd.DataFrame(index=raw.index)
+        df["game_id"] = (
+            raw["game_id"] if "game_id" in raw.columns else pd.Series(range(len(raw)), index=raw.index)
+        ).astype(str)
+        df["season"] = pd.to_numeric(_col(raw, "season", 2025), errors="coerce").fillna(2025).astype(int)
+        df["week"] = pd.to_numeric(_col(raw, "week", 1), errors="coerce").fillna(1).astype(int)
+        df["gameday"] = _col(raw, "gameday", "2025-09-07").astype(str)
+        df["home_team"] = _col(raw, "home_team", "KC").astype(str).str.upper()
+        df["away_team"] = _col(raw, "away_team", "BUF").astype(str).str.upper()
+        df["home_score"] = pd.to_numeric(_col(raw, "home_score", np.nan), errors="coerce")
+        df["away_score"] = pd.to_numeric(_col(raw, "away_score", np.nan), errors="coerce")
         # In nflverse/nflreadpy, spread_line is positive when home team is favored!
         # Convert to standard sportsbook convention: negative = home favored (e.g., -3.5)
-        raw_spread = pd.to_numeric(raw.get("spread_line"), errors="coerce")
+        raw_spread = pd.to_numeric(_col(raw, "spread_line", np.nan), errors="coerce")
         df["home_spread"] = -raw_spread
-        df["total_line"] = pd.to_numeric(raw.get("total_line"), errors="coerce")
-        df["home_rest"] = pd.to_numeric(raw.get("home_rest", 7), errors="coerce").fillna(7.0)
-        df["away_rest"] = pd.to_numeric(raw.get("away_rest", 7), errors="coerce").fillna(7.0)
-        roof_col = raw.get("roof", pd.Series(["outdoors"] * len(raw))).fillna("outdoors").astype(str)
+        df["total_line"] = pd.to_numeric(_col(raw, "total_line", np.nan), errors="coerce")
+        df["home_rest"] = pd.to_numeric(_col(raw, "home_rest", 7), errors="coerce").fillna(7.0)
+        df["away_rest"] = pd.to_numeric(_col(raw, "away_rest", 7), errors="coerce").fillna(7.0)
+        roof_col = _col(raw, "roof", "outdoors").fillna("outdoors").astype(str)
         df["is_indoor"] = roof_col.str.lower().isin(["dome", "closed"]).astype(int)
-        df["temp"] = pd.to_numeric(raw.get("temp", 65.0), errors="coerce").fillna(65.0)
-        df["wind"] = pd.to_numeric(raw.get("wind", 5.0), errors="coerce").fillna(5.0)
-        df["div_game"] = pd.to_numeric(raw.get("div_game", 0), errors="coerce").fillna(0).astype(int)
+        df["temp"] = pd.to_numeric(_col(raw, "temp", 65.0), errors="coerce").fillna(65.0)
+        df["wind"] = pd.to_numeric(_col(raw, "wind", 5.0), errors="coerce").fillna(5.0)
+        df["div_game"] = pd.to_numeric(_col(raw, "div_game", 0), errors="coerce").fillna(0).astype(int)
         return df.sort_values(["gameday", "game_id"]).reset_index(drop=True)
 
     @staticmethod
@@ -122,32 +132,36 @@ class NFLLoader:
         team_col = (
             raw["recent_team"]
             if "recent_team" in raw.columns
-            else raw.get("team", pd.Series(["KC"] * len(raw)))
+            else _col(raw, "team", "KC")
         )
         name_col = (
             raw["player_display_name"]
             if "player_display_name" in raw.columns
-            else raw.get("player_name", pd.Series(["Player"] * len(raw)))
+            else _col(raw, "player_name", "Player")
         )
-        opp_col = raw.get("opponent_team", pd.Series(["BUF"] * len(raw)))
+        opp_col = _col(raw, "opponent_team", "BUF")
+
+        def _num(name: str, default: float = 0.0) -> pd.Series:
+            return pd.to_numeric(_col(raw, name, default), errors="coerce").fillna(default)
+
         df = pd.DataFrame(
             {
-                "player_id": raw.get("player_id", name_col).astype(str),
+                "player_id": (raw["player_id"] if "player_id" in raw.columns else name_col).astype(str),
                 "player_name": name_col.astype(str),
-                "position": raw.get("position", "WR").fillna("WR").astype(str),
+                "position": _col(raw, "position", "WR").fillna("WR").astype(str),
                 "team": team_col.fillna("UNK").astype(str).str.upper(),
                 "opponent": opp_col.fillna("UNK").astype(str).str.upper(),
-                "season": pd.to_numeric(raw.get("season", 2026), errors="coerce").fillna(2026).astype(int),
-                "week": pd.to_numeric(raw.get("week", 1), errors="coerce").fillna(1).astype(int),
-                "attempts": pd.to_numeric(raw.get("attempts", 0), errors="coerce").fillna(0.0),
-                "completions": pd.to_numeric(raw.get("completions", 0), errors="coerce").fillna(0.0),
-                "passing_yards": pd.to_numeric(raw.get("passing_yards", 0), errors="coerce").fillna(0.0),
-                "passing_tds": pd.to_numeric(raw.get("passing_tds", 0), errors="coerce").fillna(0.0),
-                "carries": pd.to_numeric(raw.get("carries", 0), errors="coerce").fillna(0.0),
-                "rushing_yards": pd.to_numeric(raw.get("rushing_yards", 0), errors="coerce").fillna(0.0),
-                "targets": pd.to_numeric(raw.get("targets", 0), errors="coerce").fillna(0.0),
-                "receptions": pd.to_numeric(raw.get("receptions", 0), errors="coerce").fillna(0.0),
-                "receiving_yards": pd.to_numeric(raw.get("receiving_yards", 0), errors="coerce").fillna(0.0),
+                "season": _num("season", 2026).astype(int),
+                "week": _num("week", 1).astype(int),
+                "attempts": _num("attempts"),
+                "completions": _num("completions"),
+                "passing_yards": _num("passing_yards"),
+                "passing_tds": _num("passing_tds"),
+                "carries": _num("carries"),
+                "rushing_yards": _num("rushing_yards"),
+                "targets": _num("targets"),
+                "receptions": _num("receptions"),
+                "receiving_yards": _num("receiving_yards"),
             }
         )
         df["game_order"] = df["season"] * 100 + df["week"]

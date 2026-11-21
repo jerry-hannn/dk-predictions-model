@@ -99,13 +99,103 @@ async function apiFetch(url, options = {}) {
   return resp;
 }
 
+// Build a readable Error from a non-OK response (FastAPI `detail` string / 422 list / plain text).
+async function httpError(resp) {
+  let detail = '';
+  try {
+    const ct = resp.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      const body = await resp.json();
+      const d = body && body.detail;
+      if (typeof d === 'string') {
+        detail = d;
+      } else if (Array.isArray(d)) {
+        detail = d
+          .map((x) => {
+            if (!x || !x.msg) return String(x);
+            const field = Array.isArray(x.loc) ? x.loc[x.loc.length - 1] : '';
+            return field ? `${field}: ${x.msg}` : x.msg;
+          })
+          .join('; ');
+      }
+    } else {
+      detail = (await resp.text()).trim().slice(0, 200);
+    }
+  } catch (_) {}
+  return new Error(detail ? `HTTP ${resp.status}: ${detail}` : `HTTP ${resp.status}`);
+}
+
+// Fetch JSON or throw a descriptive error.
+async function apiJson(url, options = {}) {
+  const resp = await apiFetch(url, options);
+  if (!resp.ok) throw await httpError(resp);
+  return resp.json();
+}
+
+function isSilentError(err) {
+  return Boolean(err) && (err.name === 'AbortError' || err.message === 'Authentication required');
+}
+
+function errText(err) {
+  return err && err.message ? err.message : String(err);
+}
+
+function reportError(prefix, err) {
+  if (isSilentError(err)) return;
+  console.error(prefix, err);
+  showBanner(`${prefix}: ${errText(err)}`, true);
+}
+
+// Disable a button while an async action runs to prevent double-submits.
+async function withBusy(btn, fn) {
+  if (btn && btn.disabled) return undefined;
+  if (btn) {
+    btn.disabled = true;
+    btn.setAttribute('aria-busy', 'true');
+  }
+  try {
+    return await fn();
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.removeAttribute('aria-busy');
+    }
+  }
+}
+
+// Monotonic per-key request sequencing so stale responses never overwrite newer ones.
+const requestSeq = Object.create(null);
+function nextSeq(key) {
+  requestSeq[key] = (requestSeq[key] || 0) + 1;
+  return requestSeq[key];
+}
+function isLatestSeq(key, seq) {
+  return requestSeq[key] === seq;
+}
+
+function setSegActive(buttons, activeBtn) {
+  buttons.forEach((b) => {
+    const on = b === activeBtn;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-pressed', String(on));
+  });
+}
+
 function promptPasscodeUnlock() {
-  document.getElementById('auth-error-msg').hidden = true;
+  const errEl = document.getElementById('auth-error-msg');
+  errEl.hidden = true;
+  errEl.textContent = 'Invalid passcode.';
   document.getElementById('auth-passcode-input').value = '';
   if (!authDialog.open) {
     authDialog.showModal();
   }
 }
+
+authDialog.addEventListener('cancel', (e) => {
+  if (state.authEnabled && !state.authenticated) {
+    e.preventDefault();
+  }
+});
 
 document.getElementById('auth-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -122,6 +212,7 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
       body: JSON.stringify({ passcode }),
     });
     if (!resp.ok) {
+      errEl.textContent = resp.status === 401 ? 'Invalid passcode.' : errText(await httpError(resp));
       errEl.hidden = false;
       return;
     }
@@ -136,10 +227,20 @@ document.getElementById('auth-form').addEventListener('submit', async (e) => {
   }
 });
 
-document.getElementById('logout-btn').addEventListener('click', async () => {
-  await fetch('/api/auth/logout', { method: 'POST' });
-  state.authenticated = false;
-  promptPasscodeUnlock();
+document.getElementById('logout-btn').addEventListener('click', async (e) => {
+  await withBusy(e.currentTarget, async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (err) {
+      console.error('Logout request failed:', err);
+    }
+    state.authenticated = false;
+    if (autoRefreshTimer) {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
+    promptPasscodeUnlock();
+  });
 });
 
 // --- Tabs Navigation ---
@@ -198,14 +299,16 @@ function showBanner(msg, isError = false) {
   const txt = document.getElementById('status-banner-text');
   txt.textContent = msg;
   wrap.classList.toggle('error', isError);
+  wrap.setAttribute('role', isError ? 'alert' : 'status');
   wrap.hidden = false;
   if (bannerTimer) clearTimeout(bannerTimer);
   bannerTimer = setTimeout(() => {
     wrap.hidden = true;
-  }, 5000);
+  }, isError ? 9000 : 5000);
 }
 
 document.getElementById('dismiss-banner-btn').addEventListener('click', () => {
+  if (bannerTimer) clearTimeout(bannerTimer);
   document.getElementById('status-banner').hidden = true;
 });
 
@@ -220,10 +323,21 @@ function getFee() {
   return Number.isFinite(raw) && raw >= 0 ? raw : 0.015;
 }
 
+const HTML_ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str ?? '';
-  return div.innerHTML;
+  return String(str ?? '').replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]);
+}
+
+// Null/NaN-safe number formatting (avoids "NaN" / TypeError on missing API fields).
+function toFixedSafe(val, digits = 2, fallback = '—') {
+  if (val === null || val === undefined || val === '') return fallback;
+  const n = Number(val);
+  return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+}
+
+function pctSafe(val, digits = 1, fallback = '—') {
+  if (val === null || val === undefined || val === '') return fallback;
+  return toFixedSafe(Number(val) * 100, digits, fallback);
 }
 
 function formatMoney(val) {
@@ -419,10 +533,10 @@ function updateKPIs(ledgerSummary, picksList) {
     document.getElementById('kpi-exposure').textContent = `$${formatMoney(ledgerSummary.open_exposure)}`;
 
     document.getElementById('kpi-hitrate').textContent =
-      ledgerSummary.hit_rate !== null ? `${(ledgerSummary.hit_rate * 100).toFixed(1)}%` : '—';
+      ledgerSummary.hit_rate != null ? `${pctSafe(ledgerSummary.hit_rate, 1)}%` : '—';
     document.getElementById('kpi-exp-hitrate').textContent =
-      ledgerSummary.expected_win_rate !== null
-        ? `exp ${(ledgerSummary.expected_win_rate * 100).toFixed(0)}%`
+      ledgerSummary.expected_win_rate != null
+        ? `exp ${pctSafe(ledgerSummary.expected_win_rate, 0)}%`
         : '';
 
     const openBadge = document.getElementById('open-trades-badge');
@@ -467,79 +581,108 @@ function updateKPIs(ledgerSummary, picksList) {
 }
 
 // --- Auto-Refresh Live Polling ---
+const AUTO_REFRESH_MS = 60000;
+let lastLiveRefreshAt = 0;
 const picksGridEl = document.getElementById('picks-grid');
 picksGridEl.addEventListener('contentvisibilityautostatechange', (event) => {
   state.gridVisibleForPolling = !event.skipped;
   syncAutoRefreshTimer();
 });
 
-document.addEventListener('visibilitychange', syncAutoRefreshTimer);
+document.addEventListener('visibilitychange', () => {
+  const wasRunning = Boolean(autoRefreshTimer);
+  syncAutoRefreshTimer();
+  // Catch up immediately when returning to a tab whose data went stale while hidden.
+  if (!wasRunning && autoRefreshTimer && Date.now() - lastLiveRefreshAt >= AUTO_REFRESH_MS) {
+    refreshLiveLines(true);
+  }
+});
+
+function shouldAutoRefresh() {
+  if (!document.getElementById('auto-refresh-live').checked) return false;
+  if (document.hidden || !state.authenticated) return false;
+  const picksPanelVisible = !document.getElementById('panel-picks').hidden;
+  const stratPanelVisible = !document.getElementById('panel-strategies').hidden;
+  if (!picksPanelVisible && !stratPanelVisible) return false;
+  // Only gate on card-grid on-screen visibility when the card grid is actually the active view.
+  if (picksPanelVisible && state.viewMode === 'grid' && !state.gridVisibleForPolling) return false;
+  return true;
+}
 
 function syncAutoRefreshTimer() {
-  if (autoRefreshTimer) {
-    clearInterval(autoRefreshTimer);
-    autoRefreshTimer = null;
-  }
-  const enabled = document.getElementById('auto-refresh-live').checked;
-  const picksTabVisible = !document.getElementById('panel-picks').hidden || !document.getElementById('panel-strategies').hidden;
-  if (!enabled || document.hidden || !picksTabVisible || !state.gridVisibleForPolling) {
+  const run = shouldAutoRefresh();
+  if (run && autoRefreshTimer) return; // keep existing cadence instead of resetting it
+  if (!run) {
+    if (autoRefreshTimer) {
+      clearInterval(autoRefreshTimer);
+      autoRefreshTimer = null;
+    }
     return;
   }
-  autoRefreshTimer = setInterval(async () => {
-    if (!document.hidden) {
-      await refreshLiveLines(true);
-    }
-  }, 60000);
+  autoRefreshTimer = setInterval(() => {
+    if (!document.hidden) refreshLiveLines(true);
+  }, AUTO_REFRESH_MS);
 }
 
 // --- Server Config & Settings Dialog ---
+let filtersSyncedForMode = null;
+
 async function loadServerConfig() {
   try {
     const res = await apiFetch('/api/config');
-    if (!res.ok) return;
+    if (!res.ok) throw await httpError(res);
     const cfg = await res.json();
     state.serverConfig = cfg;
     const prevMode = state.traditionalMode;
     state.traditionalMode = Boolean(cfg.traditional_sportsbooks_enabled);
-
-    document.getElementById('setting-traditional-mode').checked = state.traditionalMode;
-    document.getElementById('global-bankroll').value = Number(cfg.bankroll).toFixed(2);
-
-    const feeSelect = document.getElementById('global-fee');
-    const matchingOpt = Array.from(feeSelect.options).find(
-      (o) => Math.abs(parseFloat(o.value) - Number(cfg.default_fee_dollars)) < 1e-4
-    );
-    if (matchingOpt) feeSelect.value = matchingOpt.value;
-
-    const roundSelect = document.getElementById('setting-arb-rounding');
-    const roundOpt = Array.from(roundSelect.options).find(
-      (o) => Math.abs(parseFloat(o.value) - Number(cfg.arb_stake_rounding ?? 1.0)) < 1e-4
-    );
-    if (roundOpt) roundSelect.value = roundOpt.value;
-
-    document.getElementById('setting-dk-bankroll').value =
-      cfg.dk_bankroll != null ? Number(cfg.dk_bankroll).toFixed(2) : '';
-    document.getElementById('setting-fd-bankroll').value =
-      cfg.fd_bankroll != null ? Number(cfg.fd_bankroll).toFixed(2) : '';
-    document.getElementById('setting-min-arb-roi').value = (Number(cfg.min_arb_roi ?? 0.005) * 100).toFixed(1);
     const incDkex = Boolean(cfg.include_dkex_cross_arb ?? true);
-    document.getElementById('setting-include-dkex-arb').checked = incDkex;
-    document.getElementById('strat-include-dkex').checked = incDkex;
 
-    document.getElementById('setting-kelly').value = Number(cfg.kelly_fraction || 0.25).toFixed(2);
-    document.getElementById('setting-max-bet').value = (Number(cfg.max_single_bet_pct || 0.04) * 100).toFixed(1);
+    // Don't clobber edits the user is making in an open Settings dialog (e.g. during auto-refresh).
+    if (!settingsDialog.open) {
+      document.getElementById('setting-traditional-mode').checked = state.traditionalMode;
+      document.getElementById('global-bankroll').value = toFixedSafe(cfg.bankroll, 2, '1000.00');
 
-    const minProbPct = state.traditionalMode
-      ? 40
-      : Math.round(Number(cfg.min_win_prob) * 100);
-    document.getElementById('filter-min-prob').value = String(minProbPct);
-    document.getElementById('min-prob-val').textContent = `${minProbPct}%`;
+      const feeSelect = document.getElementById('global-fee');
+      const matchingOpt = Array.from(feeSelect.options).find(
+        (o) => Math.abs(parseFloat(o.value) - Number(cfg.default_fee_dollars)) < 1e-4
+      );
+      if (matchingOpt) feeSelect.value = matchingOpt.value;
 
-    const minEdgePct = state.traditionalMode
-      ? Number((Number(cfg.min_sb_ev_edge ?? 0.02) * 100).toFixed(1))
-      : Number((Number(cfg.min_net_edge) * 100).toFixed(1));
-    document.getElementById('filter-min-edge').value = String(minEdgePct);
-    document.getElementById('min-edge-val').textContent = `+${minEdgePct.toFixed(1)}%`;
+      const roundSelect = document.getElementById('setting-arb-rounding');
+      const roundOpt = Array.from(roundSelect.options).find(
+        (o) => Math.abs(parseFloat(o.value) - Number(cfg.arb_stake_rounding ?? 1.0)) < 1e-4
+      );
+      if (roundOpt) roundSelect.value = roundOpt.value;
+
+      document.getElementById('setting-dk-bankroll').value =
+        cfg.dk_bankroll != null ? Number(cfg.dk_bankroll).toFixed(2) : '';
+      document.getElementById('setting-fd-bankroll').value =
+        cfg.fd_bankroll != null ? Number(cfg.fd_bankroll).toFixed(2) : '';
+      document.getElementById('setting-min-arb-roi').value = (Number(cfg.min_arb_roi ?? 0.005) * 100).toFixed(1);
+      document.getElementById('setting-include-dkex-arb').checked = incDkex;
+
+      document.getElementById('setting-kelly').value = Number(cfg.kelly_fraction || 0.25).toFixed(2);
+      document.getElementById('setting-max-bet').value = (Number(cfg.max_single_bet_pct || 0.04) * 100).toFixed(1);
+    }
+
+    // Only (re)seed the slate filters from server defaults on first load or after a mode switch,
+    // so periodic live refreshes don't reset the user's slider / toggle choices.
+    if (filtersSyncedForMode !== state.traditionalMode) {
+      filtersSyncedForMode = state.traditionalMode;
+      document.getElementById('strat-include-dkex').checked = incDkex;
+
+      const minProbPct = state.traditionalMode
+        ? 40
+        : Math.round(Number(cfg.min_win_prob ?? 0.6) * 100);
+      document.getElementById('filter-min-prob').value = String(minProbPct);
+      document.getElementById('min-prob-val').textContent = `${minProbPct}%`;
+
+      const minEdgePct = state.traditionalMode
+        ? Number((Number(cfg.min_sb_ev_edge ?? 0.02) * 100).toFixed(1))
+        : Number((Number(cfg.min_net_edge ?? 0.025) * 100).toFixed(1));
+      document.getElementById('filter-min-edge').value = String(minEdgePct);
+      document.getElementById('min-edge-val').textContent = `+${minEdgePct.toFixed(1)}%`;
+    }
 
     const keyHint = document.getElementById('setting-odds-hint');
     if (cfg.odds_api_connected) {
@@ -561,9 +704,10 @@ async function loadServerConfig() {
     if (prevMode !== state.traditionalMode) {
       state.backtestLoaded = false;
       state.picks = [];
+      state.sbSlate = null;
     }
   } catch (err) {
-    if (err.message !== 'Authentication required') {
+    if (!isSilentError(err)) {
       console.error('Failed loading /api/config:', err);
     }
   }
@@ -571,21 +715,24 @@ async function loadServerConfig() {
 
 document.getElementById('setting-traditional-mode').addEventListener('change', syncSettingsDialogModeFields);
 
-document.getElementById('open-settings-btn').addEventListener('click', () => {
+let settingsSaved = false;
+function openSettingsDialog() {
+  if (settingsDialog.open) return;
+  settingsSaved = false;
   document.getElementById('setting-odds-key').value = '';
   syncSettingsDialogModeFields();
   settingsDialog.showModal();
+}
+
+// Cancel / Escape / light-dismiss: revert unsaved edits, since the bankroll & fee inputs in this
+// dialog are read live by getBankroll()/getFee() for every sizing request.
+settingsDialog.addEventListener('close', () => {
+  if (!settingsSaved && state.authenticated) loadServerConfig();
 });
 
-['notice-open-settings-btn', 'strat-open-settings-btn'].forEach((id) => {
+['open-settings-btn', 'notice-open-settings-btn', 'strat-open-settings-btn'].forEach((id) => {
   const btn = document.getElementById(id);
-  if (btn) {
-    btn.addEventListener('click', () => {
-      document.getElementById('setting-odds-key').value = '';
-      syncSettingsDialogModeFields();
-      settingsDialog.showModal();
-    });
-  }
+  if (btn) btn.addEventListener('click', openSettingsDialog);
 });
 
 document.getElementById('settings-form').addEventListener('submit', async (e) => {
@@ -602,7 +749,7 @@ document.getElementById('settings-form').addEventListener('submit', async (e) =>
     kelly_fraction: Math.min(1.0, Math.max(0.05, parseFloat(document.getElementById('setting-kelly').value) || 0.25)),
     max_single_bet_pct: Math.min(0.25, Math.max(0.01, (parseFloat(document.getElementById('setting-max-bet').value) || 4) / 100)),
     arb_stake_rounding: parseFloat(document.getElementById('setting-arb-rounding').value) || 0.0,
-    min_arb_roi: Math.max(0, (parseFloat(document.getElementById('setting-min-arb-roi').value) || 0.5) / 100),
+    min_arb_roi: Math.min(0.2, Math.max(0, (parseFloat(document.getElementById('setting-min-arb-roi').value) || 0.5) / 100)),
     include_dkex_cross_arb: document.getElementById('setting-include-dkex-arb').checked,
     dk_bankroll: dkBkRaw === '' ? 0 : Math.max(0, parseFloat(dkBkRaw) || 0),
     fd_bankroll: fdBkRaw === '' ? 0 : Math.max(0, parseFloat(fdBkRaw) || 0),
@@ -619,30 +766,32 @@ document.getElementById('settings-form').addEventListener('submit', async (e) =>
     payload.the_odds_api_key = keyRaw;
   }
 
-  try {
-    const resp = await apiFetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    settingsDialog.close();
-    await loadServerConfig();
-    await loadPicks();
-    if (!document.getElementById('panel-calculator').hidden) {
-      if (state.traditionalMode) runSportsbookAnalyzer();
-      else runCustomCalculator();
+  await withBusy(document.getElementById('save-settings-btn'), async () => {
+    try {
+      await apiJson('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      settingsSaved = true;
+      settingsDialog.close();
+      await loadServerConfig();
+      await loadPicks();
+      if (!document.getElementById('panel-calculator').hidden) {
+        if (state.traditionalMode) runSportsbookAnalyzer();
+        else runCustomCalculator();
+      }
+      if (!document.getElementById('panel-ledger').hidden) loadLedger();
+      if (!document.getElementById('panel-backtest').hidden) loadBacktest();
+      showBanner(
+        state.traditionalMode
+          ? 'Switched to Traditional DraftKings & FanDuel Sportsbooks mode.'
+          : 'Workspace settings saved (DKeX mode).'
+      );
+    } catch (err) {
+      reportError('Failed saving settings', err);
     }
-    if (!document.getElementById('panel-ledger').hidden) loadLedger();
-    if (!document.getElementById('panel-backtest').hidden) loadBacktest();
-    showBanner(
-      state.traditionalMode
-        ? 'Switched to Traditional DraftKings & FanDuel Sportsbooks mode.'
-        : 'Workspace settings saved (DKeX mode).'
-    );
-  } catch (err) {
-    showBanner(`Failed saving settings: ${err}`, true);
-  }
+  });
 });
 
 // --- Markets Toolbar & Filtering ---
@@ -650,10 +799,9 @@ document.querySelectorAll('[data-seg]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const group = btn.dataset.seg;
     const val = btn.dataset.val;
+    if (state[group] === val && btn.classList.contains('active')) return;
     state[group] = val;
-    document.querySelectorAll(`[data-seg="${group}"]`).forEach((b) => {
-      b.classList.toggle('active', b === btn);
-    });
+    setSegActive(document.querySelectorAll(`[data-seg="${group}"]`), btn);
     loadPicks();
   });
 });
@@ -661,9 +809,7 @@ document.querySelectorAll('[data-seg]').forEach((btn) => {
 document.querySelectorAll('[data-strat-tab]').forEach((btn) => {
   btn.addEventListener('click', () => {
     state.strategyTab = btn.dataset.stratTab;
-    document.querySelectorAll('[data-strat-tab]').forEach((b) => {
-      b.classList.toggle('active', b === btn);
-    });
+    setSegActive(document.querySelectorAll('[data-strat-tab]'), btn);
     renderStrategies();
   });
 });
@@ -682,30 +828,35 @@ document.getElementById('toggle-filters-btn').addEventListener('click', (e) => {
 
 function applyViewModeUI() {
   const isTable = state.viewMode === 'table';
-  document.getElementById('view-grid-btn').classList.toggle('active', !isTable);
-  document.getElementById('view-table-btn').classList.toggle('active', isTable);
+  const gridBtn = document.getElementById('view-grid-btn');
+  const tableBtn = document.getElementById('view-table-btn');
+  setSegActive([gridBtn, tableBtn], isTable ? tableBtn : gridBtn);
   document.getElementById('picks-grid').hidden = isTable;
   document.getElementById('picks-table-wrap').hidden = !isTable;
 }
 
-document.getElementById('view-grid-btn').addEventListener('click', () => {
-  state.viewMode = 'grid';
-  try { localStorage.setItem('dkex_view_mode', 'grid'); } catch (_) {}
+function setViewMode(mode) {
+  if (state.viewMode === mode) return;
+  state.viewMode = mode;
+  try { localStorage.setItem('dkex_view_mode', mode); } catch (_) {}
   applyViewModeUI();
   renderPicks();
-});
+  syncAutoRefreshTimer();
+}
 
-document.getElementById('view-table-btn').addEventListener('click', () => {
-  state.viewMode = 'table';
-  try { localStorage.setItem('dkex_view_mode', 'table'); } catch (_) {}
-  applyViewModeUI();
-  renderPicks();
-});
+document.getElementById('view-grid-btn').addEventListener('click', () => setViewMode('grid'));
+document.getElementById('view-table-btn').addEventListener('click', () => setViewMode('table'));
 applyViewModeUI();
 
+let searchDebounceTimer = null;
 document.getElementById('filter-search').addEventListener('input', (e) => {
-  state.searchQuery = e.target.value.trim().toLowerCase();
-  renderPicks();
+  const next = e.target.value.trim().toLowerCase();
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    if (next === state.searchQuery) return;
+    state.searchQuery = next;
+    renderPicks();
+  }, 120);
 });
 
 document.getElementById('filters-form').addEventListener('submit', (e) => e.preventDefault());
@@ -718,7 +869,7 @@ document.getElementById('filter-min-edge').addEventListener('input', (e) => {
 });
 
 ['filter-date', 'filter-min-prob', 'filter-min-edge', 'filter-show-all', 'filter-live-props'].forEach((id) => {
-  document.getElementById(id).addEventListener('change', loadPicks);
+  document.getElementById(id).addEventListener('change', () => loadPicks());
 });
 document.getElementById('auto-refresh-live').addEventListener('change', syncAutoRefreshTimer);
 
@@ -782,6 +933,17 @@ function updateSlateMetaBar() {
 }
 
 // --- Load & Render Markets ---
+let picksAbortCtrl = null;
+
+function setPicksBusy(busy) {
+  ['picks-grid', 'picks-table-wrap', 'strategies-container'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (busy) el.setAttribute('aria-busy', 'true');
+    else el.removeAttribute('aria-busy');
+  });
+}
+
 async function loadPicks() {
   const minProb = parseFloat(document.getElementById('filter-min-prob').value) / 100;
   const minEdge = parseFloat(document.getElementById('filter-min-edge').value) / 100;
@@ -789,14 +951,21 @@ async function loadPicks() {
   const liveProps = document.getElementById('filter-live-props').checked;
   const dateVal = document.getElementById('filter-date').value;
 
+  // Cancel any older in-flight slate request so a slow stale response can't overwrite newer filters.
+  if (picksAbortCtrl) picksAbortCtrl.abort();
+  const ctrl = new AbortController();
+  picksAbortCtrl = ctrl;
+
   const grid = document.getElementById('picks-grid');
+  const tbody = document.getElementById('picks-table-tbody');
   if (!state.picks.length) {
-    grid.innerHTML = `<div class="empty-state"><p>${
-      state.traditionalMode
-        ? 'Scanning DraftKings & FanDuel lines, arbs, middles, promos, and steam lag...'
-        : 'Pricing pre-game and live contracts...'
-    }</p></div>`;
+    const loadingMsg = state.traditionalMode
+      ? 'Scanning DraftKings &amp; FanDuel lines, arbs, middles, promos, and steam lag...'
+      : 'Pricing pre-game and live contracts...';
+    grid.innerHTML = `<div class="empty-state"><p>${loadingMsg}</p></div>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${loadingMsg}</td></tr>`;
   }
+  setPicksBusy(true);
 
   try {
     if (state.traditionalMode) {
@@ -812,8 +981,8 @@ async function loadPicks() {
         min_prob: String(Math.max(0.20, minProb)),
         min_ev: String(minEdge),
         bankroll: String(getBankroll()),
-        arb_stake: String(arbStake),
-        bonus_bet_size: String(bonusSize),
+        arb_stake: String(Math.max(1, arbStake)),
+        bonus_bet_size: String(Math.max(1, bonusSize)),
         boost_pct: String(boostPct),
         include_passes: String(showAll),
         include_dkex_cross_arb: String(includeDkex),
@@ -821,9 +990,8 @@ async function loadPicks() {
       });
       if (dateVal) params.set('date', dateVal);
 
-      const res = await apiFetch(`/api/sportsbook/slate?${params.toString()}`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const data = await apiJson(`/api/sportsbook/slate?${params.toString()}`, { signal: ctrl.signal });
+      if (ctrl !== picksAbortCtrl) return;
       state.sbSlate = data;
       state.picks = data.picks || [];
       state.totalCandidates = Number(data.total_candidates ?? state.picks.length);
@@ -834,7 +1002,7 @@ async function loadPicks() {
       document.getElementById('strat-fanduel-notice').hidden = !showFdNotice;
 
       if (data.odds_quota) {
-        updateOddsApiPill(Boolean(data.odds_api_connected), undefined, data.odds_quota);
+        updateOddsApiPill(Boolean(data.odds_api_connected), Number(state.serverConfig.sharp_events_cached || 0), data.odds_quota);
       }
       updateKPIs(data.ledger_summary, state.picks);
       updateSlateMetaBar();
@@ -857,22 +1025,28 @@ async function loadPicks() {
     });
     if (dateVal) params.set('date', dateVal);
 
-    const res = await apiFetch(`/api/picks?${params.toString()}`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
+    const data = await apiJson(`/api/picks?${params.toString()}`, { signal: ctrl.signal });
+    if (ctrl !== picksAbortCtrl) return;
     state.sbSlate = null;
     state.picks = data.picks || [];
     state.totalCandidates = Number(data.total_candidates ?? state.picks.length);
     state.gamesCount = Number(data.games_count ?? 0);
     if (data.odds_quota) {
-      updateOddsApiPill(Boolean(data.odds_api_connected), undefined, data.odds_quota);
+      updateOddsApiPill(Boolean(data.odds_api_connected), Number(state.serverConfig.sharp_events_cached || 0), data.odds_quota);
     }
     updateKPIs(data.ledger_summary, state.picks);
     updateSlateMetaBar();
     renderPicks();
   } catch (err) {
-    if (err.message !== 'Authentication required') {
-      grid.innerHTML = `<div class="empty-state"><h3>Unable to load markets</h3><p>${escapeHtml(String(err))}</p></div>`;
+    if (ctrl !== picksAbortCtrl || isSilentError(err)) return;
+    console.error('Failed loading markets:', err);
+    const msg = escapeHtml(errText(err));
+    grid.innerHTML = `<div class="empty-state" role="alert"><h3>Unable to load markets</h3><p>${msg}</p></div>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="table-empty negative">Unable to load markets: ${msg}</td></tr>`;
+  } finally {
+    if (ctrl === picksAbortCtrl) {
+      picksAbortCtrl = null;
+      setPicksBusy(false);
     }
   }
 }
@@ -970,9 +1144,9 @@ function buildPickCardInnerHtml(p, idx) {
             class="dk-line-input ${p.is_custom_line ? 'is-custom' : ''}"
             type="number"
             step="0.5"
-            value="${Number(p.line_value)}"
+            value="${Number.isFinite(Number(p.line_value)) ? Number(p.line_value) : ''}"
             data-idx="${idx}"
-            aria-label="Offered DraftKings line"
+            aria-label="Offered DraftKings line for ${escapeHtml(p.selection_label)}"
           >
         </div>
         ${
@@ -992,18 +1166,18 @@ function buildPickCardInnerHtml(p, idx) {
   const btnLabel =
     p.confidence_tier === 'PASS'
       ? `Log (${qty}x)`
-      : `Log ${escapeHtml(p.recommended_side)} · ${p.recommended_contracts}x ($${p.recommended_outlay.toFixed(2)})`;
+      : `Log ${escapeHtml(p.recommended_side)} · ${p.recommended_contracts ?? qty}x ($${toFixedSafe(p.recommended_outlay, 2)})`;
   const btnCls = p.confidence_tier === 'PASS' ? 'btn btn-secondary btn-sm log-trade-btn' : 'btn btn-primary btn-sm log-trade-btn';
 
   return `
     <div class="pick-header">
       <div class="pick-meta">
         <span class="sport-label">${escapeHtml(p.sport)}</span>
-        <span>·</span>
+        <span aria-hidden="true">·</span>
         <span>${escapeHtml(p.market_type)}</span>
         ${liveBadge}
       </div>
-      <span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${p.confidence_score}</span>
+      <span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${escapeHtml(p.confidence_score ?? '')}</span>
     </div>
 
     <div>
@@ -1036,7 +1210,7 @@ function buildPickCardInnerHtml(p, idx) {
     <div class="pick-actions">
       <div class="inline-pricer" title="Configure exact DraftKings line and contract ask price">
         ${lineEditorHtml}
-        <select id="dk-side-${idx}" class="dk-side-select" data-idx="${idx}" aria-label="Contract side">
+        <select id="dk-side-${idx}" class="dk-side-select" data-idx="${idx}" aria-label="Contract side for ${escapeHtml(p.selection_label)}">
           <option value="YES" ${p.recommended_side === 'YES' ? 'selected' : ''}>YES</option>
           <option value="NO" ${p.recommended_side === 'NO' ? 'selected' : ''}>NO</option>
         </select>
@@ -1048,11 +1222,11 @@ function buildPickCardInnerHtml(p, idx) {
             min="1"
             max="99"
             step="0.5"
-            value="${Number((p.contract_price * 100).toFixed(1))}"
+            value="${Number.isFinite(Number(p.contract_price)) ? Number((p.contract_price * 100).toFixed(1)) : ''}"
             data-idx="${idx}"
-            aria-label="Contract price in cents"
+            aria-label="Contract price in cents for ${escapeHtml(p.selection_label)}"
           >
-          <span class="cents-suffix">¢</span>
+          <span class="cents-suffix" aria-hidden="true">¢</span>
         </div>
       </div>
       <button type="button" class="${btnCls}" data-idx="${idx}">${btnLabel}</button>
@@ -1060,36 +1234,72 @@ function buildPickCardInnerHtml(p, idx) {
   `;
 }
 
+// After logging a position, refresh KPIs (and the ledger table if visible) without letting a
+// secondary failure masquerade as a failed log.
+async function refreshLedgerAfterLog() {
+  if (!document.getElementById('panel-ledger').hidden) {
+    await loadLedger();
+    return;
+  }
+  try {
+    const led = await apiJson(`/api/ledger?bankroll=${getBankroll()}`);
+    updateKPIs(led.summary, state.picks);
+  } catch (err) {
+    if (!isSilentError(err)) console.error('Ledger summary refresh failed:', err);
+  }
+}
+
+async function postLedgerTrade(body) {
+  return apiJson('/api/ledger', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
 async function logPickByIndex(idx) {
   const pick = state.picks[idx];
   if (!pick) return;
   const qty = Math.max(1, pick.recommended_contracts || 1);
   try {
-    const resp = await apiFetch('/api/ledger', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sport: pick.sport,
-        event_name: pick.short_name || pick.event_name,
-        market_type: pick.market_type,
-        selection_label: pick.selection_label,
-        side: pick.recommended_side,
-        entry_price: pick.contract_price,
-        fee_per_contract: pick.fee_per_contract,
-        contracts: qty,
-        model_prob: pick.model_prob,
-        fair_exit_price: pick.fair_midgame_exit_price,
-      }),
+    await postLedgerTrade({
+      sport: pick.sport,
+      event_name: pick.short_name || pick.event_name,
+      market_type: pick.market_type,
+      selection_label: pick.selection_label,
+      side: pick.recommended_side,
+      entry_price: pick.contract_price,
+      fee_per_contract: pick.fee_per_contract,
+      contracts: qty,
+      model_prob: pick.model_prob,
+      fair_exit_price: pick.fair_midgame_exit_price,
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     showBanner(
-      `Logged ${qty}x ${pick.recommended_side} "${pick.selection_label}" @ ${(pick.contract_price * 100).toFixed(1)}¢ ($${(qty * pick.all_in_cost).toFixed(2)})`
+      `Logged ${qty}x ${pick.recommended_side} "${pick.selection_label}" @ ${pctSafe(pick.contract_price, 1)}¢ ($${toFixedSafe(qty * Number(pick.all_in_cost), 2)})`
     );
-    const led = await (await apiFetch(`/api/ledger?bankroll=${getBankroll()}`)).json();
-    updateKPIs(led.summary, state.picks);
+    await refreshLedgerAfterLog();
   } catch (err) {
-    showBanner(`Failed logging position: ${err}`, true);
+    reportError('Failed logging position', err);
   }
+}
+
+// Re-render a single card in place, keeping keyboard focus on the equivalent control.
+function rerenderPickCard(idx) {
+  const cardEl = document.querySelector(`.pick-card[data-idx="${idx}"]`);
+  if (!cardEl || !state.picks[idx]) return false;
+  const active = document.activeElement;
+  const focusCls =
+    active && cardEl.contains(active)
+      ? ['dk-line-input', 'dk-side-select', 'dk-cents-input', 'log-trade-btn', 'line-reset-btn'].find((c) =>
+          active.classList.contains(c)
+        )
+      : null;
+  cardEl.innerHTML = buildPickCardInnerHtml(state.picks[idx], idx);
+  if (focusCls) {
+    const target = cardEl.querySelector(`.${focusCls}`) || cardEl.querySelector('.dk-line-input, .dk-cents-input');
+    if (target) target.focus();
+  }
+  return true;
 }
 
 async function applyCardLineOverride(idx, { reset = false, includePriceSide = false } = {}) {
@@ -1138,26 +1348,20 @@ async function applyCardLineOverride(idx, { reset = false, includePriceSide = fa
     payload.contract_price = cents / 100;
   }
 
+  const seqKey = `card:${idx}`;
+  const seq = nextSeq(seqKey);
   try {
-    const resp = await apiFetch('/api/line-override', {
+    const data = await apiJson('/api/line-override', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
     if (!data || !data.pick) throw new Error('Invalid response payload');
+    // Drop stale responses: a newer edit on this card, or the slate was reloaded meanwhile.
+    if (!isLatestSeq(seqKey, seq) || state.picks[idx] !== pick) return;
 
     state.picks[idx] = data.pick;
-    if (state.viewMode === 'grid') {
-      const cardEl = document.querySelector(`.pick-card[data-idx="${idx}"]`);
-      if (cardEl) {
-        cardEl.innerHTML = buildPickCardInnerHtml(data.pick, idx);
-        bindCardEvents(cardEl);
-      } else {
-        renderPicks();
-      }
-    } else {
+    if (state.viewMode !== 'grid' || !rerenderPickCard(idx)) {
       renderPicks();
     }
     updateKPIs(null, state.picks);
@@ -1165,10 +1369,10 @@ async function applyCardLineOverride(idx, { reset = false, includePriceSide = fa
     if (reset) {
       showBanner(`Reset "${data.pick.selection_label}" to synced line (${data.pick.line_value}).`);
     } else if (!includePriceSide) {
-      showBanner(`Updated custom line: ${data.pick.selection_label} · Win ${(data.pick.model_prob * 100).toFixed(1)}%`);
+      showBanner(`Updated custom line: ${data.pick.selection_label} · Win ${pctSafe(data.pick.model_prob, 1)}%`);
     }
   } catch (err) {
-    showBanner(`Could not update custom line: ${err}`, true);
+    reportError('Could not update custom line', err);
   }
 }
 
@@ -1188,8 +1392,10 @@ async function reevaluateSingleCard(idx) {
   const minProb = parseFloat(document.getElementById('filter-min-prob').value) / 100;
   const minEdge = parseFloat(document.getElementById('filter-min-edge').value) / 100;
 
+  const seqKey = `card:${idx}`;
+  const seq = nextSeq(seqKey);
   try {
-    const resp = await apiFetch('/api/evaluate-contract', {
+    const updated = await apiJson('/api/evaluate-contract', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1198,71 +1404,80 @@ async function reevaluateSingleCard(idx) {
         contract_price: cents / 100,
         fee_per_contract: getFee(),
         bankroll: getBankroll(),
-        min_win_prob: minProb,
+        min_win_prob: Math.max(0.5, minProb),
         min_net_edge: minEdge,
         is_live: pick.game_state === 'LIVE',
       }),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const updated = await resp.json();
+    if (!isLatestSeq(seqKey, seq) || state.picks[idx] !== pick) return;
     pick.recommended_side = updated.side;
     pick.selection_label = formatSelectionLabelForSide(pick, updated.side);
     Object.assign(pick, updated);
 
-    const cardEl = document.querySelector(`.pick-card[data-idx="${idx}"]`);
-    if (cardEl) {
-      cardEl.innerHTML = buildPickCardInnerHtml(pick, idx);
-      bindCardEvents(cardEl);
-    }
+    if (state.viewMode === 'grid') rerenderPickCard(idx);
     updateKPIs(null, state.picks);
   } catch (err) {
-    showBanner(`Could not re-evaluate contract: ${err}`, true);
+    reportError('Could not re-evaluate contract', err);
   }
 }
 
-function bindCardEvents(container) {
-  container.querySelectorAll('.dk-line-input').forEach((inp) => {
-    inp.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        applyCardLineOverride(parseInt(e.currentTarget.dataset.idx, 10));
-      }
-    });
-    inp.addEventListener('change', (e) => {
-      applyCardLineOverride(parseInt(e.currentTarget.dataset.idx, 10));
-    });
-  });
-
-  container.querySelectorAll('.line-reset-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      applyCardLineOverride(parseInt(e.currentTarget.dataset.resetIdx, 10), { reset: true });
-    });
-  });
-
-  container.querySelectorAll('.dk-side-select').forEach((sel) => {
-    sel.addEventListener('change', (e) => {
-      reevaluateSingleCard(parseInt(e.currentTarget.dataset.idx, 10));
-    });
-  });
-
-  container.querySelectorAll('.dk-cents-input').forEach((inp) => {
-    inp.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        reevaluateSingleCard(parseInt(e.currentTarget.dataset.idx, 10));
-      }
-    });
-    inp.addEventListener('change', (e) => {
-      reevaluateSingleCard(parseInt(e.currentTarget.dataset.idx, 10));
-    });
-  });
-
-  container.querySelectorAll('.log-trade-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      logPickByIndex(parseInt(e.currentTarget.dataset.idx, 10));
-    });
+// Submit an editable card input once per distinct value (Enter + the follow-up `change` event
+// would otherwise fire two identical requests).
+function submitCardInput(inp) {
+  const idx = parseInt(inp.dataset.idx, 10);
+  if (!Number.isInteger(idx)) return;
+  const key = `${inp.className}|${inp.value}`;
+  if (inp.dataset.lastSubmitted === key) return;
+  inp.dataset.lastSubmitted = key;
+  const pending = inp.classList.contains('dk-line-input') ? applyCardLineOverride(idx) : reevaluateSingleCard(idx);
+  Promise.resolve(pending).finally(() => {
+    if (inp.dataset.lastSubmitted === key) delete inp.dataset.lastSubmitted;
   });
 }
+
+// Delegated handlers for pick cards / table rows: bound once on the stable containers instead of
+// re-attaching listeners to every control on each render.
+function bindPicksDelegation(container) {
+  container.addEventListener('click', (e) => {
+    const logBtn = e.target.closest('.log-trade-btn');
+    if (logBtn && container.contains(logBtn)) {
+      const idx = parseInt(logBtn.dataset.idx, 10);
+      withBusy(logBtn, () => logPickByIndex(idx));
+      return;
+    }
+    const sbBtn = e.target.closest('.log-sb-pick-btn');
+    if (sbBtn && container.contains(sbBtn)) {
+      const idx = parseInt(sbBtn.dataset.sbIdx, 10);
+      withBusy(sbBtn, () => logSportsbookPickByIndex(idx));
+      return;
+    }
+    const resetBtn = e.target.closest('.line-reset-btn');
+    if (resetBtn && container.contains(resetBtn)) {
+      const idx = parseInt(resetBtn.dataset.resetIdx, 10);
+      withBusy(resetBtn, () => applyCardLineOverride(idx, { reset: true }));
+    }
+  });
+
+  container.addEventListener('change', (e) => {
+    const el = e.target;
+    if (el.matches('.dk-line-input, .dk-cents-input')) {
+      submitCardInput(el);
+    } else if (el.matches('.dk-side-select')) {
+      reevaluateSingleCard(parseInt(el.dataset.idx, 10));
+    }
+  });
+
+  container.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const el = e.target;
+    if (el.matches && el.matches('.dk-line-input, .dk-cents-input')) {
+      e.preventDefault();
+      submitCardInput(el);
+    }
+  });
+}
+bindPicksDelegation(document.getElementById('picks-grid'));
+bindPicksDelegation(document.getElementById('picks-table-tbody'));
 
 function buildSportsbookCardInnerHtml(p, idx) {
   const isLive = p.game_state === 'LIVE';
@@ -1305,19 +1520,19 @@ function buildSportsbookCardInnerHtml(p, idx) {
   const btnLbl =
     p.confidence_tier === 'PASS'
       ? `Log on ${bestShort} ($${stakeVal.toFixed(0)})`
-      : `Log on ${bestShort} · $${p.recommended_stake.toFixed(0)} (${formatAmerican(p.american_odds)})`;
+      : `Log on ${bestShort} · $${toFixedSafe(p.recommended_stake, 0)} (${formatAmerican(p.american_odds)})`;
 
   return `
     <div class="pick-header">
       <div class="pick-meta">
         <span class="sport-label">${escapeHtml(p.sport)}</span>
-        <span>·</span>
+        <span aria-hidden="true">·</span>
         <span>${escapeHtml(p.market_type)}</span>
         ${venueBadgeHtml(p.book)}
         ${shopPill}
         ${liveBadge}
       </div>
-      <span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${p.confidence_score}</span>
+      <span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${escapeHtml(p.confidence_score ?? '')}</span>
     </div>
 
     <div>
@@ -1372,29 +1587,23 @@ async function logSportsbookPickByIndex(idx) {
   if (!p) return;
   const stake = Number(p.recommended_stake) > 0 ? Number(p.recommended_stake) : Math.max(5, Math.round(getBankroll() * 0.01));
   try {
-    const resp = await apiFetch('/api/ledger', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        sport: p.sport,
-        event_name: p.short_name || p.event_name,
-        market_type: p.market_type,
-        selection_label: p.selection_label,
-        side: p.side,
-        venue: p.book,
-        bet_format: 'SPORTSBOOK',
-        odds_american: p.american_odds,
-        stake,
-        model_prob: p.model_prob,
-        strategy_tag: 'EV',
-      }),
+    await postLedgerTrade({
+      sport: p.sport,
+      event_name: p.short_name || p.event_name,
+      market_type: p.market_type,
+      selection_label: p.selection_label,
+      side: p.side,
+      venue: p.book,
+      bet_format: 'SPORTSBOOK',
+      odds_american: p.american_odds,
+      stake,
+      model_prob: p.model_prob,
+      strategy_tag: 'EV',
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     showBanner(`Logged $${stake.toFixed(2)} on ${venueDisplayName(p.book)} — ${p.selection_label} (${formatAmerican(p.american_odds)})`);
-    const led = await (await apiFetch(`/api/ledger?bankroll=${getBankroll()}`)).json();
-    updateKPIs(led.summary, state.picks);
+    await refreshLedgerAfterLog();
   } catch (err) {
-    showBanner(`Failed logging sportsbook bet: ${err}`, true);
+    reportError('Failed logging sportsbook bet', err);
   }
 }
 
@@ -1412,18 +1621,16 @@ function renderPicks() {
 
     const emptyHtml = `<div class="empty-state"><h3>No matching lines</h3><p>${escapeHtml(hint)}</p></div>`;
     grid.innerHTML = emptyHtml;
-    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:2rem;">${escapeHtml(hint)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${escapeHtml(hint)}</td></tr>`;
     return;
   }
 
+  // Click/change/keydown handlers are delegated on #picks-grid / #picks-table-tbody (see bindPicksDelegation).
   if (state.traditionalMode) {
     if (state.viewMode === 'grid') {
       grid.innerHTML = rows
         .map(({ p, idx }) => `<article class="pick-card" data-idx="${idx}">${buildSportsbookCardInnerHtml(p, idx)}</article>`)
         .join('');
-      grid.querySelectorAll('.log-sb-pick-btn').forEach((btn) => {
-        btn.addEventListener('click', (e) => logSportsbookPickByIndex(parseInt(e.currentTarget.dataset.sbIdx, 10)));
-      });
     } else {
       tbody.innerHTML = rows
         .map(({ p, idx }) => {
@@ -1434,25 +1641,22 @@ function renderPicks() {
           const stateLabel = isLive
             ? `<span class="live-indicator"><span class="live-dot"></span>${escapeHtml(p.score_display || p.status_detail || 'LIVE')}</span>`
             : `${escapeHtml(p.short_name || p.event_name)}${startTxt ? ` <span class="muted">· ${escapeHtml(startTxt)}</span>` : ''}`;
-          const stakeDisp = p.recommended_stake > 0 ? `$${p.recommended_stake.toFixed(0)}` : '—';
+          const stakeDisp = Number(p.recommended_stake) > 0 ? `$${toFixedSafe(p.recommended_stake, 0)}` : '—';
           return `
             <tr>
-              <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${p.confidence_score}</span></td>
+              <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${escapeHtml(p.confidence_score ?? '')}</span></td>
               <td><span class="sport-label">${escapeHtml(p.sport)}</span> · ${stateLabel}</td>
               <td><strong>${escapeHtml(p.selection_label)}</strong></td>
               <td>${venueBadgeHtml(p.book)}</td>
               <td class="num-col mono">${formatAmerican(p.dk_odds)} / ${formatAmerican(p.fd_odds)}</td>
               <td class="num-col mono">${formatAmerican(p.fair_american_odds)}</td>
-              <td class="num-col">${(p.model_prob * 100).toFixed(1)}%</td>
-              <td class="num-col ${evCls}">${evSign}${(p.ev_pct * 100).toFixed(1)}%</td>
+              <td class="num-col">${pctSafe(p.model_prob, 1)}%</td>
+              <td class="num-col ${evCls}">${evSign}${pctSafe(p.ev_pct, 1)}%</td>
               <td class="num-col">${stakeDisp}</td>
-              <td><button type="button" class="btn btn-secondary btn-sm log-sb-pick-btn" data-sb-idx="${idx}">Log</button></td>
+              <td><button type="button" class="btn btn-secondary btn-sm log-sb-pick-btn" data-sb-idx="${idx}" aria-label="Log ${escapeHtml(p.selection_label)} on ${escapeHtml(venueDisplayName(p.book))}">Log</button></td>
             </tr>`;
         })
         .join('');
-      tbody.querySelectorAll('.log-sb-pick-btn').forEach((btn) => {
-        btn.addEventListener('click', (e) => logSportsbookPickByIndex(parseInt(e.currentTarget.dataset.sbIdx, 10)));
-      });
     }
     return;
   }
@@ -1461,7 +1665,6 @@ function renderPicks() {
     grid.innerHTML = rows
       .map(({ p, idx }) => `<article class="pick-card" data-idx="${idx}">${buildPickCardInnerHtml(p, idx)}</article>`)
       .join('');
-    bindCardEvents(grid);
   } else {
     tbody.innerHTML = rows
       .map(({ p, idx }) => {
@@ -1472,44 +1675,42 @@ function renderPicks() {
         const stateLabel = isLive
           ? `<span class="live-indicator"><span class="live-dot"></span>${escapeHtml(p.score_display || p.status_detail || 'LIVE')}</span>`
           : `${escapeHtml(p.short_name || p.event_name)}${startTxt ? ` <span class="muted">· ${escapeHtml(startTxt)}</span>` : ''}`;
+        const syncedLine = escapeHtml(String(p.default_line_value ?? p.line_value));
         const customResetBtn = p.is_custom_line
-          ? ` <button type="button" class="line-reset-btn" data-reset-idx="${idx}" title="Reset to synced line (${escapeHtml(String(p.default_line_value ?? p.line_value))})">↺</button>`
+          ? ` <button type="button" class="line-reset-btn" data-reset-idx="${idx}" title="Reset to synced line (${syncedLine})" aria-label="Reset ${escapeHtml(p.selection_label)} to synced line ${syncedLine}">↺</button>`
           : '';
         const qty = Math.max(1, p.recommended_contracts || 1);
         return `
           <tr>
-            <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${p.confidence_score}</span></td>
+            <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${escapeHtml(p.confidence_score ?? '')}</span></td>
             <td><span class="sport-label">${escapeHtml(p.sport)}</span> · ${stateLabel}</td>
             <td><strong>${escapeHtml(p.selection_label)}</strong>${customResetBtn}</td>
             <td class="mono">${escapeHtml(p.recommended_side)}</td>
-            <td class="num-col">${(p.contract_price * 100).toFixed(0)}¢</td>
-            <td class="num-col">${(p.fair_entry_max_price * 100).toFixed(0)}¢</td>
-            <td class="num-col">${(p.model_prob * 100).toFixed(1)}%</td>
-            <td class="num-col ${edgeCls}">${edgeSign}${(p.net_edge * 100).toFixed(1)}%</td>
-            <td class="num-col">${p.recommended_contracts}x ($${p.recommended_outlay.toFixed(2)})</td>
-            <td><button type="button" class="btn btn-secondary btn-sm log-trade-btn" data-idx="${idx}">Log ${qty}x</button></td>
+            <td class="num-col">${pctSafe(p.contract_price, 0)}¢</td>
+            <td class="num-col">${pctSafe(p.fair_entry_max_price, 0)}¢</td>
+            <td class="num-col">${pctSafe(p.model_prob, 1)}%</td>
+            <td class="num-col ${edgeCls}">${edgeSign}${pctSafe(p.net_edge, 1)}%</td>
+            <td class="num-col">${p.recommended_contracts ?? 0}x ($${toFixedSafe(p.recommended_outlay, 2)})</td>
+            <td><button type="button" class="btn btn-secondary btn-sm log-trade-btn" data-idx="${idx}" aria-label="Log ${qty}x ${escapeHtml(p.recommended_side)} ${escapeHtml(p.selection_label)}">Log ${qty}x</button></td>
           </tr>
         `;
       })
       .join('');
-    bindCardEvents(tbody);
   }
 }
 
 // --- Traditional DK/FD Strategies Workspace ---
 async function logStrategyPair(legA, legB, successMsg) {
   try {
-    const resp = await apiFetch('/api/ledger/pair', {
+    await apiJson('/api/ledger/pair', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ leg_a: legA, leg_b: legB }),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     showBanner(successMsg);
-    const led = await (await apiFetch(`/api/ledger?bankroll=${getBankroll()}`)).json();
-    updateKPIs(led.summary, state.picks);
+    await refreshLedgerAfterLog();
   } catch (err) {
-    showBanner(`Could not log paired strategy: ${err}`, true);
+    reportError('Could not log paired strategy', err);
   }
 }
 
@@ -1600,7 +1801,7 @@ function renderStrategies() {
     const cards = mids
       .map((m, idx) => {
         const keysHtml = (m.key_numbers_crossed || []).length
-          ? `<span class="strat-pill strat-arb">KEY #${m.key_numbers_crossed.join(', #')}</span>`
+          ? `<span class="strat-pill strat-arb">KEY #${escapeHtml(m.key_numbers_crossed.join(', #'))}</span>`
           : '';
         const evCls = m.ev_roi_pct >= 0 ? 'positive' : 'negative';
         return `
@@ -1748,50 +1949,62 @@ function renderStrategies() {
   }
 
   container.innerHTML = html;
+}
 
-  // Bind 1-click Strategy Loggers
-  container.querySelectorAll('.log-arb-pair-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      const a = arbs[parseInt(e.currentTarget.dataset.arbIdx, 10)];
-      if (!a) return;
-      const toLeg = (lg) =>
-        lg.is_dkex
-          ? {
-              sport: a.sport,
-              event_name: a.short_name || a.event_name,
-              market_type: a.market_type,
-              selection_label: lg.label,
-              side: lg.side === 'HOME' || lg.side === 'OVER' ? 'YES' : 'NO',
-              entry_price: lg.dkex_ask_price,
-              fee_per_contract: lg.dkex_fee,
-              contracts: lg.dkex_contracts || 1,
-              model_prob: lg.implied_prob,
-              fair_exit_price: lg.implied_prob,
-              venue: 'DKEX',
-              bet_format: 'CONTRACT',
-              strategy_tag: 'ARB',
-            }
-          : {
-              sport: a.sport,
-              event_name: a.short_name || a.event_name,
-              market_type: a.market_type,
-              selection_label: lg.label,
-              side: lg.side,
-              venue: lg.book,
-              bet_format: 'SPORTSBOOK',
-              odds_american: lg.american_odds,
-              stake: lg.rounded_stake,
-              model_prob: lg.implied_prob,
-              strategy_tag: 'ARB',
-            };
-      logStrategyPair(toLeg(a.leg_a), toLeg(a.leg_b), `Logged Arbitrage Pair on ${a.short_name} (+${(a.min_roi_pct * 100).toFixed(2)}% ROI)`);
-    });
-  });
+// Delegated 1-click Strategy Loggers (bound once on #strategies-container)
+document.getElementById('strategies-container').addEventListener('click', (e) => {
+  const slate = state.sbSlate;
+  if (!slate) return;
 
-  container.querySelectorAll('.log-mid-pair-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      const m = mids[parseInt(e.currentTarget.dataset.midIdx, 10)];
-      if (!m) return;
+  const arbBtn = e.target.closest('.log-arb-pair-btn');
+  if (arbBtn) {
+    const a = (slate.arbitrage || [])[parseInt(arbBtn.dataset.arbIdx, 10)];
+    if (!a) return;
+    const toLeg = (lg) =>
+      lg.is_dkex
+        ? {
+            sport: a.sport,
+            event_name: a.short_name || a.event_name,
+            market_type: a.market_type,
+            selection_label: lg.label,
+            side: lg.side === 'HOME' || lg.side === 'OVER' ? 'YES' : 'NO',
+            entry_price: lg.dkex_ask_price,
+            fee_per_contract: lg.dkex_fee,
+            contracts: lg.dkex_contracts || 1,
+            model_prob: lg.implied_prob,
+            fair_exit_price: lg.implied_prob,
+            venue: 'DKEX',
+            bet_format: 'CONTRACT',
+            strategy_tag: 'ARB',
+          }
+        : {
+            sport: a.sport,
+            event_name: a.short_name || a.event_name,
+            market_type: a.market_type,
+            selection_label: lg.label,
+            side: lg.side,
+            venue: lg.book,
+            bet_format: 'SPORTSBOOK',
+            odds_american: lg.american_odds,
+            stake: lg.rounded_stake,
+            model_prob: lg.implied_prob,
+            strategy_tag: 'ARB',
+          };
+    withBusy(arbBtn, () =>
+      logStrategyPair(
+        toLeg(a.leg_a),
+        toLeg(a.leg_b),
+        `Logged Arbitrage Pair on ${a.short_name} (+${pctSafe(a.min_roi_pct, 2)}% ROI)`
+      )
+    );
+    return;
+  }
+
+  const midBtn = e.target.closest('.log-mid-pair-btn');
+  if (midBtn) {
+    const m = (slate.middles || [])[parseInt(midBtn.dataset.midIdx, 10)];
+    if (!m) return;
+    withBusy(midBtn, () =>
       logStrategyPair(
         {
           sport: m.sport,
@@ -1820,14 +2033,16 @@ function renderStrategies() {
           strategy_tag: 'MIDDLE',
         },
         `Logged Middle Pair on ${m.short_name}`
-      );
-    });
-  });
+      )
+    );
+    return;
+  }
 
-  container.querySelectorAll('.log-bon-pair-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      const b = (promos.bonus_bet || [])[parseInt(e.currentTarget.dataset.bonIdx, 10)];
-      if (!b) return;
+  const bonBtn = e.target.closest('.log-bon-pair-btn');
+  if (bonBtn) {
+    const b = (slate.promos?.bonus_bet || [])[parseInt(bonBtn.dataset.bonIdx, 10)];
+    if (!b) return;
+    withBusy(bonBtn, () =>
       logStrategyPair(
         {
           sport: b.sport,
@@ -1857,20 +2072,20 @@ function renderStrategies() {
           model_prob: 0.75,
           strategy_tag: 'BONUS_BET',
         },
-        `Logged Bonus Bet Conversion (+$${b.guaranteed_cash.toFixed(2)} guaranteed cash)`
-      );
-    });
-  });
+        `Logged Bonus Bet Conversion (+$${toFixedSafe(b.guaranteed_cash, 2)} guaranteed cash)`
+      )
+    );
+    return;
+  }
 
-  container.querySelectorAll('.log-boost-btn').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      const bp = (promos.profit_boost || [])[parseInt(e.currentTarget.dataset.boostIdx, 10)];
-      if (!bp) return;
-      const stake = Math.max(5, Number(bp.recommended_stake || 25));
-      const resp = await apiFetch('/api/ledger', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+  const boostBtn = e.target.closest('.log-boost-btn');
+  if (boostBtn) {
+    const bp = (slate.promos?.profit_boost || [])[parseInt(boostBtn.dataset.boostIdx, 10)];
+    if (!bp) return;
+    const stake = Math.max(5, Number(bp.recommended_stake || 25));
+    withBusy(boostBtn, async () => {
+      try {
+        await postLedgerTrade({
           sport: bp.sport,
           event_name: bp.short_name || bp.event_name,
           market_type: bp.market_type,
@@ -1882,23 +2097,24 @@ function renderStrategies() {
           stake,
           model_prob: bp.model_prob,
           strategy_tag: 'BOOST',
-        }),
-      });
-      if (resp.ok) {
+        });
         showBanner(`Logged Boosted Play on ${venueDisplayName(bp.book)} (${formatAmerican(bp.effective_american_odds)})`);
+        await refreshLedgerAfterLog();
+      } catch (err) {
+        reportError('Failed logging boosted play', err);
       }
     });
-  });
+    return;
+  }
 
-  container.querySelectorAll('.log-steam-btn').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      const s = steams[parseInt(e.currentTarget.dataset.steamIdx, 10)];
-      if (!s) return;
-      const stake = Math.max(5, Math.round(getBankroll() * 0.02));
-      const resp = await apiFetch('/api/ledger', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+  const steamBtn = e.target.closest('.log-steam-btn');
+  if (steamBtn) {
+    const s = (slate.steam || [])[parseInt(steamBtn.dataset.steamIdx, 10)];
+    if (!s) return;
+    const stake = Math.max(5, Math.round(getBankroll() * 0.02));
+    withBusy(steamBtn, async () => {
+      try {
+        await postLedgerTrade({
           sport: s.sport,
           event_name: s.short_name || s.event_name,
           market_type: s.market_type,
@@ -1910,35 +2126,37 @@ function renderStrategies() {
           stake,
           model_prob: s.sharp_prob,
           strategy_tag: 'STEAM',
-        }),
-      });
-      if (resp.ok) {
+        });
         showBanner(`Logged Steam Lag play on ${venueDisplayName(s.stale_book)} (${formatAmerican(s.stale_odds)})`);
+        await refreshLedgerAfterLog();
+      } catch (err) {
+        reportError('Failed logging steam play', err);
       }
     });
-  });
-}
+  }
+});
 
 // --- Standalone Contract Analyzer (DKeX) ---
-['calc-side-yes', 'calc-side-no'].forEach((id) => {
-  document.getElementById(id).addEventListener('click', (e) => {
+const calcSideBtns = [document.getElementById('calc-side-yes'), document.getElementById('calc-side-no')];
+calcSideBtns.forEach((btn) => {
+  btn.addEventListener('click', (e) => {
     const side = e.currentTarget.dataset.side;
     document.getElementById('calc-side').value = side;
-    document.getElementById('calc-side-yes').classList.toggle('active', side === 'YES');
-    document.getElementById('calc-side-no').classList.toggle('active', side === 'NO');
+    setSegActive(calcSideBtns, e.currentTarget);
     runCustomCalculator();
   });
 });
 
 async function runCustomCalculator(e) {
   if (e) e.preventDefault();
+  const seq = nextSeq('calc-dkex');
   const side = document.getElementById('calc-side').value;
   const yesProb = Math.min(99.5, Math.max(0.5, parseFloat(document.getElementById('calc-prob').value) || 65)) / 100;
   const price = Math.min(99, Math.max(1, parseFloat(document.getElementById('calc-price').value) || 55)) / 100;
   const isLive = document.getElementById('calc-is-live').checked;
 
   try {
-    const resp = await apiFetch('/api/evaluate-contract', {
+    const ev = await apiJson('/api/evaluate-contract', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -1952,8 +2170,7 @@ async function runCustomCalculator(e) {
         is_live: isLive,
       }),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const ev = await resp.json();
+    if (!isLatestSeq('calc-dkex', seq)) return;
     state.lastCalcEval = ev;
 
     const edgeCls = ev.net_edge >= 0 ? 'positive' : 'negative';
@@ -1969,19 +2186,17 @@ async function runCustomCalculator(e) {
     pillEl.className = tierPillClass(ev.confidence_tier);
 
     document.getElementById('calc-output-body').innerHTML = `
-      <div class="kv-row"><span>Side True Win Probability</span><strong>${(ev.model_prob * 100).toFixed(1)}%</strong></div>
-      <div class="kv-row"><span>All-In Cost (Ask + Fee)</span><strong>${(ev.all_in_cost * 100).toFixed(2)}¢ (${ev.american_equivalent > 0 ? '+' : ''}${ev.american_equivalent})</strong></div>
-      <div class="kv-row"><span>Break-Even Win Rate</span><strong>${(ev.breakeven_prob * 100).toFixed(2)}%</strong></div>
-      <div class="kv-row"><span>Post-Fee Net Edge</span><strong class="${edgeCls}">${ev.net_edge >= 0 ? '+' : ''}${(ev.net_edge * 100).toFixed(2)}%</strong></div>
-      <div class="kv-row"><span>Expected ROI</span><strong class="${edgeCls}">${ev.roi_pct >= 0 ? '+' : ''}${(ev.roi_pct * 100).toFixed(2)}%</strong></div>
-      <div class="kv-row"><span>Max Limit Entry Price</span><strong>${(ev.fair_entry_max_price * 100).toFixed(1)}¢</strong></div>
-      <div class="kv-row"><span>Fair Mid-Game Exit Target</span><strong>${(ev.fair_midgame_exit_price * 100).toFixed(1)}¢</strong></div>
-      <div class="kv-row"><span>${isLive ? 'In-Play ' : ''}Quarter-Kelly Position</span><strong>${ev.recommended_contracts} contracts ($${ev.recommended_outlay.toFixed(2)})</strong></div>
+      <div class="kv-row"><span>Side True Win Probability</span><strong>${pctSafe(ev.model_prob, 1)}%</strong></div>
+      <div class="kv-row"><span>All-In Cost (Ask + Fee)</span><strong>${pctSafe(ev.all_in_cost, 2)}¢ (${ev.american_equivalent > 0 ? '+' : ''}${ev.american_equivalent})</strong></div>
+      <div class="kv-row"><span>Break-Even Win Rate</span><strong>${pctSafe(ev.breakeven_prob, 2)}%</strong></div>
+      <div class="kv-row"><span>Post-Fee Net Edge</span><strong class="${edgeCls}">${ev.net_edge >= 0 ? '+' : ''}${pctSafe(ev.net_edge, 2)}%</strong></div>
+      <div class="kv-row"><span>Expected ROI</span><strong class="${edgeCls}">${ev.roi_pct >= 0 ? '+' : ''}${pctSafe(ev.roi_pct, 2)}%</strong></div>
+      <div class="kv-row"><span>Max Limit Entry Price</span><strong>${pctSafe(ev.fair_entry_max_price, 1)}¢</strong></div>
+      <div class="kv-row"><span>Fair Mid-Game Exit Target</span><strong>${pctSafe(ev.fair_midgame_exit_price, 1)}¢</strong></div>
+      <div class="kv-row"><span>${isLive ? 'In-Play ' : ''}Quarter-Kelly Position</span><strong>${ev.recommended_contracts ?? 0} contracts ($${toFixedSafe(ev.recommended_outlay, 2)})</strong></div>
     `;
   } catch (err) {
-    if (err.message !== 'Authentication required') {
-      showBanner(`Analyzer error: ${err}`, true);
-    }
+    if (isLatestSeq('calc-dkex', seq)) reportError('Analyzer error', err);
   }
 }
 
@@ -1995,6 +2210,9 @@ document.getElementById('custom-calc-form').addEventListener('submit', runCustom
 
 document.getElementById('calc-log-btn').addEventListener('click', () => {
   const ev = state.lastCalcEval;
+  document.getElementById('nt-venue').value = 'DKEX';
+  document.getElementById('nt-dkex-fields').hidden = false;
+  document.getElementById('nt-sb-fields').hidden = true;
   if (ev) {
     document.getElementById('nt-side').value = ev.side;
     document.getElementById('nt-contracts').value = String(Math.max(1, ev.recommended_contracts || 1));
@@ -2005,10 +2223,11 @@ document.getElementById('calc-log-btn').addEventListener('click', () => {
 });
 
 // --- Traditional DK/FD 3-Mode Analyzer ---
-document.querySelectorAll('[data-sb-calc]').forEach((btn) => {
+const sbCalcBtns = Array.from(document.querySelectorAll('[data-sb-calc]'));
+sbCalcBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     state.sbCalcMode = btn.dataset.sbCalc;
-    document.querySelectorAll('[data-sb-calc]').forEach((b) => b.classList.toggle('active', b === btn));
+    setSegActive(sbCalcBtns, btn);
     document.getElementById('sb-calc-panel-ev').hidden = state.sbCalcMode !== 'ev';
     document.getElementById('sb-calc-panel-arb').hidden = state.sbCalcMode !== 'arb';
     document.getElementById('sb-calc-panel-bonus').hidden = state.sbCalcMode !== 'bonus';
@@ -2035,6 +2254,11 @@ async function runSportsbookEvCalc(e) {
   if (e) e.preventDefault();
   const dkRaw = document.getElementById('sb-ev-dk').value.trim();
   const fdRaw = document.getElementById('sb-ev-fd').value.trim();
+  if (dkRaw === '' && fdRaw === '') {
+    showBanner('Enter DraftKings odds, FanDuel odds, or both.', true);
+    return;
+  }
+  const seq = nextSeq('calc-sb-ev');
   const probRaw = document.getElementById('sb-ev-prob').value.trim();
   const shA = document.getElementById('sb-ev-sharp-a').value.trim();
   const shB = document.getElementById('sb-ev-sharp-b').value.trim();
@@ -2050,13 +2274,12 @@ async function runSportsbookEvCalc(e) {
     profit_boost_pct: boost,
   };
   try {
-    const resp = await apiFetch('/api/sportsbook/evaluate', {
+    const data = await apiJson('/api/sportsbook/evaluate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    if (!isLatestSeq('calc-sb-ev', seq)) return;
     const b = data.best;
     const evCls = b.ev_pct >= 0 ? 'positive' : 'negative';
     document.getElementById('sb-ev-verdict').textContent =
@@ -2069,21 +2292,21 @@ async function runSportsbookEvCalc(e) {
     pill.className = tierPillClass(b.confidence_tier);
 
     const dkRow = data.books.DRAFTKINGS
-      ? `<div class="kv-row"><span>DraftKings (${formatAmerican(data.books.DRAFTKINGS.effective_american_odds)})</span><strong class="${data.books.DRAFTKINGS.ev_pct >= 0 ? 'positive' : 'negative'}">${data.books.DRAFTKINGS.ev_pct >= 0 ? '+' : ''}${(data.books.DRAFTKINGS.ev_pct * 100).toFixed(2)}% EV</strong></div>`
+      ? `<div class="kv-row"><span>DraftKings (${formatAmerican(data.books.DRAFTKINGS.effective_american_odds)})</span><strong class="${data.books.DRAFTKINGS.ev_pct >= 0 ? 'positive' : 'negative'}">${data.books.DRAFTKINGS.ev_pct >= 0 ? '+' : ''}${pctSafe(data.books.DRAFTKINGS.ev_pct, 2)}% EV</strong></div>`
       : '';
     const fdRow = data.books.FANDUEL
-      ? `<div class="kv-row"><span>FanDuel (${formatAmerican(data.books.FANDUEL.effective_american_odds)})</span><strong class="${data.books.FANDUEL.ev_pct >= 0 ? 'positive' : 'negative'}">${data.books.FANDUEL.ev_pct >= 0 ? '+' : ''}${(data.books.FANDUEL.ev_pct * 100).toFixed(2)}% EV</strong></div>`
+      ? `<div class="kv-row"><span>FanDuel (${formatAmerican(data.books.FANDUEL.effective_american_odds)})</span><strong class="${data.books.FANDUEL.ev_pct >= 0 ? 'positive' : 'negative'}">${data.books.FANDUEL.ev_pct >= 0 ? '+' : ''}${pctSafe(data.books.FANDUEL.ev_pct, 2)}% EV</strong></div>`
       : '';
     document.getElementById('sb-ev-output').innerHTML = `
-      <div class="kv-row"><span>True Win Prob / Fair Odds</span><strong>${(data.true_prob * 100).toFixed(1)}% (${formatAmerican(data.fair_american_odds)})</strong></div>
+      <div class="kv-row"><span>True Win Prob / Fair Odds</span><strong>${pctSafe(data.true_prob, 1)}% (${formatAmerican(data.fair_american_odds)})</strong></div>
       ${dkRow}
       ${fdRow}
-      ${data.line_shopping_gain_pct != null ? `<div class="kv-row"><span>Line Shopping Gain</span><strong class="positive">+${(data.line_shopping_gain_pct * 100).toFixed(2)}% EV</strong></div>` : ''}
-      <div class="kv-row"><span>Best Expected ROI</span><strong class="${evCls}">${b.ev_pct >= 0 ? '+' : ''}${(b.ev_pct * 100).toFixed(2)}%</strong></div>
-      <div class="kv-row"><span>Recommended Kelly Stake</span><strong>$${b.recommended_stake.toFixed(2)} (Win +$${b.potential_profit.toFixed(2)})</strong></div>
+      ${data.line_shopping_gain_pct != null ? `<div class="kv-row"><span>Line Shopping Gain</span><strong class="positive">+${pctSafe(data.line_shopping_gain_pct, 2)}% EV</strong></div>` : ''}
+      <div class="kv-row"><span>Best Expected ROI</span><strong class="${evCls}">${b.ev_pct >= 0 ? '+' : ''}${pctSafe(b.ev_pct, 2)}%</strong></div>
+      <div class="kv-row"><span>Recommended Kelly Stake</span><strong>$${toFixedSafe(b.recommended_stake, 2)} (Win +$${toFixedSafe(b.potential_profit, 2)})</strong></div>
     `;
   } catch (err) {
-    if (err.message !== 'Authentication required') showBanner(`Evaluator error: ${err}`, true);
+    if (isLatestSeq('calc-sb-ev', seq)) reportError('Evaluator error', err);
   }
 }
 
@@ -2093,6 +2316,11 @@ async function runSportsbookArbCalc(e) {
   const bB = document.getElementById('sb-arb-book-b').value;
   const valA = parseFloat(document.getElementById('sb-arb-odds-a').value);
   const valB = parseFloat(document.getElementById('sb-arb-odds-b').value);
+  if (!Number.isFinite(valA) || !Number.isFinite(valB)) {
+    showBanner('Enter valid odds or contract prices for both legs.', true);
+    return;
+  }
+  const seq = nextSeq('calc-sb-arb');
   const total = parseFloat(document.getElementById('sb-arb-total').value) || 100;
   const fixedA = document.getElementById('sb-arb-fixed-a').value.trim();
   const step = parseFloat(document.getElementById('sb-arb-round').value) || 0;
@@ -2110,18 +2338,17 @@ async function runSportsbookArbCalc(e) {
     rounding_step: step,
   };
   try {
-    const resp = await apiFetch('/api/sportsbook/arb-calc', {
+    const r = await apiJson('/api/sportsbook/arb-calc', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const r = await resp.json();
+    if (!isLatestSeq('calc-sb-arb', seq)) return;
     const isArb = Boolean(r.is_arb);
     const vEl = document.getElementById('sb-arb-verdict');
     vEl.textContent = isArb
-      ? `ARBITRAGE · +${(r.exact_roi_pct * 100).toFixed(2)}% Guaranteed ROI`
-      : `HEDGE · ${(r.hold_pct * 100).toFixed(2)}% Two-Way Hold`;
+      ? `ARBITRAGE · +${pctSafe(r.exact_roi_pct, 2)}% Guaranteed ROI`
+      : `HEDGE · ${pctSafe(r.hold_pct, 2)}% Two-Way Hold`;
     vEl.className = `verdict-title ${isArb ? 'positive' : ''}`;
     const pill = document.getElementById('sb-arb-pill');
     pill.textContent = isArb ? (r.is_guaranteed_after_rounding ? 'GUARANTEED' : 'ROUNDING TIGHT') : 'NO ARB';
@@ -2129,20 +2356,21 @@ async function runSportsbookArbCalc(e) {
 
     const profitCls = r.min_guaranteed_profit > 0 ? 'positive' : 'negative';
     document.getElementById('sb-arb-output').innerHTML = `
-      <div class="kv-row"><span>${venueDisplayName(r.leg_a.book)} Leg 1 (${formatAmerican(r.leg_a.american_odds)})</span><strong>Stake $${r.leg_a.rounded_stake.toFixed(2)} (Exact $${r.leg_a.exact_stake.toFixed(2)})</strong></div>
-      <div class="kv-row"><span>${venueDisplayName(r.leg_b.book)} Leg 2 (${formatAmerican(r.leg_b.american_odds)})</span><strong>Stake $${r.leg_b.rounded_stake.toFixed(2)} (Exact $${r.leg_b.exact_stake.toFixed(2)})</strong></div>
-      <div class="kv-row"><span>Total Rounded Outlay</span><strong>$${r.rounded_total_stake.toFixed(2)}</strong></div>
-      <div class="kv-row"><span>Worst-Case Profit (Rounded)</span><strong class="${profitCls}">${r.min_guaranteed_profit >= 0 ? '+' : '-'}$${Math.abs(r.min_guaranteed_profit).toFixed(2)} (${(r.min_roi_pct * 100).toFixed(2)}%)</strong></div>
-      <div class="kv-row"><span>Best-Case Profit (Rounded)</span><strong class="${r.max_profit >= 0 ? 'positive' : 'negative'}">${r.max_profit >= 0 ? '+' : '-'}$${Math.abs(r.max_profit).toFixed(2)}</strong></div>
-      <div class="kv-row"><span>Implied Cost Sum</span><strong>${(r.implied_sum * 100).toFixed(2)}%</strong></div>
+      <div class="kv-row"><span>${venueDisplayName(r.leg_a.book)} Leg 1 (${formatAmerican(r.leg_a.american_odds)})</span><strong>Stake $${toFixedSafe(r.leg_a.rounded_stake, 2)} (Exact $${toFixedSafe(r.leg_a.exact_stake, 2)})</strong></div>
+      <div class="kv-row"><span>${venueDisplayName(r.leg_b.book)} Leg 2 (${formatAmerican(r.leg_b.american_odds)})</span><strong>Stake $${toFixedSafe(r.leg_b.rounded_stake, 2)} (Exact $${toFixedSafe(r.leg_b.exact_stake, 2)})</strong></div>
+      <div class="kv-row"><span>Total Rounded Outlay</span><strong>$${toFixedSafe(r.rounded_total_stake, 2)}</strong></div>
+      <div class="kv-row"><span>Worst-Case Profit (Rounded)</span><strong class="${profitCls}">${r.min_guaranteed_profit >= 0 ? '+' : '-'}$${toFixedSafe(Math.abs(r.min_guaranteed_profit), 2)} (${pctSafe(r.min_roi_pct, 2)}%)</strong></div>
+      <div class="kv-row"><span>Best-Case Profit (Rounded)</span><strong class="${r.max_profit >= 0 ? 'positive' : 'negative'}">${r.max_profit >= 0 ? '+' : '-'}$${toFixedSafe(Math.abs(r.max_profit), 2)}</strong></div>
+      <div class="kv-row"><span>Implied Cost Sum</span><strong>${pctSafe(r.implied_sum, 2)}%</strong></div>
     `;
   } catch (err) {
-    if (err.message !== 'Authentication required') showBanner(`Arb calc error: ${err}`, true);
+    if (isLatestSeq('calc-sb-arb', seq)) reportError('Arb calc error', err);
   }
 }
 
 async function runSportsbookBonusCalc(e) {
   if (e) e.preventDefault();
+  const seq = nextSeq('calc-sb-bonus');
   const bookA = document.getElementById('sb-bon-book').value;
   const bookB = bookA === 'DRAFTKINGS' ? 'FANDUEL' : 'DRAFTKINGS';
   const payload = {
@@ -2154,29 +2382,28 @@ async function runSportsbookBonusCalc(e) {
     bonus_amount: parseFloat(document.getElementById('sb-bon-amt').value) || 50,
   };
   try {
-    const resp = await apiFetch('/api/sportsbook/arb-calc', {
+    const r = await apiJson('/api/sportsbook/arb-calc', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const r = await resp.json();
-    const retPct = (r.retention_pct * 100).toFixed(1);
-    document.getElementById('sb-bon-verdict').textContent = `+$${r.guaranteed_cash.toFixed(2)} Guaranteed Cash (${retPct}%)`;
+    if (!isLatestSeq('calc-sb-bonus', seq)) return;
+    const retPct = pctSafe(r.retention_pct, 1);
+    document.getElementById('sb-bon-verdict').textContent = `+$${toFixedSafe(r.guaranteed_cash, 2)} Guaranteed Cash (${retPct}%)`;
     document.getElementById('sb-bon-verdict').className = 'verdict-title positive';
     const pill = document.getElementById('sb-bon-pill');
     pill.textContent = r.retention_pct >= 0.70 ? 'OPTIMAL 70%+' : 'MODERATE';
     pill.className = r.retention_pct >= 0.70 ? 'tier-pill tier-high' : 'tier-pill tier-mid';
 
     document.getElementById('sb-bon-output').innerHTML = `
-      <div class="kv-row"><span>Place Bonus Bet (${venueDisplayName(r.bonus_book)})</span><strong>$${r.bonus_amount.toFixed(2)} @ ${formatAmerican(r.bonus_odds)}</strong></div>
-      <div class="kv-row"><span>Place Cash Hedge (${venueDisplayName(r.hedge_book)})</span><strong>$${r.hedge_stake.toFixed(2)} @ ${formatAmerican(r.hedge_odds)}</strong></div>
-      <div class="kv-row"><span>Guaranteed Net Cash (Either Outcome)</span><strong class="positive">+$${r.guaranteed_cash.toFixed(2)}</strong></div>
+      <div class="kv-row"><span>Place Bonus Bet (${venueDisplayName(r.bonus_book)})</span><strong>$${toFixedSafe(r.bonus_amount, 2)} @ ${formatAmerican(r.bonus_odds)}</strong></div>
+      <div class="kv-row"><span>Place Cash Hedge (${venueDisplayName(r.hedge_book)})</span><strong>$${toFixedSafe(r.hedge_stake, 2)} @ ${formatAmerican(r.hedge_odds)}</strong></div>
+      <div class="kv-row"><span>Guaranteed Net Cash (Either Outcome)</span><strong class="positive">+$${toFixedSafe(r.guaranteed_cash, 2)}</strong></div>
       <div class="kv-row"><span>Conversion Retention %</span><strong class="positive">${retPct}%</strong></div>
-      <div class="kv-row"><span>Underlying Market Hold</span><strong>${(r.two_way_hold * 100).toFixed(2)}%</strong></div>
+      <div class="kv-row"><span>Underlying Market Hold</span><strong>${pctSafe(r.two_way_hold, 2)}%</strong></div>
     `;
   } catch (err) {
-    if (err.message !== 'Authentication required') showBanner(`Bonus calc error: ${err}`, true);
+    if (isLatestSeq('calc-sb-bonus', seq)) reportError('Bonus calc error', err);
   }
 }
 
@@ -2191,18 +2418,20 @@ document.getElementById('sb-arb-form').addEventListener('submit', runSportsbookA
 document.getElementById('sb-bonus-form').addEventListener('submit', runSportsbookBonusCalc);
 
 // --- Unified Multi-Venue Trade Ledger ---
-document.querySelectorAll('[data-ledger-filter]').forEach((btn) => {
+const ledgerFilterBtns = Array.from(document.querySelectorAll('[data-ledger-filter]'));
+ledgerFilterBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     state.ledgerFilter = btn.dataset.ledgerFilter;
-    document.querySelectorAll('[data-ledger-filter]').forEach((b) => b.classList.toggle('active', b === btn));
+    setSegActive(ledgerFilterBtns, btn);
     renderLedgerRows();
   });
 });
 
-document.querySelectorAll('[data-venue-filter]').forEach((btn) => {
+const venueFilterBtns = Array.from(document.querySelectorAll('[data-venue-filter]'));
+venueFilterBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     state.ledgerVenueFilter = btn.dataset.venueFilter;
-    document.querySelectorAll('[data-venue-filter]').forEach((b) => b.classList.toggle('active', b === btn));
+    setSegActive(venueFilterBtns, btn);
     renderLedgerRows();
   });
 });
@@ -2221,6 +2450,7 @@ document.getElementById('new-trade-btn').addEventListener('click', () => {
     document.getElementById('nt-dkex-fields').hidden = true;
     document.getElementById('nt-sb-fields').hidden = false;
   } else {
+    document.getElementById('nt-venue').value = 'DKEX';
     document.getElementById('nt-dkex-fields').hidden = false;
     document.getElementById('nt-sb-fields').hidden = true;
   }
@@ -2229,6 +2459,7 @@ document.getElementById('new-trade-btn').addEventListener('click', () => {
 
 document.getElementById('new-trade-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  const submitBtn = document.getElementById('save-new-trade-btn');
   const useSb = state.traditionalMode && document.getElementById('nt-venue').value !== 'DKEX';
   let body;
   if (useSb) {
@@ -2269,19 +2500,20 @@ document.getElementById('new-trade-form').addEventListener('submit', async (e) =
     };
   }
 
-  try {
-    const resp = await apiFetch('/api/ledger', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    newTradeDialog.close();
-    showBanner('Position logged to ledger.');
-    await loadLedger();
-  } catch (err) {
-    showBanner(`Could not log position: ${err}`, true);
-  }
+  await withBusy(submitBtn, async () => {
+    try {
+      await apiJson('/api/ledger', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      newTradeDialog.close();
+      showBanner('Position logged to ledger.');
+      await loadLedger();
+    } catch (err) {
+      reportError('Could not log position', err);
+    }
+  });
 });
 
 function renderVenueBankrollStrip(summary) {
@@ -2310,12 +2542,14 @@ function renderVenueBankrollStrip(summary) {
           <div class="venue-bankroll-meta mono">
             <span class="${pnlCls}">P&amp;L ${pnlSign}$${formatMoney(Math.abs(info.realized_pnl))}</span>
             <span>Open $${formatMoney(info.open_exposure)}</span>
-            <span>${info.settled_trades_count} settled</span>
+            <span>${info.settled_trades_count ?? 0} settled</span>
           </div>
         </div>`;
     })
     .join('');
 }
+
+const KNOWN_STATUS_CLASSES = new Set(['OPEN', 'WON', 'LOST', 'SOLD', 'PUSH', 'VOID', 'CASHOUT']);
 
 function renderLedgerRows() {
   const tbody = document.getElementById('ledger-tbody');
@@ -2339,27 +2573,30 @@ function renderLedgerRows() {
   tbody.innerHTML = filtered
     .map((t) => {
       const isSb = String(t.bet_format || 'CONTRACT').toUpperCase() === 'SPORTSBOOK';
-      const pnlCls = t.pnl > 0 ? 'positive' : t.pnl < 0 ? 'negative' : '';
-      const pnlStr = t.status === 'OPEN' ? '—' : `${t.pnl >= 0 ? '+' : '-'}$${Math.abs(t.pnl).toFixed(2)}`;
+      const pnlVal = Number(t.pnl || 0);
+      const pnlCls = pnlVal > 0 ? 'positive' : pnlVal < 0 ? 'negative' : '';
+      const pnlStr = t.status === 'OPEN' ? '—' : `${pnlVal >= 0 ? '+' : '-'}$${toFixedSafe(Math.abs(pnlVal), 2)}`;
       const probTxt =
         t.status === 'OPEN' && t.live_model_prob != null
-          ? `${(t.model_prob * 100).toFixed(0)}% → <strong>${(t.live_model_prob * 100).toFixed(1)}%</strong>`
-          : `${(t.model_prob * 100).toFixed(1)}%`;
+          ? `${pctSafe(t.model_prob, 0)}% → <strong>${pctSafe(t.live_model_prob, 1)}%</strong>`
+          : `${pctSafe(t.model_prob, 1)}%`;
       const guidanceTxt =
         t.status === 'OPEN' && t.live_guidance
           ? escapeHtml(t.live_guidance)
           : isSb
-            ? `Payout $${Number(t.potential_payout || 0).toFixed(2)}`
-            : `Exit ${(t.fair_exit_price * 100).toFixed(0)}¢`;
+            ? `Payout $${toFixedSafe(t.potential_payout ?? 0, 2)}`
+            : `Exit ${pctSafe(t.fair_exit_price, 0)}¢`;
 
       const sizePriceTxt = isSb
-        ? `$${Number(t.stake || t.total_cost).toFixed(2)} @ ${formatAmerican(t.odds_american)}${t.is_bonus_bet ? ' (Bonus)' : ''}`
-        : `${t.contracts} @ ${(t.entry_price * 100).toFixed(1)}¢`;
+        ? `$${toFixedSafe(t.stake ?? t.total_cost, 2)} @ ${formatAmerican(t.odds_american)}${t.is_bonus_bet ? ' (Bonus)' : ''}`
+        : `${t.contracts ?? 0} @ ${pctSafe(t.entry_price, 1)}¢`;
       const stratBadge =
         t.strategy_tag && t.strategy_tag !== 'EV'
           ? ` <span class="strat-pill">${escapeHtml(t.strategy_tag)}</span>`
           : '';
       const vBadge = state.traditionalMode || (t.venue && t.venue !== 'DKEX') ? `${venueBadgeHtml(t.venue)} ` : '';
+      const statusUpper = String(t.status || '').toUpperCase();
+      const statusCls = KNOWN_STATUS_CLASSES.has(statusUpper) ? statusUpper : '';
 
       return `
         <tr>
@@ -2370,75 +2607,92 @@ function renderLedgerRows() {
           <td class="mono">${escapeHtml(t.sport)}</td>
           <td class="mono"><strong>${escapeHtml(t.side)}</strong></td>
           <td class="num-col mono">${sizePriceTxt}</td>
-          <td class="num-col">$${Number(t.total_cost).toFixed(2)}</td>
+          <td class="num-col">$${toFixedSafe(t.total_cost, 2)}</td>
           <td class="num-col">${probTxt}</td>
           <td style="font-size:0.77rem;color:var(--text-secondary);">${guidanceTxt}</td>
-          <td><span class="status-badge ${escapeHtml(t.status)}">${escapeHtml(t.status)}</span></td>
+          <td><span class="status-badge ${statusCls}">${escapeHtml(t.status)}</span></td>
           <td class="num-col ${pnlCls}"><strong>${pnlStr}</strong></td>
           <td>
             <div class="row-actions">
               <button type="button" class="btn btn-secondary btn-sm settle-open-btn" data-id="${t.id}">Settle</button>
-              <button type="button" class="btn btn-danger-ghost btn-sm delete-trade-btn" data-id="${t.id}" aria-label="Remove position">Remove</button>
+              <button type="button" class="btn btn-danger-ghost btn-sm delete-trade-btn" data-id="${t.id}" aria-label="Remove position ${escapeHtml(t.selection_label)}">Remove</button>
             </div>
           </td>
         </tr>
       `;
     })
     .join('');
-
-  tbody.querySelectorAll('.settle-open-btn').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      const id = parseInt(e.currentTarget.dataset.id, 10);
-      const trade = state.trades.find((x) => x.id === id);
-      if (!trade) return;
-      const isSb = String(trade.bet_format || 'CONTRACT').toUpperCase() === 'SPORTSBOOK';
-      document.getElementById('settle-trade-id').value = String(trade.id);
-      document.getElementById('settle-trade-format').value = isSb ? 'SPORTSBOOK' : 'CONTRACT';
-      document.getElementById('settle-trade-summary').textContent = isSb
-        ? `${venueDisplayName(trade.venue)} — ${trade.selection_label} ($${Number(trade.stake || trade.total_cost).toFixed(2)} @ ${formatAmerican(trade.odds_american)})`
-        : `${trade.contracts}x ${trade.side} — ${trade.selection_label} (All-in cost $${trade.total_cost.toFixed(2)})`;
-
-      document.getElementById('opt-settle-sold').hidden = isSb;
-      document.getElementById('opt-settle-push').hidden = !isSb;
-      document.getElementById('opt-settle-void').hidden = !isSb;
-      document.getElementById('opt-settle-cashout').hidden = !isSb;
-      document.getElementById('settle-clv-cents-wrap').hidden = isSb;
-      document.getElementById('settle-clv-odds-wrap').hidden = !isSb;
-
-      document.getElementById('settle-status').value = 'WON';
-      document.getElementById('sold-fields').hidden = true;
-      document.getElementById('cashout-fields').hidden = true;
-      document.getElementById('settle-closing-price').value = '';
-      document.getElementById('settle-closing-odds').value = '';
-      settleDialog.showModal();
-    });
-  });
-
-  tbody.querySelectorAll('.delete-trade-btn').forEach((btn) => {
-    btn.addEventListener('click', async (e) => {
-      const id = parseInt(e.currentTarget.dataset.id, 10);
-      const delResp = await apiFetch(`/api/ledger/${id}`, { method: 'DELETE' });
-      if (delResp.ok) {
-        showBanner(`Removed position #${id}.`);
-        loadLedger();
-      }
-    });
-  });
 }
 
+// Delegated ledger row actions (bound once on #ledger-tbody)
+document.getElementById('ledger-tbody').addEventListener('click', (e) => {
+  const settleBtn = e.target.closest('.settle-open-btn');
+  if (settleBtn) {
+    const id = parseInt(settleBtn.dataset.id, 10);
+    const trade = state.trades.find((x) => x.id === id);
+    if (!trade) return;
+    const isSb = String(trade.bet_format || 'CONTRACT').toUpperCase() === 'SPORTSBOOK';
+    document.getElementById('settle-trade-id').value = String(trade.id);
+    document.getElementById('settle-trade-format').value = isSb ? 'SPORTSBOOK' : 'CONTRACT';
+    document.getElementById('settle-trade-summary').textContent = isSb
+      ? `${venueDisplayName(trade.venue)} — ${trade.selection_label} ($${toFixedSafe(trade.stake ?? trade.total_cost, 2)} @ ${formatAmerican(trade.odds_american)})`
+      : `${trade.contracts}x ${trade.side} — ${trade.selection_label} (All-in cost $${toFixedSafe(trade.total_cost, 2)})`;
+
+    document.getElementById('opt-settle-sold').hidden = isSb;
+    document.getElementById('opt-settle-push').hidden = !isSb;
+    document.getElementById('opt-settle-void').hidden = !isSb;
+    document.getElementById('opt-settle-cashout').hidden = !isSb;
+    document.getElementById('settle-clv-cents-wrap').hidden = isSb;
+    document.getElementById('settle-clv-odds-wrap').hidden = !isSb;
+
+    document.getElementById('settle-status').value = 'WON';
+    document.getElementById('sold-fields').hidden = true;
+    document.getElementById('cashout-fields').hidden = true;
+    document.getElementById('settle-closing-price').value = '';
+    document.getElementById('settle-closing-odds').value = '';
+    settleDialog.showModal();
+    return;
+  }
+
+  const delBtn = e.target.closest('.delete-trade-btn');
+  if (delBtn) {
+    const id = parseInt(delBtn.dataset.id, 10);
+    const trade = state.trades.find((x) => x.id === id);
+    const label = trade ? `${trade.selection_label} (#${id})` : `#${id}`;
+    if (!window.confirm(`Remove position ${label} from your ledger? This cannot be undone.`)) return;
+    withBusy(delBtn, async () => {
+      try {
+        await apiJson(`/api/ledger/${id}`, { method: 'DELETE' });
+        showBanner(`Removed position #${id}.`);
+        await loadLedger();
+      } catch (err) {
+        reportError(`Could not remove position #${id}`, err);
+      }
+    });
+  }
+});
+
 async function loadLedger() {
+  const seq = nextSeq('ledger');
   try {
-    const resp = await apiFetch(`/api/ledger?bankroll=${getBankroll()}`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    const data = await apiJson(`/api/ledger?bankroll=${getBankroll()}`);
+    if (!isLatestSeq('ledger', seq)) return;
     state.trades = data.trades || [];
+    const noticeEl = document.getElementById('ledger-guidance-notice');
+    if (noticeEl) {
+      if (data.guidance_error) {
+        noticeEl.textContent = `${data.guidance_error} — showing saved positions without live hold/exit signals.`;
+        noticeEl.hidden = false;
+      } else {
+        noticeEl.textContent = '';
+        noticeEl.hidden = true;
+      }
+    }
     updateKPIs(data.summary, state.picks);
     renderVenueBankrollStrip(data.summary);
     renderLedgerRows();
   } catch (err) {
-    if (err.message !== 'Authentication required') {
-      showBanner(`Failed loading ledger: ${err}`, true);
-    }
+    if (isLatestSeq('ledger', seq)) reportError('Failed loading ledger', err);
   }
 }
 
@@ -2449,6 +2703,7 @@ document.getElementById('settle-status').addEventListener('change', (e) => {
 
 document.getElementById('settle-form').addEventListener('submit', async (e) => {
   e.preventDefault();
+  const submitBtn = document.getElementById('save-settle-btn');
   const id = parseInt(document.getElementById('settle-trade-id').value, 10);
   const fmt = document.getElementById('settle-trade-format').value;
   const status = document.getElementById('settle-status').value;
@@ -2469,18 +2724,20 @@ document.getElementById('settle-form').addEventListener('submit', async (e) => {
     payload.closing_price = clvRaw ? parseFloat(clvRaw) / 100 : null;
   }
 
-  const resp = await apiFetch(`/api/ledger/${id}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+  await withBusy(submitBtn, async () => {
+    try {
+      await apiJson(`/api/ledger/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      settleDialog.close();
+      showBanner(`Position #${id} settled as ${status}.`);
+      await loadLedger();
+    } catch (err) {
+      reportError('Could not save settlement', err);
+    }
   });
-  if (resp.ok) {
-    settleDialog.close();
-    showBanner(`Position #${id} settled as ${status}.`);
-    loadLedger();
-  } else {
-    showBanner('Could not save settlement — verify inputs.', true);
-  }
 });
 
 // --- Calibration & Strategy Backtest Verification ---
@@ -2701,82 +2958,92 @@ function renderBacktestData(data) {
 
 async function loadBacktest() {
   const container = document.getElementById('backtest-container');
+  const seq = nextSeq('backtest');
+  const reqMode = state.traditionalMode;
   container.innerHTML = '<div class="empty-state"><p>Loading walk-forward verification metrics...</p></div>';
   try {
-    const endpoint = state.traditionalMode ? '/api/sportsbook/backtest-metrics' : '/api/backtest-metrics';
-    const resp = await apiFetch(endpoint);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    const endpoint = reqMode ? '/api/sportsbook/backtest-metrics' : '/api/backtest-metrics';
+    const data = await apiJson(endpoint);
+    if (!isLatestSeq('backtest', seq) || state.traditionalMode !== reqMode) return;
     state.backtestLoaded = true;
-    state.backtestModeLoaded = state.traditionalMode;
-    if (state.traditionalMode) renderSportsbookBacktest(data);
+    state.backtestModeLoaded = reqMode;
+    if (reqMode) renderSportsbookBacktest(data);
     else renderBacktestData(data);
   } catch (err) {
-    if (err.message !== 'Authentication required') {
-      container.innerHTML = `<div class="empty-state"><p>Error loading backtest: ${escapeHtml(String(err))}</p></div>`;
+    if (isLatestSeq('backtest', seq) && !isSilentError(err)) {
+      container.innerHTML = `<div class="empty-state"><p>Error loading backtest: ${escapeHtml(errText(err))}</p></div>`;
     }
   }
 }
 
 document.getElementById('run-backtest-btn').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
+  if (btn.disabled) return;
+  const reqMode = state.traditionalMode;
+  const seq = nextSeq('backtest');
   btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
   btn.textContent = 'Running Backtest...';
   try {
-    const url = state.traditionalMode
+    const url = reqMode
       ? `/api/sportsbook/backtest?sport=all&arb_rounding=${parseFloat(document.getElementById('setting-arb-rounding').value) || 1}`
       : `/api/backtest?sport=all&fee=${getFee()}`;
-    const resp = await apiFetch(url, { method: 'POST' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    state.backtestLoaded = true;
-    state.backtestModeLoaded = state.traditionalMode;
-    if (state.traditionalMode) renderSportsbookBacktest(data);
-    else renderBacktestData(data);
+    const data = await apiJson(url, { method: 'POST' });
+    if (isLatestSeq('backtest', seq) && state.traditionalMode === reqMode) {
+      state.backtestLoaded = true;
+      state.backtestModeLoaded = reqMode;
+      if (reqMode) renderSportsbookBacktest(data);
+      else renderBacktestData(data);
+    }
     showBanner(
-      state.traditionalMode
+      reqMode
         ? 'Traditional DK/FD walk-forward strategy verification completed.'
         : 'Chronological walk-forward backtest completed.'
     );
   } catch (err) {
-    showBanner(`Backtest failed: ${err}`, true);
+    reportError('Backtest failed', err);
   } finally {
     btn.disabled = false;
+    btn.removeAttribute('aria-busy');
     btn.textContent = state.traditionalMode ? 'Re-run Sportsbook Backtest' : 'Re-run Backtest';
   }
 });
 
 document.getElementById('train-models-btn').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
+  if (btn.disabled) return;
   btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
   btn.textContent = 'Training...';
   try {
-    const resp = await apiFetch('/api/train?sport=all', { method: 'POST' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    await apiJson('/api/train?sport=all', { method: 'POST' });
     await loadPicks();
     showBanner('NFL, NBA, and Player Props ensemble models retrained and calibrated.');
   } catch (err) {
-    showBanner(`Model training failed: ${err}`, true);
+    reportError('Model training failed', err);
   } finally {
     btn.disabled = false;
+    btn.removeAttribute('aria-busy');
     btn.textContent = 'Retrain Models';
   }
 });
 
 document.getElementById('sync-btn').addEventListener('click', async (e) => {
   const btn = e.currentTarget;
+  if (btn.disabled) return;
   btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
   btn.textContent = 'Syncing & Training...';
   try {
-    const resp = await apiFetch('/api/sync?sport=all', { method: 'POST' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    await apiJson('/api/sync?sport=all', { method: 'POST' });
     await loadServerConfig();
     await loadPicks();
     showBanner('Historical schedules, player logs, live feeds, and models synced.');
   } catch (err) {
-    showBanner(`Sync error: ${err}`, true);
+    reportError('Sync error', err);
   } finally {
     btn.disabled = false;
+    btn.removeAttribute('aria-busy');
     btn.textContent = 'Sync Data & Retrain';
   }
 });
@@ -2784,9 +3051,7 @@ document.getElementById('sync-btn').addEventListener('click', async (e) => {
 // --- Guide Markdown Renderer ---
 async function loadGuide() {
   try {
-    const resp = await apiFetch('/api/guide');
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
+    const data = await apiJson('/api/guide');
     state.guideLoaded = true;
     const md = data.markdown || '';
     const blocks = md.split(/```([\s\S]*?)```/g);
@@ -2826,8 +3091,8 @@ async function loadGuide() {
     }
     document.getElementById('guide-content').innerHTML = html;
   } catch (err) {
-    if (err.message !== 'Authentication required') {
-      document.getElementById('guide-content').innerHTML = `<p>Failed loading guide: ${escapeHtml(String(err))}</p>`;
+    if (!isSilentError(err)) {
+      document.getElementById('guide-content').innerHTML = `<p>Failed loading guide: ${escapeHtml(errText(err))}</p>`;
     }
   }
 }
@@ -2835,6 +3100,7 @@ async function loadGuide() {
 // --- Fast Live Feed Refresh ---
 async function refreshLiveLines(silent = false) {
   const btn = document.getElementById('refresh-live-btn');
+  if (btn.disabled) return;
   const icon = document.getElementById('refresh-icon');
   const label = document.getElementById('refresh-btn-label');
   const dateVal = document.getElementById('filter-date').value;
@@ -2842,12 +3108,13 @@ async function refreshLiveLines(silent = false) {
   if (dateVal) qs.set('date', dateVal);
 
   btn.disabled = true;
+  btn.setAttribute('aria-busy', 'true');
   icon.classList.add('spin');
   label.textContent = 'Refreshing';
 
   try {
-    const resp = await apiFetch(`/api/refresh-live?${qs.toString()}`, { method: 'POST' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    await apiJson(`/api/refresh-live?${qs.toString()}`, { method: 'POST' });
+    lastLiveRefreshAt = Date.now();
     await loadServerConfig();
     await loadPicks();
     if (!document.getElementById('panel-ledger').hidden) await loadLedger();
@@ -2855,11 +3122,10 @@ async function refreshLiveLines(silent = false) {
       showBanner('Live scoreboards, box scores, injuries, and lines refreshed.');
     }
   } catch (err) {
-    if (!silent && err.message !== 'Authentication required') {
-      showBanner(`Live refresh error: ${err}`, true);
-    }
+    if (!silent) reportError('Live refresh error', err);
   } finally {
     btn.disabled = false;
+    btn.removeAttribute('aria-busy');
     icon.classList.remove('spin');
     label.textContent = 'Refresh';
   }

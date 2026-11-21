@@ -578,7 +578,7 @@ summary:focus-visible {
 /* --- Market Cards Grid --- */
 .picks-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(350px, 100%), 1fr));
   gap: 0.85rem;
   content-visibility: auto;
   contain-intrinsic-size: auto none auto 480px;
@@ -1021,7 +1021,8 @@ summary:focus-visible {
   gap: 0.32rem;
 }
 
-.field label {
+.field label,
+.field .field-label {
   font-size: 0.76rem;
   font-weight: 500;
   color: var(--text-secondary);
@@ -1104,7 +1105,7 @@ summary:focus-visible {
 /* --- Calibration Grid & Bars --- */
 .calibration-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(360px, 100%), 1fr));
   gap: 1rem;
 }
 
@@ -1530,8 +1531,10 @@ dialog::backdrop {
 
 .strategy-section-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
+  gap: 0.35rem 0.75rem;
   margin-bottom: 0.6rem;
 }
 
@@ -1543,8 +1546,13 @@ dialog::backdrop {
 
 .strategy-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(360px, 100%), 1fr));
   gap: 0.85rem;
+}
+
+button[aria-busy="true"] {
+  cursor: progress;
+  opacity: 0.7;
 }
 
 .strategy-card {

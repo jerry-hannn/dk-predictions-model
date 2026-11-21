@@ -2,18 +2,77 @@
 
 from __future__ import annotations
 
+import atexit
 import math
 import os
+import re
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 import requests
+from requests.adapters import HTTPAdapter
 
 from src.config import get_settings
 from src.engine.dk_math import american_to_implied_prob, clamp_prob, normalize_player_name
 from src.storage.db import Database
+
+
+# --- Shared, pooled HTTP transport -------------------------------------------------------
+# Creating a new httpx.Client per request forces a fresh TCP + TLS handshake every call
+# (the dominant cost of a cold slate build). A single module-level client is thread-safe
+# and keeps connections alive across ESPN / Odds API requests.
+_HTTP_LIMITS = httpx.Limits(max_connections=64, max_keepalive_connections=32, keepalive_expiry=30.0)
+_RETRY_STATUSES = frozenset({502, 503, 504})
+_RETRY_EXCEPTIONS: tuple[type[BaseException], ...] = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.RemoteProtocolError,  # server closed a pooled keep-alive connection
+    httpx.PoolTimeout,
+)
+_http_lock = threading.Lock()
+_httpx_client: httpx.Client | None = None
+_requests_session: requests.Session | None = None
+_use_requests_fallback = False
+
+
+def _get_httpx_client() -> httpx.Client:
+    global _httpx_client
+    if _httpx_client is None:
+        with _http_lock:
+            if _httpx_client is None:
+                _httpx_client = httpx.Client(limits=_HTTP_LIMITS, timeout=10.0)
+    return _httpx_client
+
+
+def _get_requests_session() -> requests.Session:
+    global _requests_session
+    if _requests_session is None:
+        with _http_lock:
+            if _requests_session is None:
+                sess = requests.Session()
+                adapter = HTTPAdapter(pool_connections=16, pool_maxsize=64)
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+                _requests_session = sess
+    return _requests_session
+
+
+def _close_http_clients() -> None:
+    if _httpx_client is not None:
+        _httpx_client.close()
+    if _requests_session is not None:
+        _requests_session.close()
+
+
+atexit.register(_close_http_clients)
+
+
+def _redact_api_key(text: str) -> str:
+    """Strip `apiKey=...` query values from exception text before it is surfaced to the UI."""
+    return re.sub(r"(apiKey=)[^&\s'\"]+", r"\1***", str(text))
 
 
 def http_get(
@@ -25,19 +84,48 @@ def http_get(
     raise_for_status: bool = True,
 ) -> Any:
     """
-    Execute an HTTP GET via httpx, gracefully falling back to requests when container
-    NO_PROXY contains unbracketed IPv6 literals (e.g. `::1`) that trigger httpx.InvalidURL.
+    Execute an HTTP GET via a shared, connection-pooled httpx client (one retry with short
+    backoff on connect failures / dropped keep-alive connections / 502-504), gracefully
+    falling back to a pooled requests.Session when container NO_PROXY contains unbracketed
+    IPv6 literals (e.g. `::1`) that trigger httpx.InvalidURL.
     """
+    global _use_requests_fallback
     if "PYTEST_CURRENT_TEST" in os.environ and os.environ.get("ALLOW_PYTEST_NETWORK") != "1":
         raise RuntimeError("Live network disabled during pytest")
-    try:
-        with httpx.Client(timeout=timeout, headers=headers) as client:
-            resp = client.get(url, params=params)
-    except httpx.InvalidURL:
-        resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+
+    # Fail fast on unreachable hosts instead of burning the full read timeout on connect
+    req_timeout = httpx.Timeout(timeout, connect=min(float(timeout), 5.0))
+    attempts = 2
+    resp: Any = None
+    for attempt in range(attempts):
+        try:
+            if _use_requests_fallback:
+                resp = _get_requests_session().get(
+                    url, params=params, headers=headers, timeout=(min(float(timeout), 5.0), timeout)
+                )
+            else:
+                try:
+                    resp = _get_httpx_client().get(
+                        url, params=params, headers=headers, timeout=req_timeout
+                    )
+                except httpx.InvalidURL:
+                    _use_requests_fallback = True
+                    resp = _get_requests_session().get(
+                        url, params=params, headers=headers, timeout=(min(float(timeout), 5.0), timeout)
+                    )
+        except _RETRY_EXCEPTIONS + (requests.ConnectionError,):
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(0.25 * (attempt + 1))
+            continue
+        if resp.status_code in _RETRY_STATUSES and attempt + 1 < attempts:
+            time.sleep(0.25 * (attempt + 1))
+            continue
+        break
     if raise_for_status:
         resp.raise_for_status()
     return resp
+
 
 # Sharpness weights when aggregating multi-book consensus
 BOOK_SHARPNESS_WEIGHTS: dict[str, float] = {
@@ -158,6 +246,25 @@ def _iso_age_seconds(iso_str: str | None) -> float | None:
         return None
 
 
+def _safe_american(val: Any) -> float | None:
+    """Parse an American price, rejecting missing / NaN / impossible (|odds| < 100) values."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(f) or math.isinf(f) or abs(f) < 100.0:
+        return None
+    return f
+
+
+def _safe_point(val: Any) -> float | None:
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(f) or math.isinf(f) else f
+
+
 def _normalize_team_tokens(name: str) -> str:
     s = str(name or "").lower().strip()
     replacements = {
@@ -191,6 +298,9 @@ class OddsClient:
         "NBA": "basketball_nba",
     }
     QUOTA_CACHE_KEY = "odds_api:quota"
+    # Alternate key used by tooling/tests (`odds_api:meta:quota`). Both are read and the most
+    # recently updated snapshot wins, so the low-quota guard cannot be silently bypassed.
+    QUOTA_CACHE_KEY_ALIASES: tuple[str, ...] = ("odds_api:meta:quota",)
 
     def __init__(self, api_key: str | None = None, db: Database | None = None) -> None:
         settings = get_settings()
@@ -202,13 +312,23 @@ class OddsClient:
         return bool(self.api_key)
 
     def get_quota_status(self) -> dict[str, Any]:
-        q = self.db.get_cache(self.QUOTA_CACHE_KEY) or {}
+        q: dict[str, Any] = {}
+        for key in (self.QUOTA_CACHE_KEY, *self.QUOTA_CACHE_KEY_ALIASES):
+            cand = self.db.get_cache(key)
+            if not isinstance(cand, dict):
+                continue
+            if not q or float(cand.get("updated_at") or 0.0) > float(q.get("updated_at") or 0.0):
+                q = cand
         rem = q.get("requests_remaining")
         used = q.get("requests_used")
+        try:
+            low_guard = rem is not None and int(float(rem)) <= 15
+        except (TypeError, ValueError):
+            low_guard = False
         return {
             "requests_remaining": rem,
             "requests_used": used,
-            "low_quota_guard": rem is not None and int(rem) <= 15,
+            "low_quota_guard": low_guard,
             "updated_at": q.get("updated_at"),
         }
 
@@ -277,6 +397,9 @@ class OddsClient:
             self._record_quota_headers(resp.headers)
             resp.raise_for_status()
             payload = resp.json()
+            if not isinstance(payload, list):
+                # Error envelopes (e.g. {"message": ...}) must not overwrite good cached odds
+                raise ValueError("Unexpected Odds API payload shape")
             ttl = 90 if live_mode else 600
             self.db.set_cache(cache_key, payload, ttl_seconds=ttl)
             return payload
@@ -320,7 +443,7 @@ class OddsClient:
 
         quota = self.get_quota_status()
         rem = quota.get("requests_remaining")
-        if rem is not None and int(rem) <= 15 and not force_refresh:
+        if quota["low_quota_guard"] and not force_refresh:
             self._last_prop_diag = {
                 "status": "quota_guard",
                 "requests_remaining": rem,
@@ -361,13 +484,14 @@ class OddsClient:
                 last_err = None
                 break
             except Exception as exc:
-                last_err = str(exc)
+                # httpx error strings embed the full request URL, including the apiKey param
+                last_err = _redact_api_key(str(exc))
                 if attempt == 0 and last_status == 429:
                     time.sleep(0.9)
                     continue
                 break
 
-        if payload is None:
+        if not isinstance(payload, dict):
             self._last_prop_diag = {
                 "status": "http_error",
                 "http_status": last_status,
@@ -415,9 +539,12 @@ class OddsClient:
                 for out in mkt.get("outcomes") or []:
                     pname = str(out.get("description") or "").strip().lower()
                     side_nm = str(out.get("name") or "").strip().lower()
-                    if not pname or side_nm not in ("over", "under") or "point" not in out:
+                    if not pname or side_nm not in ("over", "under"):
                         continue
-                    pt_val = round(float(out["point"]), 2)
+                    pt_raw = _safe_point(out.get("point"))
+                    if pt_raw is None or _safe_american(out.get("price")) is None:
+                        continue
+                    pt_val = round(pt_raw, 2)
                     by_player_pt.setdefault((pname, pt_val), {})[side_nm] = out
 
                 # Pick the main line per player on this book (closest to 50/50 de-vigged probability)
@@ -425,8 +552,8 @@ class OddsClient:
                 for (pname, pt_val), pair in by_player_pt.items():
                     if "over" not in pair or "under" not in pair:
                         continue
-                    o_px = float(pair["over"]["price"])
-                    u_px = float(pair["under"]["price"])
+                    o_px = float(_safe_american(pair["over"].get("price")))  # validated above
+                    u_px = float(_safe_american(pair["under"].get("price")))
                     po, _ = devig_american_pair(o_px, u_px)
                     imbalance = abs(po - 0.50)
                     prev = best_for_player.get(pname)
@@ -527,7 +654,7 @@ class OddsClient:
         books_seen = 0
         sharp_books_seen = 0
 
-        for book in matched.get("bookmakers", []):
+        for book in (matched.get("bookmakers") or []):
             bkey = str(book.get("key", "")).lower()
             w = BOOK_SHARPNESS_WEIGHTS.get(bkey, 1.0)
             books_seen += 1
@@ -539,9 +666,9 @@ class OddsClient:
             if b_age is not None:
                 freshest_age = b_age if freshest_age is None else min(freshest_age, b_age)
 
-            for mkt in book.get("markets", []):
+            for mkt in (book.get("markets") or []):
                 mkey = mkt.get("key")
-                outcomes = mkt.get("outcomes", [])
+                outcomes = mkt.get("outcomes") or []
                 if len(outcomes) != 2:
                     continue
                 m_age = _iso_age_seconds(mkt.get("last_update"))
@@ -554,9 +681,10 @@ class OddsClient:
                         None,
                     )
                     away_out = next((o for o in outcomes if o is not home_out), None)
-                    if home_out and away_out:
-                        h_px = float(home_out["price"])
-                        a_px = float(away_out["price"])
+                    h_px_opt = _safe_american(home_out.get("price")) if home_out else None
+                    a_px_opt = _safe_american(away_out.get("price")) if away_out else None
+                    if h_px_opt is not None and a_px_opt is not None:
+                        h_px, a_px = h_px_opt, a_px_opt
                         ph, _ = devig_american_pair(h_px, a_px)
                         h2h_num += w * ph
                         h2h_den += w
@@ -567,12 +695,12 @@ class OddsClient:
                             dk_data["dk_home_ml"] = int(round(h_px))
                             dk_data["dk_away_ml"] = int(round(a_px))
                             dk_data["dk_home_win_prob"] = round(ph, 4)
-                            dk_data["dk_age_seconds"] = m_age or b_age
+                            dk_data["dk_age_seconds"] = m_age if m_age is not None else b_age
                         elif bkey == "fanduel":
                             fd_data["fd_home_ml"] = int(round(h_px))
                             fd_data["fd_away_ml"] = int(round(a_px))
                             fd_data["fd_home_win_prob"] = round(ph, 4)
-                            fd_data["fd_age_seconds"] = m_age or b_age
+                            fd_data["fd_age_seconds"] = m_age if m_age is not None else b_age
 
                 elif mkey == "spreads":
                     home_out = next(
@@ -580,10 +708,11 @@ class OddsClient:
                         None,
                     )
                     away_out = next((o for o in outcomes if o is not home_out), None)
-                    if home_out and away_out and "point" in home_out:
-                        h_pt = float(home_out["point"])
-                        h_px = float(home_out["price"])
-                        a_px = float(away_out["price"])
+                    h_pt_opt = _safe_point(home_out.get("point")) if home_out else None
+                    h_px_opt = _safe_american(home_out.get("price")) if home_out else None
+                    a_px_opt = _safe_american(away_out.get("price")) if away_out else None
+                    if h_pt_opt is not None and h_px_opt is not None and a_px_opt is not None:
+                        h_pt, h_px, a_px = h_pt_opt, h_px_opt, a_px_opt
                         ph, _ = devig_american_pair(h_px, a_px)
                         spread_lines.append((bkey, w, h_pt, ph))
                         if is_non_dk_fd:
@@ -593,13 +722,13 @@ class OddsClient:
                             dk_data["dk_home_spread_odds"] = int(round(h_px))
                             dk_data["dk_away_spread_odds"] = int(round(a_px))
                             dk_data["dk_home_cover_prob"] = round(ph, 4)
-                            dk_data["dk_age_seconds"] = m_age or b_age
+                            dk_data["dk_age_seconds"] = m_age if m_age is not None else b_age
                         elif bkey == "fanduel":
                             fd_data["fd_home_spread"] = h_pt
                             fd_data["fd_home_spread_odds"] = int(round(h_px))
                             fd_data["fd_away_spread_odds"] = int(round(a_px))
                             fd_data["fd_home_cover_prob"] = round(ph, 4)
-                            fd_data["fd_age_seconds"] = m_age or b_age
+                            fd_data["fd_age_seconds"] = m_age if m_age is not None else b_age
 
                 elif mkey == "totals":
                     over_out = next(
@@ -610,10 +739,11 @@ class OddsClient:
                         (o for o in outcomes if str(o.get("name", "")).lower() == "under"),
                         None,
                     )
-                    if over_out and under_out and "point" in over_out:
-                        t_pt = float(over_out["point"])
-                        o_px = float(over_out["price"])
-                        u_px = float(under_out["price"])
+                    t_pt_opt = _safe_point(over_out.get("point")) if over_out else None
+                    o_px_opt = _safe_american(over_out.get("price")) if over_out else None
+                    u_px_opt = _safe_american(under_out.get("price")) if under_out else None
+                    if t_pt_opt is not None and o_px_opt is not None and u_px_opt is not None:
+                        t_pt, o_px, u_px = t_pt_opt, o_px_opt, u_px_opt
                         po, _ = devig_american_pair(o_px, u_px)
                         total_lines.append((bkey, w, t_pt, po))
                         if is_non_dk_fd:
@@ -623,13 +753,13 @@ class OddsClient:
                             dk_data["dk_over_odds"] = int(round(o_px))
                             dk_data["dk_under_odds"] = int(round(u_px))
                             dk_data["dk_over_prob"] = round(po, 4)
-                            dk_data["dk_age_seconds"] = m_age or b_age
+                            dk_data["dk_age_seconds"] = m_age if m_age is not None else b_age
                         elif bkey == "fanduel":
                             fd_data["fd_total_line"] = t_pt
                             fd_data["fd_over_odds"] = int(round(o_px))
                             fd_data["fd_under_odds"] = int(round(u_px))
                             fd_data["fd_over_prob"] = round(po, 4)
-                            fd_data["fd_age_seconds"] = m_age or b_age
+                            fd_data["fd_age_seconds"] = m_age if m_age is not None else b_age
 
         if dk_data and fd_data:
             src_label = f"DK + FD + {books_seen}-Book Sharp"

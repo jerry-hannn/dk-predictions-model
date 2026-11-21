@@ -5,14 +5,19 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
 from src.backtest.sportsbook_backtest import run_sportsbook_backtest
 from src.backtest.walk_forward import run_walk_forward_backtest
@@ -32,6 +37,7 @@ def _resolve_static_dir() -> Path:
 
 STATIC_DIR = _resolve_static_dir()
 SESSION_COOKIE_NAME = "dkex_session"
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="DraftKings Predictions & Sportsbook Live Model API",
@@ -47,6 +53,11 @@ def _derive_session_token(passcode: str) -> str:
     ).hexdigest()
 
 
+def _safe_equals(candidate: str, expected: str) -> bool:
+    """Constant-time comparison that also handles non-ASCII input (str compare_digest raises)."""
+    return hmac.compare_digest(candidate.encode("utf-8"), expected.encode("utf-8"))
+
+
 def _is_request_authenticated(request: Request, passcode: str) -> bool:
     if not passcode:
         return True
@@ -54,15 +65,15 @@ def _is_request_authenticated(request: Request, passcode: str) -> bool:
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         candidate = auth_header[7:].strip()
-        if hmac.compare_digest(candidate, passcode):
+        if _safe_equals(candidate, passcode):
             return True
 
     passcode_header = request.headers.get("x-app-passcode", "").strip()
-    if passcode_header and hmac.compare_digest(passcode_header, passcode):
+    if passcode_header and _safe_equals(passcode_header, passcode):
         return True
 
     cookie_val = request.cookies.get(SESSION_COOKIE_NAME, "")
-    if cookie_val and hmac.compare_digest(cookie_val, _derive_session_token(passcode)):
+    if cookie_val and _safe_equals(cookie_val, _derive_session_token(passcode)):
         return True
 
     return False
@@ -73,25 +84,40 @@ async def security_and_cache_middleware(request: Request, call_next):
     path = request.url.path
 
     if path.startswith("/api/") and not path.startswith("/api/auth/"):
-        passcode = get_settings().app_passcode
+        passcode = await run_in_threadpool(lambda: get_settings().app_passcode)
         if passcode and not _is_request_authenticated(request, passcode):
             return JSONResponse(
                 status_code=401,
                 content={"detail": "Authentication required."},
+                headers={"Cache-Control": "no-store"},
             )
 
     response: Response = await call_next(request)
     if path == "/" or path.startswith("/static/"):
-        response.headers["Cache-Control"] = "no-store, max-age=0"
+        # Always revalidate (ETag / Last-Modified -> cheap 304s) so deploys show up immediately
+        response.headers["Cache-Control"] = "no-cache"
+    elif path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
     return response
 
 
+# Slate / ledger JSON payloads can be several hundred KB; compress for remote clients
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 def _get_hub() -> ModelHub:
     settings = get_settings()
     return ModelHub(settings=settings, db=Database(settings.db_path))
+
+
+def _validate_american_odds(value: Optional[float]) -> Optional[float]:
+    """American odds must be <= -100 or >= +100 (e.g. -110, +150); values in (-100, 100) are invalid."""
+    if value is None:
+        return value
+    if not (abs(float(value)) >= 100.0 and abs(float(value)) <= 100000.0):
+        raise ValueError("American odds must be <= -100 or >= +100 (e.g. -110 or +150).")
+    return value
 
 
 class AuthLoginRequest(BaseModel):
@@ -137,6 +163,10 @@ class SportsbookEvalRequest(BaseModel):
     profit_boost_pct: float = Field(0.0, ge=0.0, le=2.0)
     is_live: bool = False
 
+    _check_odds = field_validator(
+        "sharp_odds_side", "sharp_odds_opp", "dk_odds", "fd_odds"
+    )(_validate_american_odds)
+
 
 class SportsbookArbCalcRequest(BaseModel):
     calc_mode: str = Field("arb", pattern="^(arb|bonus_bet)$")
@@ -152,6 +182,8 @@ class SportsbookArbCalcRequest(BaseModel):
     fixed_stake_a: Optional[float] = Field(None, gt=0.0)
     rounding_step: Optional[float] = Field(None, ge=0.0, le=25.0)
     bonus_amount: float = Field(50.0, gt=0.0)
+
+    _check_odds = field_validator("odds_a", "odds_b")(_validate_american_odds)
 
 
 class LineOverrideRequest(BaseModel):
@@ -191,6 +223,8 @@ class CreateTradeRequest(BaseModel):
     strategy_tag: str = "EV"
     group_id: Optional[str] = None
 
+    _check_odds = field_validator("odds_american")(_validate_american_odds)
+
 
 class CreateTradePairRequest(BaseModel):
     leg_a: CreateTradeRequest
@@ -209,6 +243,8 @@ class UpdateTradeRequest(BaseModel):
     closing_odds_american: Optional[int] = None
     cashout_amount: Optional[float] = Field(None, ge=0.0)
     notes: Optional[str] = None
+
+    _check_odds = field_validator("closing_odds_american")(_validate_american_odds)
 
 
 @app.get("/healthz")
@@ -230,17 +266,69 @@ def auth_status(request: Request) -> dict[str, bool]:
     }
 
 
+_LOGIN_FAILURES: dict[str, list[float]] = {}
+_LOGIN_FAILURES_LOCK = threading.Lock()
+_LOGIN_WINDOW_SECONDS = 300.0
+_LOGIN_MAX_FAILURES = 10
+# Global ceiling across all clients: forwarded client IPs can be spoofed, so per-IP limits alone
+# don't stop a distributed/rotating brute-force attempt.
+_LOGIN_GLOBAL_KEY = "__all_clients__"
+_LOGIN_MAX_GLOBAL_FAILURES = 100
+
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def _recent_failures(key: str, now: float) -> list[float]:
+    attempts = [t for t in _LOGIN_FAILURES.get(key, []) if now - t < _LOGIN_WINDOW_SECONDS]
+    if attempts:
+        _LOGIN_FAILURES[key] = attempts
+    else:
+        _LOGIN_FAILURES.pop(key, None)
+    return attempts
+
+
+def _record_login_failure(key: str, now: float) -> None:
+    if len(_LOGIN_FAILURES) > 2048:
+        for k in list(_LOGIN_FAILURES):
+            _recent_failures(k, now)
+    _LOGIN_FAILURES.setdefault(key, []).append(now)
+    _LOGIN_FAILURES.setdefault(_LOGIN_GLOBAL_KEY, []).append(now)
+
+
+def _is_https(request: Request) -> bool:
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return proto == "https" or request.url.scheme == "https"
+
+
 @app.post("/api/auth/login")
-def auth_login(req: AuthLoginRequest, response: Response) -> dict[str, bool]:
+def auth_login(req: AuthLoginRequest, request: Request, response: Response) -> dict[str, bool]:
     passcode = get_settings().app_passcode
-    if passcode and not hmac.compare_digest(req.passcode.strip(), passcode):
-        raise HTTPException(status_code=401, detail="Invalid passcode.")
     if passcode:
+        key = _client_key(request)
+        now = time.time()
+        with _LOGIN_FAILURES_LOCK:
+            if (
+                len(_recent_failures(key, now)) >= _LOGIN_MAX_FAILURES
+                or len(_recent_failures(_LOGIN_GLOBAL_KEY, now)) >= _LOGIN_MAX_GLOBAL_FAILURES
+            ):
+                raise HTTPException(
+                    status_code=429,
+                    detail="Too many failed attempts. Please wait a few minutes and try again.",
+                )
+        if not _safe_equals(req.passcode.strip(), passcode):
+            with _LOGIN_FAILURES_LOCK:
+                _record_login_failure(key, now)
+            raise HTTPException(status_code=401, detail="Invalid passcode.")
+        with _LOGIN_FAILURES_LOCK:
+            _LOGIN_FAILURES.pop(key, None)
         response.set_cookie(
             key=SESSION_COOKIE_NAME,
             value=_derive_session_token(passcode),
             httponly=True,
             samesite="lax",
+            secure=_is_https(request),
             max_age=30 * 24 * 3600,
         )
     return {"authenticated": True}
@@ -629,11 +717,14 @@ def list_ledger(
     hub = _get_hub()
     bk = bankroll if bankroll is not None else hub.settings.bankroll
     trades = hub.db.list_trades(venue=venue)
-    open_guidance = (
-        {op["id"]: op for op in hub.evaluate_open_positions(fresh=False)}
-        if any(t["status"] == "OPEN" for t in trades)
-        else {}
-    )
+    open_guidance: dict[Any, dict[str, Any]] = {}
+    guidance_error: Optional[str] = None
+    if any(t["status"] == "OPEN" for t in trades):
+        try:
+            open_guidance = {op["id"]: op for op in hub.evaluate_open_positions(fresh=False)}
+        except Exception as exc:  # noqa: BLE001 - never block access to the ledger itself
+            logger.exception("Live position guidance failed")
+            guidance_error = f"Live guidance unavailable: {exc.__class__.__name__}"
     enriched = [
         {
             **t,
@@ -653,6 +744,7 @@ def list_ledger(
             fd_bankroll=hub.settings.fd_bankroll,
         ),
         "trades": enriched,
+        "guidance_error": guidance_error,
     }
 
 

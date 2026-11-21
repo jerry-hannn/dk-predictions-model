@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 import secrets
 import sqlite3
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from src.config import get_settings
 from src.engine.dk_math import american_to_implied_prob
@@ -104,22 +106,84 @@ CREATE TABLE IF NOT EXISTS line_overrides (
 );
 """
 
+# Secondary indexes on frequently filtered/sorted columns. Created after the trades
+# migration (a legacy `trades` table may not yet have the `venue` column, and the
+# rebuild drops any indexes on the old table).
+INDEX_SQL: tuple[str, ...] = (
+    "CREATE INDEX IF NOT EXISTS idx_predictions_slate "
+    "ON predictions_snapshot (slate_date, confidence_score DESC, net_edge DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache (expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_venue ON trades (venue, id)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_group ON trades (group_id)",
+    "CREATE INDEX IF NOT EXISTS idx_line_overrides_updated ON line_overrides (updated_at)",
+)
+
+# Expired cache rows are kept around this long so `allow_stale=True` fallbacks keep
+# working during API outages, then pruned so the table does not grow without bound.
+STALE_CACHE_RETENTION_SECONDS = 7 * 86400
+
+# Schema creation / migration only needs to run once per DB file per process. The web
+# app instantiates `Database(...)` per request, so re-running DDL every time is wasteful.
+_INITIALIZED_DB_PATHS: set[str] = set()
+_INIT_LOCK = threading.Lock()
+
 
 class Database:
     def __init__(self, db_path: Path | None = None) -> None:
-        self.db_path = db_path or get_settings().db_path
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_db()
+        self.db_path = Path(db_path) if db_path is not None else Path(get_settings().db_path)
+        key = str(self.db_path.absolute())
+        if key in _INITIALIZED_DB_PATHS and self.db_path.exists():
+            return
+        with _INIT_LOCK:
+            if key in _INITIALIZED_DB_PATHS and self.db_path.exists():
+                return
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_db()
+            _INITIALIZED_DB_PATHS.add(key)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
+        # Wait for concurrent FastAPI worker threads instead of failing with "database is locked"
+        conn.execute("PRAGMA busy_timeout = 15000")
+        # Safe with WAL and markedly cheaper commits than the FULL default
+        conn.execute("PRAGMA synchronous = NORMAL")
         return conn
 
+    @contextmanager
+    def _session(self) -> Iterator[sqlite3.Connection]:
+        """
+        Yield a connection that commits on success, rolls back on error, and is ALWAYS closed.
+        (`with sqlite3.connect(...) as conn` only manages the transaction; it never closes.)
+        """
+        conn = self._connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with self._connect() as conn:
+        with self._session() as conn:
+            try:
+                # Persistent per-file setting: readers no longer block on writers
+                conn.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.DatabaseError:
+                pass  # e.g. filesystems without shared-memory support; keep default journal
             conn.executescript(SCHEMA_SQL)
+            # Explicit write transaction so the legacy table rebuild (DROP + RENAME) is atomic
+            # and concurrent processes cannot both attempt the migration.
+            conn.execute("BEGIN IMMEDIATE")
             self._migrate_trades_table(conn)
+            for stmt in INDEX_SQL:
+                try:
+                    conn.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass  # unexpected legacy column layout; indexes are only an optimization
+            conn.execute(
+                "DELETE FROM api_cache WHERE expires_at < ?",
+                (time.time() - STALE_CACHE_RETENTION_SECONDS,),
+            )
 
     @staticmethod
     def _migrate_trades_table(conn: sqlite3.Connection) -> None:
@@ -194,7 +258,7 @@ class Database:
 
     # --- Persistent UI settings helpers ---
     def get_app_settings(self) -> dict[str, str]:
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
         return {str(r["key"]): str(r["value"]) for r in rows}
 
@@ -202,18 +266,17 @@ class Database:
         if not updates:
             return
         now = time.time()
-        with self._connect() as conn:
-            for k, v in updates.items():
-                conn.execute(
-                    """
-                    INSERT INTO app_settings (key, value, updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(key) DO UPDATE SET
-                        value = excluded.value,
-                        updated_at = excluded.updated_at
-                    """,
-                    (str(k), str(v), now),
-                )
+        with self._session() as conn:
+            conn.executemany(
+                """
+                INSERT INTO app_settings (key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                [(str(k), str(v), now) for k, v in updates.items()],
+            )
 
     # --- Cache helpers ---
     def get_cache(self, key: str) -> Any | None:
@@ -222,7 +285,7 @@ class Database:
 
     def get_cache_with_age(self, key: str, allow_stale: bool = False) -> tuple[Any | None, float | None]:
         now = time.time()
-        with self._connect() as conn:
+        with self._session() as conn:
             row = conn.execute(
                 "SELECT payload_json, expires_at, updated_at FROM api_cache WHERE cache_key = ?",
                 (key,),
@@ -232,11 +295,15 @@ class Database:
         age = max(0.0, now - float(row["updated_at"]))
         if not allow_stale and float(row["expires_at"]) < now:
             return None, None
-        return json.loads(row["payload_json"]), round(age, 1)
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return None, None  # corrupt cache row behaves like a miss instead of crashing callers
+        return payload, round(age, 1)
 
     def set_cache(self, key: str, payload: Any, ttl_seconds: int = 900) -> None:
         now = time.time()
-        with self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 INSERT INTO api_cache (cache_key, payload_json, expires_at, updated_at)
@@ -252,10 +319,18 @@ class Database:
     # --- Custom Line Override helpers ---
     def get_line_overrides(self, max_age_seconds: float = 86400.0) -> dict[str, dict[str, Any]]:
         cutoff = time.time() - max_age_seconds
-        with self._connect() as conn:
-            conn.execute("DELETE FROM line_overrides WHERE updated_at < ?", (cutoff,))
+        with self._session() as conn:
+            # Only take a write lock when there is actually something to purge (this runs on
+            # every slate/status request, so an unconditional DELETE serialized readers).
+            has_expired = conn.execute(
+                "SELECT 1 FROM line_overrides WHERE updated_at < ? LIMIT 1", (cutoff,)
+            ).fetchone()
+            if has_expired is not None:
+                conn.execute("DELETE FROM line_overrides WHERE updated_at < ?", (cutoff,))
             rows = conn.execute(
-                "SELECT override_key, line_value, contract_price, side, updated_at FROM line_overrides"
+                "SELECT override_key, line_value, contract_price, side, updated_at "
+                "FROM line_overrides WHERE updated_at >= ?",
+                (cutoff,),
             ).fetchall()
         return {
             str(r["override_key"]): {
@@ -277,7 +352,7 @@ class Database:
     ) -> dict[str, Any]:
         now = time.time()
         norm_side = side.upper() if side and side.upper() in ("YES", "NO") else None
-        with self._connect() as conn:
+        with self._session() as conn:
             conn.execute(
                 """
                 INSERT INTO line_overrides (override_key, line_value, contract_price, side, updated_at)
@@ -299,7 +374,7 @@ class Database:
         }
 
     def delete_line_override(self, override_key: str) -> bool:
-        with self._connect() as conn:
+        with self._session() as conn:
             cur = conn.execute(
                 "DELETE FROM line_overrides WHERE override_key = ?",
                 (str(override_key),),
@@ -307,16 +382,17 @@ class Database:
             return cur.rowcount > 0
 
     def clear_line_overrides(self) -> int:
-        with self._connect() as conn:
+        with self._session() as conn:
             cur = conn.execute("DELETE FROM line_overrides")
             return int(cur.rowcount or 0)
 
     # --- Predictions Snapshot ---
     def save_predictions(self, picks: list[dict[str, Any]]) -> None:
         now = time.time()
-        with self._connect() as conn:
-            for p in picks:
-                conn.execute(
+        if not picks:
+            return
+        with self._session() as conn:
+            conn.executemany(
                     """
                     INSERT INTO predictions_snapshot (
                         pick_id, slate_date, sport, event_id, event_name, start_time,
@@ -352,6 +428,7 @@ class Database:
                         injury_notes = excluded.injury_notes,
                         created_at = excluded.created_at
                     """,
+                    [
                     (
                         p["pick_id"],
                         p["slate_date"],
@@ -381,7 +458,9 @@ class Database:
                         json.dumps(p.get("drivers", [])),
                         p.get("injury_notes", ""),
                         now,
-                    ),
+                    )
+                    for p in picks
+                    ],
                 )
 
     def list_predictions(self, slate_date: str | None = None) -> list[dict[str, Any]]:
@@ -391,7 +470,7 @@ class Database:
             query += " WHERE slate_date = ?"
             params = (slate_date,)
         query += " ORDER BY confidence_score DESC, net_edge DESC"
-        with self._connect() as conn:
+        with self._session() as conn:
             rows = conn.execute(query, params).fetchall()
         out = []
         for r in rows:
@@ -433,7 +512,56 @@ class Database:
         strategy_tag: str = "EV",
         group_id: str | None = None,
     ) -> dict[str, Any]:
-        norm_venue = self._normalize_venue(venue)
+        params = self._prepare_trade_params(
+            created_at=created_at,
+            sport=sport,
+            event_name=event_name,
+            market_type=market_type,
+            selection_label=selection_label,
+            side=side,
+            entry_price=entry_price,
+            fee_per_contract=fee_per_contract,
+            contracts=contracts,
+            model_prob=model_prob,
+            fair_exit_price=fair_exit_price,
+            notes=notes,
+            venue=venue,
+            bet_format=bet_format,
+            odds_american=odds_american,
+            stake=stake,
+            is_bonus_bet=is_bonus_bet,
+            strategy_tag=strategy_tag,
+            group_id=group_id,
+        )
+        with self._session() as conn:
+            return self._insert_trade(conn, params)
+
+    @classmethod
+    def _prepare_trade_params(
+        cls,
+        *,
+        created_at: str,
+        sport: str,
+        event_name: str,
+        market_type: str,
+        selection_label: str,
+        side: str,
+        entry_price: float = 0.50,
+        fee_per_contract: float = 0.015,
+        contracts: int = 1,
+        model_prob: float = 0.50,
+        fair_exit_price: float = 0.50,
+        notes: str = "",
+        venue: str = "DKEX",
+        bet_format: str | None = None,
+        odds_american: int | None = None,
+        stake: float | None = None,
+        is_bonus_bet: bool = False,
+        strategy_tag: str = "EV",
+        group_id: str | None = None,
+    ) -> tuple[Any, ...]:
+        """Validate & normalize a trade into INSERT parameters (raises ValueError before any write)."""
+        norm_venue = cls._normalize_venue(venue)
         if bet_format is None:
             norm_format = "SPORTSBOOK" if norm_venue in ("DRAFTKINGS", "FANDUEL") or (
                 odds_american is not None and stake is not None
@@ -447,6 +575,8 @@ class Database:
             if odds_american is None or stake is None or float(stake) <= 0:
                 raise ValueError("odds_american and positive stake are required for SPORTSBOOK trades.")
             am_int = int(round(float(odds_american)))
+            if abs(am_int) < 100:
+                raise ValueError("odds_american must be <= -100 or >= +100 for SPORTSBOOK trades.")
             dec = american_to_decimal(am_int)
             stake_val = round(float(stake), 2)
             total_cost = 0.0 if is_bonus_bet else stake_val
@@ -469,43 +599,45 @@ class Database:
             pot_payout = round(eff_contracts * 1.0, 2)
             eff_fair_exit = float(fair_exit_price)
 
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT INTO trades (
-                    created_at, sport, event_name, market_type, selection_label,
-                    side, entry_price, fee_per_contract, contracts, total_cost,
-                    model_prob, fair_exit_price, status, pnl, notes,
-                    venue, bet_format, odds_american, stake, potential_payout,
-                    is_bonus_bet, strategy_tag, group_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    created_at,
-                    sport.upper(),
-                    event_name,
-                    market_type,
-                    selection_label,
-                    side.upper(),
-                    eff_entry_px,
-                    eff_fee,
-                    eff_contracts,
-                    total_cost,
-                    float(model_prob),
-                    eff_fair_exit,
-                    notes,
-                    norm_venue,
-                    norm_format,
-                    am_int,
-                    stake_val,
-                    pot_payout,
-                    1 if is_bonus_bet else 0,
-                    norm_strategy,
-                    group_id,
-                ),
-            )
-            trade_id = cur.lastrowid
-            row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        return (
+            created_at,
+            sport.upper(),
+            event_name,
+            market_type,
+            selection_label,
+            side.upper(),
+            eff_entry_px,
+            eff_fee,
+            eff_contracts,
+            total_cost,
+            float(model_prob),
+            eff_fair_exit,
+            notes,
+            norm_venue,
+            norm_format,
+            am_int,
+            stake_val,
+            pot_payout,
+            1 if is_bonus_bet else 0,
+            norm_strategy,
+            group_id,
+        )
+
+    @staticmethod
+    def _insert_trade(conn: sqlite3.Connection, params: tuple[Any, ...]) -> dict[str, Any]:
+        cur = conn.execute(
+            """
+            INSERT INTO trades (
+                created_at, sport, event_name, market_type, selection_label,
+                side, entry_price, fee_per_contract, contracts, total_cost,
+                model_prob, fair_exit_price, status, pnl, notes,
+                venue, bet_format, odds_american, stake, potential_payout,
+                is_bonus_bet, strategy_tag, group_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            params,
+        )
+        row = conn.execute("SELECT * FROM trades WHERE id = ?", (cur.lastrowid,)).fetchone()
         return dict(row)
 
     def log_trade_pair(
@@ -517,8 +649,13 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Atomically log a paired two-leg strategy (Arbitrage, Middle, Bonus Bet Hedge)."""
         gid = group_id or f"pair_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
-        created_a = self.log_trade(**{**leg_a, "group_id": gid})
-        created_b = self.log_trade(**{**leg_b, "group_id": gid})
+        # Validate BOTH legs before writing, then insert in a single transaction so an invalid
+        # or failing second leg can never leave an orphaned half-hedge in the ledger.
+        params_a = self._prepare_trade_params(**{**leg_a, "group_id": gid})
+        params_b = self._prepare_trade_params(**{**leg_b, "group_id": gid})
+        with self._session() as conn:
+            created_a = self._insert_trade(conn, params_a)
+            created_b = self._insert_trade(conn, params_b)
         return [created_a, created_b]
 
     def update_trade(
@@ -534,7 +671,10 @@ class Database:
         notes: str | None = None,
     ) -> dict[str, Any] | None:
         status_u = status.upper()
-        with self._connect() as conn:
+        with self._session() as conn:
+            # Take the write lock up-front so the read-modify-write below cannot interleave
+            # with a concurrent settle of the same trade.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
             if row is None:
                 return None
@@ -634,12 +774,12 @@ class Database:
         return dict(updated)
 
     def delete_trade(self, trade_id: int) -> bool:
-        with self._connect() as conn:
+        with self._session() as conn:
             cur = conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
             return cur.rowcount > 0
 
     def list_trades(self, venue: str | None = None) -> list[dict[str, Any]]:
-        with self._connect() as conn:
+        with self._session() as conn:
             if venue and venue.upper() != "ALL":
                 norm_v = self._normalize_venue(venue)
                 rows = conn.execute(

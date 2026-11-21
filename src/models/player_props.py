@@ -177,7 +177,38 @@ class PlayerPropsEngine:
     def fit(self, nfl_logs: pd.DataFrame, nba_logs: pd.DataFrame) -> None:
         self.nfl_logs = nfl_logs.sort_values("game_order").reset_index(drop=True)
         self.nba_logs = nba_logs.sort_values("gameday").reset_index(drop=True)
+        self._team_map_cache = {}
         self._compute_opponent_allowances()
+
+    def __getstate__(self) -> dict[str, Any]:
+        # Derived lookup caches are rebuilt lazily; keep them out of the pickled artifact
+        state = self.__dict__.copy()
+        state.pop("_team_map_cache", None)
+        return state
+
+    def _cached_latest_team_map(
+        self, league: str, logs: pd.DataFrame, order_col: str, *, cacheable: bool
+    ) -> dict[str, str]:
+        """
+        Map each player to the team on their most recent log row. This full-table sort + groupby
+        is identical for every game on a slate, so memoize it when no as-of cutoff is applied.
+        """
+        cache: dict[str, dict[str, str]] | None = getattr(self, "_team_map_cache", None)
+        if cacheable and cache is not None and league in cache:
+            return cache[league]
+        team_map = (
+            logs.sort_values(order_col)
+            .groupby("player_name", as_index=False)
+            .last()
+            .set_index("player_name")["team"]
+            .to_dict()
+        )
+        if cacheable:
+            if cache is None:
+                cache = {}
+                self._team_map_cache = cache
+            cache[league] = team_map
+        return team_map
 
     def _compute_opponent_allowances(self) -> None:
         if len(self.nba_logs) > 0:
@@ -274,12 +305,8 @@ class PlayerPropsEngine:
             else 0.0
         )
 
-        latest_team_map = (
-            logs.sort_values("gameday")
-            .groupby("player_name", as_index=False)
-            .last()
-            .set_index("player_name")["team"]
-            .to_dict()
+        latest_team_map = self._cached_latest_team_map(
+            "nba", logs, "gameday", cacheable=not cutoff_date
         )
         max_day = str(logs["gameday"].max())
         recent_cutoff = (
@@ -633,12 +660,8 @@ class PlayerPropsEngine:
         rem_frac = max(0.02, min(1.0, rem_mins / 60.0)) if is_live else 1.0
         live_period = int(live_state.get("period", 1) or 1) if is_live and live_state else 0
 
-        latest_nfl_team = (
-            logs.sort_values("game_order")
-            .groupby("player_name", as_index=False)
-            .last()
-            .set_index("player_name")["team"]
-            .to_dict()
+        latest_nfl_team = self._cached_latest_team_map(
+            "nfl", logs, "game_order", cacheable=max_game_order is None
         )
         max_order = int(logs["game_order"].max())
 
@@ -714,6 +737,10 @@ class PlayerPropsEngine:
                 )
             )
             grouped = grouped[grouped["n"] >= 2]
+            # Split once (row order preserved within each group) instead of a boolean scan per player
+            player_logs_by_name = {
+                str(name): grp for name, grp in t_logs.groupby("player_name", sort=False)
+            }
 
             for _, prow in grouped.iterrows():
                 pname = str(prow["player_name"])
@@ -738,7 +765,7 @@ class PlayerPropsEngine:
                 p_live = _lookup_live_player(live_boxscore, pname) if is_live else None
                 if is_live and p_live is None and live_period >= 2:
                     continue
-                p_all = t_logs[t_logs["player_name"] == pname]
+                p_all = player_logs_by_name.get(pname, t_logs.iloc[0:0])
                 p_hist = p_all.tail(12)
                 inj_clarity = (
                     0.68
