@@ -759,14 +759,23 @@ function updateSlateMetaBar() {
 
   bar.hidden = false;
   const gamesWord = state.gamesCount === 1 ? 'game' : 'games';
+  let propNote = '';
+  if (state.traditionalMode && state.sbSlate && state.sbSlate.prop_diagnostics && state.market !== 'game') {
+    const pd = state.sbSlate.prop_diagnostics;
+    if (pd.last_error) {
+      propNote = ` · Prop sync: ${pd.last_error}`;
+    } else if (pd.events_queried > 0) {
+      propNote = ` · Odds API props: ${pd.odds_api_events_with_fd}/${pd.events_queried} games w/ FD`;
+    }
+  }
   if (showAll) {
     const actionCount = state.picks.filter((p) => p.confidence_tier !== 'PASS').length;
-    txt.textContent = `Showing all ${state.picks.length} priced lines (${actionCount} conviction) across ${state.gamesCount} upcoming ${gamesWord}`;
+    txt.textContent = `Showing all ${state.picks.length} priced lines (${actionCount} conviction) across ${state.gamesCount} upcoming ${gamesWord}${propNote}`;
     btn.textContent = 'Hide PASS lines';
     btn.hidden = false;
   } else {
     const pickWord = state.picks.length === 1 ? 'play' : 'plays';
-    txt.textContent = `Showing ${state.picks.length} conviction ${pickWord} of ${state.totalCandidates} priced lines across ${state.gamesCount} upcoming ${gamesWord}`;
+    txt.textContent = `Showing ${state.picks.length} conviction ${pickWord} of ${state.totalCandidates} priced lines across ${state.gamesCount} upcoming ${gamesWord}${propNote}`;
     btn.textContent = `Show all ${state.totalCandidates} lines`;
     btn.hidden = state.totalCandidates <= state.picks.length;
   }

@@ -303,7 +303,7 @@ class OddsClient:
         if not sport_key:
             return {}
 
-        cache_key = f"odds_api:v3:{sport_u}:props:{odds_event_id}"
+        cache_key = f"odds_api:v4:{sport_u}:props:{odds_event_id}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if cached is not None:
@@ -320,7 +320,13 @@ class OddsClient:
 
         quota = self.get_quota_status()
         rem = quota.get("requests_remaining")
-        if rem is not None and int(rem) <= 40 and not force_refresh:
+        if rem is not None and int(rem) <= 15 and not force_refresh:
+            self._last_prop_diag = {
+                "status": "quota_guard",
+                "requests_remaining": rem,
+                "http_status": None,
+                "error": f"Low Odds API quota ({rem} cr remaining <= 15)",
+            }
             return {}
 
         prop_map = PROP_MARKET_MAP_NBA if sport_u == "NBA" else PROP_MARKET_MAP_NFL
@@ -332,17 +338,57 @@ class OddsClient:
             "bookmakers": "draftkings,fanduel,betmgm",
             "oddsFormat": "american",
         }
-        try:
-            resp = http_get(url, params=params, timeout=10.0, raise_for_status=False)
-            self._record_quota_headers(resp.headers)
-            resp.raise_for_status()
-            payload = resp.json()
-        except Exception:
+        # Gentle pacing across sequential event-prop requests to avoid free-tier HTTP 429 bursts
+        now_ts = time.time()
+        last_ts = getattr(self, "_last_prop_http_ts", 0.0)
+        if last_ts > 0.0 and (now_ts - last_ts) < 0.22:
+            time.sleep(0.22 - (now_ts - last_ts))
+
+        payload: dict[str, Any] | None = None
+        last_status: int | None = None
+        last_err: str | None = None
+        for attempt in range(2):
+            try:
+                self._last_prop_http_ts = time.time()
+                resp = http_get(url, params=params, timeout=10.0, raise_for_status=False)
+                last_status = getattr(resp, "status_code", None)
+                self._record_quota_headers(resp.headers)
+                if last_status == 429 and attempt == 0:
+                    time.sleep(0.9)
+                    continue
+                resp.raise_for_status()
+                payload = resp.json()
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = str(exc)
+                if attempt == 0 and last_status == 429:
+                    time.sleep(0.9)
+                    continue
+                break
+
+        if payload is None:
+            self._last_prop_diag = {
+                "status": "http_error",
+                "http_status": last_status,
+                "error": last_err or f"HTTP {last_status}",
+            }
             return {}
 
+        raw_books = [
+            str(b.get("key", "")).lower() for b in (payload.get("bookmakers") or [])
+        ]
         parsed = self.extract_player_prop_lines(sport_u, payload)
+        self._last_prop_diag = {
+            "status": "ok",
+            "http_status": last_status or 200,
+            "bookmakers_seen": sorted(set(raw_books)),
+            "props_extracted": len(parsed),
+            "error": None,
+        }
         serializable = {f"{p_low}::{col}": val for (p_low, col), val in parsed.items()}
-        self.db.set_cache(cache_key, serializable, ttl_seconds=120 if live_mode else 900)
+        ttl = (120 if live_mode else 900) if serializable else 120
+        self.db.set_cache(cache_key, serializable, ttl_seconds=ttl)
         return parsed
 
     @staticmethod

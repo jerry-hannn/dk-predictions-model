@@ -1743,6 +1743,13 @@ class ModelHub:
 
         games_seen: set[str] = set()
         has_any_fanduel = False
+        prop_diag: dict[str, Any] = {
+            "events_queried": 0,
+            "odds_api_events_with_dk": 0,
+            "odds_api_events_with_fd": 0,
+            "last_http_status": None,
+            "last_error": None,
+        }
 
         for sp in sports:
             events = self._get_upcoming_events(
@@ -1792,12 +1799,13 @@ class ModelHub:
                     has_any_fanduel = True
 
                 merged_prop_mkts: dict[tuple[str, str], dict[str, Any]] = {}
-                for pk, pv in (espn_slate_props.get(ev_id, {}) or {}).items():
+                for (p_raw, col_k), pv in (espn_slate_props.get(ev_id, {}) or {}).items():
+                    norm_k = (normalize_player_name(p_raw) or p_raw.lower(), col_k)
                     pv_copy = dict(pv)
                     pv_copy["books"] = dict(pv.get("books") or {})
-                    merged_prop_mkts[pk] = pv_copy
+                    merged_prop_mkts[norm_k] = pv_copy
 
-                # Only fetch paid per-event Odds API props for live games or games starting within 36h
+                # Only fetch paid per-event Odds API props for live games or games starting within 48h/72h
                 within_prop_window = is_live
                 if not within_prop_window:
                     st_iso = str(ev.get("start_time") or ev.get("commence_time") or "")
@@ -1822,23 +1830,38 @@ class ModelHub:
                     and market_filter.lower() in ("all", "props")
                     and mkt.get("odds_event_id")
                 ):
+                    prop_diag["events_queried"] += 1
                     odds_props = self.odds.fetch_event_player_props(
                         sp,
                         str(mkt["odds_event_id"]),
                         force_refresh=fresh,
                         live_mode=is_live,
                     )
+                    last_d = getattr(self.odds, "_last_prop_diag", None)
+                    if isinstance(last_d, dict):
+                        if last_d.get("error"):
+                            prop_diag["last_error"] = last_d["error"]
+                        if last_d.get("http_status"):
+                            prop_diag["last_http_status"] = last_d["http_status"]
                     if odds_props:
-                        for pk, ov in odds_props.items():
-                            prev = merged_prop_mkts.get(pk)
+                        ev_had_fd = False
+                        ev_had_dk = False
+                        for (p_raw, col_k), ov in odds_props.items():
+                            norm_k = (normalize_player_name(p_raw) or p_raw.lower(), col_k)
+                            ov_books = dict(ov.get("books") or {})
+                            if "fanduel" in ov_books:
+                                ev_had_fd = True
+                            if "draftkings" in ov_books:
+                                ev_had_dk = True
+                            prev = merged_prop_mkts.get(norm_k)
                             if prev is None:
                                 ov_copy = dict(ov)
-                                ov_copy["books"] = dict(ov.get("books") or {})
-                                merged_prop_mkts[pk] = ov_copy
+                                ov_copy["books"] = ov_books
+                                merged_prop_mkts[norm_k] = ov_copy
                             else:
                                 # Preserve both ESPN DraftKings AND Odds API DraftKings/FanDuel books
                                 comb_books = dict(prev.get("books") or {})
-                                comb_books.update(ov.get("books") or {})
+                                comb_books.update(ov_books)
                                 comb = {**prev, **ov, "books": comb_books}
                                 if "draftkings" in comb_books and "fanduel" in comb_books:
                                     comb["source"] = "DK + FD"
@@ -1846,7 +1869,11 @@ class ModelHub:
                                     comb["source"] = "DraftKings"
                                 elif "fanduel" in comb_books:
                                     comb["source"] = "FanDuel"
-                                merged_prop_mkts[pk] = comb
+                                merged_prop_mkts[norm_k] = comb
+                        if ev_had_dk:
+                            prop_diag["odds_api_events_with_dk"] += 1
+                        if ev_had_fd:
+                            prop_diag["odds_api_events_with_fd"] += 1
                 live_prop_mkts = merged_prop_mkts if merged_prop_mkts else None
 
                 inj_notes = self._format_injury_summary(injuries, h, a)
@@ -2844,6 +2871,7 @@ class ModelHub:
             "odds_api_connected": bool(self.settings.the_odds_api_key),
             "has_fanduel_odds": has_any_fanduel,
             "odds_quota": self.odds.get_quota_status(),
+            "prop_diagnostics": prop_diag,
             "picks": visible_picks,
             "arbitrage": arbitrage_list[:40],
             "middles": middles_list[:30],
