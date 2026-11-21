@@ -1791,11 +1791,33 @@ class ModelHub:
                 if mkt.get("has_fanduel"):
                     has_any_fanduel = True
 
-                merged_prop_mkts: dict[tuple[str, str], dict[str, Any]] = dict(
-                    espn_slate_props.get(ev_id, {})
-                )
+                merged_prop_mkts: dict[tuple[str, str], dict[str, Any]] = {}
+                for pk, pv in (espn_slate_props.get(ev_id, {}) or {}).items():
+                    pv_copy = dict(pv)
+                    pv_copy["books"] = dict(pv.get("books") or {})
+                    merged_prop_mkts[pk] = pv_copy
+
+                # Only fetch paid per-event Odds API props for live games or games starting within 36h
+                within_prop_window = is_live
+                if not within_prop_window:
+                    st_iso = str(ev.get("start_time") or ev.get("commence_time") or "")
+                    if st_iso:
+                        try:
+                            from datetime import timezone as _tz
+
+                            st_dt = datetime.fromisoformat(st_iso.replace("Z", "+00:00"))
+                            if st_dt.tzinfo is None:
+                                st_dt = st_dt.replace(tzinfo=_tz.utc)
+                            hrs_away = (st_dt - datetime.now(_tz.utc)).total_seconds() / 3600.0
+                            within_prop_window = -6.0 <= hrs_away <= 36.0
+                        except ValueError:
+                            within_prop_window = True
+                    else:
+                        within_prop_window = True
+
                 if (
                     live_props
+                    and within_prop_window
                     and market_filter.lower() in ("all", "props")
                     and mkt.get("odds_event_id")
                 ):
@@ -1806,7 +1828,24 @@ class ModelHub:
                         live_mode=is_live,
                     )
                     if odds_props:
-                        merged_prop_mkts.update(odds_props)
+                        for pk, ov in odds_props.items():
+                            prev = merged_prop_mkts.get(pk)
+                            if prev is None:
+                                ov_copy = dict(ov)
+                                ov_copy["books"] = dict(ov.get("books") or {})
+                                merged_prop_mkts[pk] = ov_copy
+                            else:
+                                # Preserve both ESPN DraftKings AND Odds API DraftKings/FanDuel books
+                                comb_books = dict(prev.get("books") or {})
+                                comb_books.update(ov.get("books") or {})
+                                comb = {**prev, **ov, "books": comb_books}
+                                if "draftkings" in comb_books and "fanduel" in comb_books:
+                                    comb["source"] = "DK + FD"
+                                elif "draftkings" in comb_books:
+                                    comb["source"] = "DraftKings"
+                                elif "fanduel" in comb_books:
+                                    comb["source"] = "FanDuel"
+                                merged_prop_mkts[pk] = comb
                 live_prop_mkts = merged_prop_mkts if merged_prop_mkts else None
 
                 inj_notes = self._format_injury_summary(injuries, h, a)
@@ -2578,14 +2617,15 @@ class ModelHub:
                     if fd_p is not None:
                         has_any_fanduel = True
 
-                    # If no live sportsbook American odds exist, provide ref -110/-110 on DK line for model view
+                    # Never fabricate fake -110 DraftKings odds on unpriced Model Ref Lines or non-DK/FD books
                     if dk_p is None and fd_p is None:
-                        dk_p = {
-                            "line": float(pp.line_value),
-                            "over_odds": -110,
-                            "under_odds": -110,
-                            "over_prob": pp.market_over_prob or 0.50,
-                        }
+                        continue
+
+                    pp_line_src = (
+                        "DK + FD"
+                        if (dk_p is not None and fd_p is not None)
+                        else ("DraftKings" if dk_p is not None else "FanDuel")
+                    )
 
                     pp_evals: list[dict[str, Any]] = []
                     for bk, entry in (("DRAFTKINGS", dk_p), ("FANDUEL", fd_p)):
@@ -2675,7 +2715,7 @@ class ModelHub:
                                 "fd_odds": (fd_p["over_odds"] if best_ev.side == "OVER" else fd_p["under_odds"]) if fd_p else None,
                                 "line_shopping_gain_pct": shop_gain,
                                 "yes_true_prob": round(best_item["blend_ov"], 4),
-                                "line_source": getattr(pp, "line_source", base_meta["line_source"]),
+                                "line_source": pp_line_src,
                                 "drivers": (list(safety_drivers) + list(pp.drivers))[:4],
                                 **best_ev.to_dict(),
                             }

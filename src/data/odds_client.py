@@ -303,7 +303,7 @@ class OddsClient:
         if not sport_key:
             return {}
 
-        cache_key = f"odds_api:{sport_u}:props:{odds_event_id}"
+        cache_key = f"odds_api:v2:{sport_u}:props:{odds_event_id}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if cached is not None:
@@ -327,7 +327,6 @@ class OddsClient:
         url = f"{self.BASE_URL}/sports/{sport_key}/events/{odds_event_id}/odds"
         params = {
             "apiKey": self.api_key,
-            "regions": "us",
             "markets": ",".join(prop_map.keys()),
             "bookmakers": "draftkings,fanduel,betmgm",
             "oddsFormat": "american",
@@ -342,7 +341,7 @@ class OddsClient:
 
         parsed = self.extract_player_prop_lines(sport_u, payload)
         serializable = {f"{p_low}::{col}": val for (p_low, col), val in parsed.items()}
-        self.db.set_cache(cache_key, serializable, ttl_seconds=120 if live_mode else 600)
+        self.db.set_cache(cache_key, serializable, ttl_seconds=120 if live_mode else 900)
         return parsed
 
     @staticmethod
@@ -353,7 +352,7 @@ class OddsClient:
         prop_map = (
             PROP_MARKET_MAP_NBA if sport.upper() == "NBA" else PROP_MARKET_MAP_NFL
         )
-        # Sort bookmakers so DraftKings is processed last (overwriting or anchoring line)
+        # Sort bookmakers so DraftKings is processed last (anchoring default line)
         books = list(event_payload.get("bookmakers") or [])
         books.sort(key=lambda b: 1 if str(b.get("key", "")).lower() == "draftkings" else 0)
 
@@ -364,29 +363,45 @@ class OddsClient:
                 col = prop_map.get(str(mkt.get("key", "")))
                 if not col:
                     continue
-                by_player: dict[str, dict[str, Any]] = {}
+                # Group strictly by (player, exact point) so multi-line / alt-line props never cross-pair
+                by_player_pt: dict[tuple[str, float], dict[str, Any]] = {}
                 for out in mkt.get("outcomes") or []:
                     pname = str(out.get("description") or "").strip().lower()
                     side_nm = str(out.get("name") or "").strip().lower()
                     if not pname or side_nm not in ("over", "under") or "point" not in out:
                         continue
-                    by_player.setdefault(pname, {})[side_nm] = out
+                    pt_val = round(float(out["point"]), 2)
+                    by_player_pt.setdefault((pname, pt_val), {})[side_nm] = out
 
-                for pname, pair in by_player.items():
-                    if "over" in pair and "under" in pair:
-                        ln = float(pair["over"]["point"])
-                        o_px = float(pair["over"]["price"])
-                        u_px = float(pair["under"]["price"])
-                        po, _ = devig_american_pair(o_px, u_px)
-                        accum.setdefault((pname, col), []).append(
-                            (bkey, ln, po, int(round(o_px)), int(round(u_px)))
+                # Pick the main line per player on this book (closest to 50/50 de-vigged probability)
+                best_for_player: dict[str, tuple[float, float, float, int, int]] = {}
+                for (pname, pt_val), pair in by_player_pt.items():
+                    if "over" not in pair or "under" not in pair:
+                        continue
+                    o_px = float(pair["over"]["price"])
+                    u_px = float(pair["under"]["price"])
+                    po, _ = devig_american_pair(o_px, u_px)
+                    imbalance = abs(po - 0.50)
+                    prev = best_for_player.get(pname)
+                    if prev is None or imbalance < prev[0]:
+                        best_for_player[pname] = (
+                            imbalance,
+                            pt_val,
+                            po,
+                            int(round(o_px)),
+                            int(round(u_px)),
                         )
+
+                for pname, (_, ln, po, o_int, u_int) in best_for_player.items():
+                    accum.setdefault((pname, col), []).append(
+                        (bkey, ln, po, o_int, u_int)
+                    )
 
         out_props: dict[tuple[str, str], dict[str, Any]] = {}
         for key, entries in accum.items():
             dk_entry = next((e for e in entries if e[0] == "draftkings"), None)
             fd_entry = next((e for e in entries if e[0] == "fanduel"), None)
-            anchor_entry = dk_entry or entries[-1]
+            anchor_entry = dk_entry or fd_entry or entries[-1]
             target_line = anchor_entry[1]
             same_line_probs = [p for _, ln, p, _, _ in entries if abs(ln - target_line) < 0.01]
             mkt_over_p = sum(same_line_probs) / len(same_line_probs)
@@ -400,15 +415,17 @@ class OddsClient:
                     "over_prob": round(po, 4),
                 }
 
+            src_lbl = (
+                "DraftKings"
+                if anchor_entry[0] == "draftkings"
+                else ("FanDuel" if anchor_entry[0] == "fanduel" else anchor_entry[0].title())
+            )
+
             val_obj: dict[str, Any] = {
                 "line": target_line,
                 "over_prob": round(mkt_over_p, 4),
                 "dk_over_prob": round(anchor_entry[2], 4),
-                "source": (
-                    "DraftKings"
-                    if anchor_entry[0] == "draftkings"
-                    else anchor_entry[0].title()
-                ),
+                "source": src_lbl,
                 "books": book_lines,
             }
             if dk_entry is not None:

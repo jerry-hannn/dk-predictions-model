@@ -679,7 +679,7 @@ class ESPNClient:
 
         sport_u = sport.upper()
         sp, lg = SPORT_PATHS[sport_u]
-        cache_key = f"espn:props:{sport_u}:{eid}"
+        cache_key = f"espn:v2:props:{sport_u}:{eid}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if cached is not None:

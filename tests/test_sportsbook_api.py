@@ -571,3 +571,200 @@ def test_sportsbook_slate_surfaces_all_five_strategies_from_multibook_odds(
     assert len(slate["steam"]) >= 1      # DK BOS +115 lagging LowVig/BetOnline -145/-140
     assert len(slate["promos"]["profit_boost"]) >= 1
     assert any(a["arb_type"] == "DK_FD" and a["is_guaranteed_after_rounding"] for a in slate["arbitrage"])
+
+
+def test_prop_book_merging_multiline_fanduel_and_no_fake_dk_fabrication(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Verify multi-line FD prop pairing, ESPN DK + OddsAPI FD merging, and zero fake DK -110 cards."""
+    # 1. Multi-line FD payload (alt line + main line) must pair each point cleanly and select main line
+    payload = {
+        "bookmakers": [
+            {
+                "key": "fanduel",
+                "markets": [
+                    {
+                        "key": "player_points",
+                        "outcomes": [
+                            {"name": "Over", "description": "Jayson Tatum", "point": 24.5, "price": -180},
+                            {"name": "Under", "description": "Jayson Tatum", "point": 24.5, "price": 140},
+                            {"name": "Over", "description": "Jayson Tatum", "point": 26.5, "price": -108},
+                            {"name": "Under", "description": "Jayson Tatum", "point": 26.5, "price": -112},
+                        ],
+                    }
+                ],
+            },
+            {
+                "key": "betmgm",
+                "markets": [
+                    {
+                        "key": "player_threes",
+                        "outcomes": [
+                            {"name": "Over", "description": "Jayson Tatum", "point": 3.5, "price": -115},
+                            {"name": "Under", "description": "Jayson Tatum", "point": 3.5, "price": -115},
+                        ],
+                    }
+                ],
+            },
+        ]
+    }
+    parsed = OddsClient.extract_player_prop_lines("NBA", payload)
+    pts = parsed[("jayson tatum", "points")]
+    assert pts["source"] == "FanDuel"
+    assert pts["fd_line"] == 26.5
+    assert pts["fd_over_odds"] == -108
+    assert pts["fd_under_odds"] == -112
+    assert "fanduel" in pts["books"]
+
+    # 2. End-to-end slate: ESPN supplies DK points, Odds API supplies FD points + BetMGM-only threes.
+    # Result: points card shows BOTH DK and FD; BetMGM-only & unpriced Model Ref Lines are NOT fabricated as DK -110!
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "sb_props_merge.sqlite3"))
+    monkeypatch.setenv("MODELS_DIR", str(tmp_path / "models"))
+    monkeypatch.setenv("THE_ODDS_API_KEY", "test-key")
+    monkeypatch.setenv("TRADITIONAL_SPORTSBOOKS_ENABLED", "true")
+
+    from datetime import datetime, timedelta, timezone
+    from src.engine.recommender import ModelHub
+    from src.models.player_props import PlayerPropProjection, PlayerPropsEngine
+
+    soon_iso = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+    fake_game = {
+        "event_id": "401999998",
+        "sport": "NBA",
+        "date": "2026-11-22",
+        "commence_time": soon_iso,
+        "event_name": "New York Knicks at Boston Celtics",
+        "short_name": "NYK @ BOS",
+        "start_time": soon_iso,
+        "home_abbr": "BOS",
+        "away_abbr": "NYK",
+        "home_name": "Boston Celtics",
+        "away_name": "New York Knicks",
+        "state": "PRE",
+        "home_score": 0,
+        "away_score": 0,
+        "period": 0,
+        "clock_display": "",
+        "status_detail": "7:00 PM ET",
+        "remaining_minutes": 48.0,
+        "market": {},
+        "situation": {},
+    }
+
+    espn_dk_prop = {
+        "401999998": {
+            ("jayson tatum", "points"): {
+                "line": 25.5,
+                "over_prob": 0.50,
+                "dk_over_prob": 0.50,
+                "source": "DraftKings",
+                "dk_line": 25.5,
+                "dk_over_odds": -110,
+                "dk_under_odds": -110,
+                "books": {
+                    "draftkings": {
+                        "line": 25.5,
+                        "over_odds": -110,
+                        "under_odds": -110,
+                        "over_prob": 0.50,
+                    }
+                },
+            }
+        }
+    }
+
+    monkeypatch.setattr(
+        ModelHub,
+        "_get_upcoming_events",
+        lambda self, sport, target_date=None, mode="all", force_refresh=False: [fake_game]
+        if sport.upper() == "NBA"
+        else [],
+    )
+    monkeypatch.setattr(ESPNClient, "fetch_league_injuries", lambda self, sport, force_refresh=False: {})
+    monkeypatch.setattr(ESPNClient, "fetch_slate_player_props", lambda self, sport, events, force_refresh=False: espn_dk_prop if sport.upper() == "NBA" else {})
+    monkeypatch.setattr(OddsClient, "fetch_game_odds", lambda self, sport, force_refresh=False, live_mode=False: [_sample_multi_book_odds_event()] if sport.upper() == "NBA" else [])
+    monkeypatch.setattr(OddsClient, "fetch_event_player_props", lambda self, sport, eid, force_refresh=False, live_mode=False: parsed if sport.upper() == "NBA" else {})
+
+    def _fake_nba_props(self, **kwargs):
+        live_mkts = kwargs.get("live_prop_markets") or {}
+        tatum_pts = live_mkts.get(("jayson tatum", "points"))
+        tatum_3s = live_mkts.get(("jayson tatum", "fg3m"))
+        return [
+            PlayerPropProjection(
+                sport="NBA",
+                player_name="Jayson Tatum",
+                team="BOS",
+                opponent="NYK",
+                prop_type="points",
+                prop_label="Points",
+                line_value=25.5,
+                projected_mean=28.0,
+                projected_std=6.5,
+                over_prob=0.65,
+                under_prob=0.35,
+                drivers=["Proj 28.0 vs 25.5"],
+                injury_clarity=1.0,
+                market_over_prob=0.50,
+                line_source=tatum_pts["source"] if tatum_pts else "Model Ref Line",
+                book_lines=tatum_pts.get("books") if tatum_pts else None,
+            ),
+            # BetMGM-only prop -> must NOT become fake DK -110
+            PlayerPropProjection(
+                sport="NBA",
+                player_name="Jayson Tatum",
+                team="BOS",
+                opponent="NYK",
+                prop_type="fg3m",
+                prop_label="3-Pointers Made",
+                line_value=3.5,
+                projected_mean=2.0,
+                projected_std=1.5,
+                over_prob=0.25,
+                under_prob=0.75,
+                drivers=["Proj 2.0 vs 3.5"],
+                injury_clarity=1.0,
+                market_over_prob=0.50,
+                line_source=tatum_3s["source"] if tatum_3s else "Model Ref Line",
+                book_lines=tatum_3s.get("books") if tatum_3s else None,
+            ),
+            # Unpriced Model Ref Line prop -> must NOT become fake DK -110
+            PlayerPropProjection(
+                sport="NBA",
+                player_name="Jaylen Brown",
+                team="BOS",
+                opponent="NYK",
+                prop_type="fg3m",
+                prop_label="3-Pointers Made",
+                line_value=2.5,
+                projected_mean=1.4,
+                projected_std=1.2,
+                over_prob=0.25,
+                under_prob=0.75,
+                drivers=["Proj 1.4 vs 2.5 (Model Ref Line)"],
+                injury_clarity=1.0,
+                market_over_prob=0.50,
+                line_source="Model Ref Line",
+                book_lines=None,
+            ),
+        ]
+
+    monkeypatch.setattr(PlayerPropsEngine, "project_nba_game_props", _fake_nba_props)
+
+    client = TestClient(app)
+    r = client.get("/api/sportsbook/slate?sport=nba&market=props&include_passes=true&live_props=true")
+    assert r.status_code == 200
+    slate = r.json()
+
+    # Only the genuine DK+FD Jayson Tatum Points prop should appear (zero fake Model Ref / BetMGM-only DK cards)
+    assert len(slate["picks"]) == 1
+    p = slate["picks"][0]
+    assert p["player_name"] == "Jayson Tatum"
+    assert p["line_source"] == "DK + FD"
+    assert p["dk_line"] == 25.5
+    assert p["fd_line"] == 26.5
+    assert p["dk_odds"] is not None
+    assert p["fd_odds"] is not None
+    # And because DK=25.5 vs FD=26.5, a Player Prop Middle is automatically detected!
+    assert any("Points" in m["market_type"] for m in slate["middles"])
+
