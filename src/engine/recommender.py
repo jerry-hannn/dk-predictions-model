@@ -2764,8 +2764,10 @@ class ModelHub:
                             else prop_over_prob_for_line(sp, pp.prop_type, pp.projected_mean, pp.projected_std, ln_v)
                         )
                         mkt_ov = consensus_same_line if consensus_same_line is not None else entry.get("over_prob")
+                        is_est_juice = bool(entry.get("odds_estimated"))
+                        prop_mkt_w = 0.48 if (consensus_same_line is not None and not is_est_juice) else 0.40
                         blend_ov = (
-                            blend_probabilities(mod_ov, float(mkt_ov), market_weight=0.52)
+                            blend_probabilities(mod_ov, float(mkt_ov), market_weight=prop_mkt_w)
                             if mkt_ov is not None
                             else mod_ov
                         )

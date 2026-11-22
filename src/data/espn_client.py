@@ -596,6 +596,48 @@ class ESPNClient:
             return ""
 
     @staticmethod
+    def _match_espn_prop_col(sport_u: str, type_obj: dict[str, Any]) -> str | None:
+        prop_map = (
+            ESPN_PROP_TYPE_MAP_NBA if sport_u == "NBA" else ESPN_PROP_TYPE_MAP_NFL
+        )
+        type_id = str(type_obj.get("id", "")).strip()
+        col = prop_map.get(type_id)
+        if col:
+            return col
+        tname = str(type_obj.get("name", "")).strip().lower()
+        if not tname:
+            return None
+        # Exclude alternate, quarter/half, longest, and combo markets unless explicitly mapped
+        if any(bad in tname for bad in ("alternate", "alt ", "quarter", "1st ", "2nd ", "3rd ", "4th ", "half", "longest")):
+            return None
+        if sport_u == "NBA":
+            if tname in ("total points, rebounds, and assists", "points + rebounds + assists"):
+                return "pra"
+            if tname == "total points":
+                return "points"
+            if tname == "total rebounds":
+                return "rebounds"
+            if tname == "total assists":
+                return "assists"
+            if "3-point" in tname or "three point" in tname:
+                return "fg3m"
+            return None
+        # NFL flexible matching (handles "Total Passing Yards", "Passing Yards (Incl. Overtime)", etc.)
+        if "+" in tname or " and " in tname or "rush + rec" in tname:
+            return None
+        if "passing yards" in tname or "pass yards" in tname:
+            return "passing_yards"
+        if "passing touchdown" in tname or "pass touchdown" in tname or "passing td" in tname:
+            return "passing_tds"
+        if "rushing yards" in tname or "rush yards" in tname:
+            return "rushing_yards"
+        if "receiving yards" in tname or "reception yards" in tname:
+            return "receiving_yards"
+        if "receptions" in tname and "yards" not in tname and "touchdown" not in tname:
+            return "receptions"
+        return None
+
+    @staticmethod
     def extract_espn_prop_lines(
         sport: str,
         items: list[dict[str, Any]],
@@ -605,40 +647,13 @@ class ESPNClient:
         Parse ESPN Core API DraftKings (`odds/100/propBets`) items into `(player_key, stat_col)` dicts.
         Each `(athlete_id, col, line)` group emits Over first and Under second in feed order.
         """
-        prop_map = (
-            ESPN_PROP_TYPE_MAP_NBA if sport.upper() == "NBA" else ESPN_PROP_TYPE_MAP_NFL
-        )
+        sport_u = sport.upper()
         grouped: dict[tuple[str, str, float], list[float | None]] = {}
         for item in items or []:
             if not isinstance(item, dict):
                 continue
             type_obj = item.get("type") or {}
-            type_id = str(type_obj.get("id", "")).strip()
-            col = prop_map.get(type_id)
-            if not col:
-                tname = str(type_obj.get("name", "")).strip().lower()
-                if sport.upper() == "NBA":
-                    if tname in ("total points, rebounds, and assists", "points + rebounds + assists"):
-                        col = "pra"
-                    elif tname == "total points":
-                        col = "points"
-                    elif tname == "total rebounds":
-                        col = "rebounds"
-                    elif tname == "total assists":
-                        col = "assists"
-                    elif "3-point" in tname or "three point" in tname:
-                        col = "fg3m"
-                else:
-                    if tname == "total passing yards":
-                        col = "passing_yards"
-                    elif tname == "total passing touchdowns":
-                        col = "passing_tds"
-                    elif tname == "total rushing yards":
-                        col = "rushing_yards"
-                    elif tname == "total receiving yards":
-                        col = "receiving_yards"
-                    elif tname == "total receptions":
-                        col = "receptions"
+            col = ESPNClient._match_espn_prop_col(sport_u, type_obj)
             if not col:
                 continue
             ath_obj = item.get("athlete") or {}
@@ -700,6 +715,19 @@ class ESPNClient:
                         "over_prob": dk_over_prob,
                     }
                 }
+            else:
+                # Real DraftKings line from ESPN without explicit American juice (common on NFL propBets):
+                # attach realistic -115/-115 prop reference odds; Odds API overrides with exact live juice when present.
+                candidate["dk_line"] = line_val
+                candidate["books"] = {
+                    "draftkings": {
+                        "line": line_val,
+                        "over_odds": -115,
+                        "under_odds": -115,
+                        "over_prob": 0.50,
+                        "odds_estimated": True,
+                    }
+                }
             existing = best_by_player_col.get((aid, col))
             if existing is None or imbalance < existing[0]:
                 best_by_player_col[(aid, col)] = (imbalance, candidate)
@@ -732,7 +760,7 @@ class ESPNClient:
 
         sport_u = sport.upper()
         sp, lg = SPORT_PATHS[sport_u]
-        cache_key = f"espn:v2:props:{sport_u}:{eid}"
+        cache_key = f"espn:v3:props:{sport_u}:{eid}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if isinstance(cached, dict):
@@ -756,7 +784,8 @@ class ESPNClient:
             first_page = resp.json()
             all_items.extend(first_page.get("items") or [])
             page_count = int(first_page.get("pageCount", 1) or 1)
-            for p_idx in range(2, min(4, page_count + 1)):
+            max_pages = 10 if sport_u == "NFL" else 5
+            for p_idx in range(2, min(max_pages + 1, page_count + 1)):
                 try:
                     p_resp = http_get(
                         url,
@@ -786,15 +815,11 @@ class ESPNClient:
         if away_id:
             athlete_names.update(self.fetch_team_roster(sport_u, away_id))
 
-        prop_map = (
-            ESPN_PROP_TYPE_MAP_NBA if sport_u == "NBA" else ESPN_PROP_TYPE_MAP_NFL
-        )
         missing_aids: list[str] = []
         for item in all_items:
             if not isinstance(item, dict):
                 continue
-            type_id = str((item.get("type") or {}).get("id", "")).strip()
-            if type_id not in prop_map:
+            if not self._match_espn_prop_col(sport_u, item.get("type") or {}):
                 continue
             ath_obj = item.get("athlete") or {}
             aid = str(ath_obj.get("id", "")).strip()
@@ -804,7 +829,7 @@ class ESPNClient:
             if aid and aid not in athlete_names and aid not in missing_aids:
                 missing_aids.append(aid)
 
-        lookup_aids = missing_aids[:8]
+        lookup_aids = missing_aids[:12]
         if lookup_aids:
             # Independent single-athlete lookups: run concurrently instead of N serial round-trips
             with ThreadPoolExecutor(max_workers=min(4, len(lookup_aids))) as pool:

@@ -728,15 +728,15 @@ class PlayerPropsEngine:
                 )
 
             grouped = (
-                recent_t_logs.groupby(["player_name", "position"], as_index=False)
+                t_logs.groupby(["player_name", "position"], as_index=False)
                 .agg(
                     n=("game_order", "count"),
+                    recent_n=("game_order", lambda s: int((s >= max_order - 6).sum())),
                     py=("passing_yards", "mean"),
                     ry=("rushing_yards", "mean"),
                     recy=("receiving_yards", "mean"),
                 )
             )
-            grouped = grouped[grouped["n"] >= 2]
             # Split once (row order preserved within each group) instead of a boolean scan per player
             player_logs_by_name = {
                 str(name): grp for name, grp in t_logs.groupby("player_name", sort=False)
@@ -750,7 +750,11 @@ class PlayerPropsEngine:
                 has_player_mkt = _has_any_player_prop(live_prop_markets, pname) or _has_any_player_prop(
                     custom_lines, pname
                 )
-                if pos == "QB" and (pname != active_qb1 or float(prow["py"]) < 145.0):
+                if not has_player_mkt and int(prow["recent_n"]) < 2:
+                    continue
+                if has_player_mkt and int(prow["n"]) < 1:
+                    continue
+                if pos == "QB" and not has_player_mkt and (pname != active_qb1 or float(prow["py"]) < 145.0):
                     continue
                 if (
                     not has_player_mkt
