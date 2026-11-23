@@ -63,6 +63,10 @@ function syncThemeIcons() {
   const isDark = current === 'dark';
   sunIcon.hidden = !isDark;
   moonIcon.hidden = isDark;
+  const themeMeta = document.querySelector('meta[name="theme-color"]');
+  if (themeMeta) {
+    themeMeta.setAttribute('content', isDark ? '#09090b' : '#fafafa');
+  }
 }
 
 themeToggleBtn.addEventListener('click', () => {
@@ -276,6 +280,13 @@ function selectTab(selected) {
     tab.tabIndex = isSelected ? 0 : -1;
     panels[idx].hidden = !isSelected;
   });
+
+  if (selected && typeof selected.scrollIntoView === 'function') {
+    selected.scrollIntoView({ behavior: 'smooth', inline: 'center', block: 'nearest' });
+  }
+  if (window.innerWidth <= 768 && window.scrollY > 180) {
+    window.scrollTo({ top: 0, behavior: 'instant' });
+  }
 
   syncAutoRefreshTimer();
 
@@ -1252,6 +1263,7 @@ function buildPickCardInnerHtml(p, idx) {
             id="dk-px-${idx}"
             class="dk-cents-input"
             type="number"
+            inputmode="decimal"
             min="1"
             max="99"
             step="0.5"
@@ -2623,7 +2635,7 @@ function renderLedgerRows() {
     const msg = state.trades.length
       ? 'No matching positions for this filter.'
       : 'No positions logged yet. Log directly from any Market/Strategy card or click "+ Log Position".';
-    tbody.innerHTML = `<tr><td colspan="10" style="text-align:center;color:var(--text-muted);padding:2rem;">${escapeHtml(msg)}</td></tr>`;
+    tbody.innerHTML = `<tr class="ledger-empty-row"><td colspan="10" class="ledger-empty-cell">${escapeHtml(msg)}</td></tr>`;
     return;
   }
 
@@ -2656,20 +2668,20 @@ function renderLedgerRows() {
       const statusCls = KNOWN_STATUS_CLASSES.has(statusUpper) ? statusUpper : '';
 
       return `
-        <tr>
-          <td>
-            <div>${vBadge}<strong>${escapeHtml(t.selection_label)}</strong>${stratBadge}</div>
-            <div style="font-size:0.72rem;color:var(--text-muted);">${escapeHtml(t.event_name)} · ${escapeHtml(t.market_type)}</div>
+        <tr class="ledger-row">
+          <td class="ledger-cell-pos">
+            <div class="ledger-pos-title">${vBadge}<strong>${escapeHtml(t.selection_label)}</strong>${stratBadge}</div>
+            <div class="ledger-pos-sub">${escapeHtml(t.event_name)} · ${escapeHtml(t.market_type)}</div>
           </td>
-          <td class="mono">${escapeHtml(t.sport)}</td>
-          <td class="mono"><strong>${escapeHtml(t.side)}</strong></td>
-          <td class="num-col mono">${sizePriceTxt}</td>
-          <td class="num-col">$${toFixedSafe(t.total_cost, 2)}</td>
-          <td class="num-col">${probTxt}</td>
-          <td style="font-size:0.77rem;color:var(--text-secondary);">${guidanceTxt}</td>
-          <td><span class="status-badge ${statusCls}">${escapeHtml(t.status)}</span></td>
-          <td class="num-col ${pnlCls}"><strong>${pnlStr}</strong></td>
-          <td>
+          <td class="mono ledger-cell-league" data-label="League">${escapeHtml(t.sport)}</td>
+          <td class="mono ledger-cell-side" data-label="Side"><strong>${escapeHtml(t.side)}</strong></td>
+          <td class="num-col mono ledger-cell-size" data-label="Size @ Price">${sizePriceTxt}</td>
+          <td class="num-col ledger-cell-cost" data-label="Cost / Risk">$${toFixedSafe(t.total_cost, 2)}</td>
+          <td class="num-col ledger-cell-prob" data-label="Win %">${probTxt}</td>
+          <td class="ledger-cell-guidance" data-label="Guidance">${guidanceTxt}</td>
+          <td class="ledger-cell-status" data-label="Status"><span class="status-badge ${statusCls}">${escapeHtml(t.status)}</span></td>
+          <td class="num-col ledger-cell-pnl ${pnlCls}" data-label="Net P&amp;L"><strong>${pnlStr}</strong></td>
+          <td class="ledger-cell-actions">
             <div class="row-actions">
               <button type="button" class="btn btn-secondary btn-sm settle-open-btn" data-id="${t.id}">Settle</button>
               <button type="button" class="btn btn-danger-ghost btn-sm delete-trade-btn" data-id="${t.id}" aria-label="Remove position ${escapeHtml(t.selection_label)}">Remove</button>
@@ -2844,7 +2856,7 @@ function renderSportsbookBacktest(report) {
       const lgEv = info.ev_line_shopping || {};
       return `
         <div class="surface-panel">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:0.25rem 0.5rem;">
             <h3 class="panel-heading">${escapeHtml(lg.toUpperCase())} Out-of-Sample Calibration</h3>
             <span class="mono" style="font-size:0.75rem;color:var(--text-muted);">${info.oos_games} OOS games</span>
           </div>
@@ -2988,7 +3000,7 @@ function renderBacktestData(data) {
 
       return `
         <div class="surface-panel">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:0.25rem 0.5rem;">
             <h3 class="panel-heading">${escapeHtml(lg.toUpperCase())} Walk-Forward</h3>
             <span class="mono" style="font-size:0.75rem;color:var(--text-muted);">${info.oos_games} OOS games</span>
           </div>
@@ -3330,9 +3342,11 @@ function updateParlayFloatingBar() {
   const onParlayTab = !document.getElementById('panel-parlay').hidden;
   if (!legs.length || onParlayTab) {
     bar.hidden = true;
+    document.body.classList.remove('has-parlay-bar');
     return;
   }
   bar.hidden = false;
+  document.body.classList.add('has-parlay-bar');
   const title = document.getElementById('parlay-float-title');
   const stats = document.getElementById('parlay-float-stats');
   title.textContent = `Parlay Slip (${legs.length} ${legs.length === 1 ? 'leg' : 'legs'})`;
@@ -3483,7 +3497,7 @@ function renderParlayLegs() {
             </label>
             <label class="parlay-mini-field">
               <span>Win %</span>
-              <input type="number" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-prob" data-leg-idx="${idx}" value="${Number((Number(lg.model_prob || 0.55) * 100).toFixed(1))}" aria-label="Win probability for ${escapeHtml(lg.selection_label)}">
+              <input type="number" inputmode="decimal" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-prob" data-leg-idx="${idx}" value="${Number((Number(lg.model_prob || 0.55) * 100).toFixed(1))}" aria-label="Win probability for ${escapeHtml(lg.selection_label)}">
             </label>
           </div>`
         : `
@@ -3494,11 +3508,11 @@ function renderParlayLegs() {
             </select>
             <label class="parlay-mini-field">
               <span>Ask ¢</span>
-              <input type="number" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-ask" data-leg-idx="${idx}" value="${Number((Number(lg.contract_price ?? 0.5) * 100).toFixed(1))}" aria-label="Contract ask cents for ${escapeHtml(lg.selection_label)}">
+              <input type="number" inputmode="decimal" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-ask" data-leg-idx="${idx}" value="${Number((Number(lg.contract_price ?? 0.5) * 100).toFixed(1))}" aria-label="Contract ask cents for ${escapeHtml(lg.selection_label)}">
             </label>
             <label class="parlay-mini-field">
               <span>Win %</span>
-              <input type="number" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-prob" data-leg-idx="${idx}" value="${Number((Number(lg.model_prob || 0.55) * 100).toFixed(1))}" aria-label="Win probability for ${escapeHtml(lg.selection_label)}">
+              <input type="number" inputmode="decimal" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-prob" data-leg-idx="${idx}" value="${Number((Number(lg.model_prob || 0.55) * 100).toFixed(1))}" aria-label="Win probability for ${escapeHtml(lg.selection_label)}">
             </label>
           </div>`;
 

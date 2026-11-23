@@ -2,7 +2,11 @@
 <html lang="en" data-theme="dark">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#09090b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>DKeX — DraftKings Predictions Model</title>
   <meta name="description" content="Minimalist NFL &amp; NBA pre-game and live in-play contract valuation, calibration, and position ledger for DraftKings Predictions.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -14,6 +18,8 @@
         var saved = localStorage.getItem("dkex_theme");
         if (saved === "light" || saved === "dark") {
           document.documentElement.setAttribute("data-theme", saved);
+          var tc = document.querySelector('meta[name="theme-color"]');
+          if (tc) tc.setAttribute("content", saved === "light" ? "#fafafa" : "#09090b");
         }
       } catch (_) {}
     })();
@@ -67,7 +73,7 @@
           <span id="header-bankroll-chip">$1,000 · 1.5¢</span>
         </button>
 
-        <button type="button" id="refresh-live-btn" class="btn btn-primary" title="Refresh live scoreboards, box scores, injuries, and lines">
+        <button type="button" id="refresh-live-btn" class="btn btn-primary" aria-label="Refresh live data" title="Refresh live scoreboards, box scores, injuries, and lines">
           <svg id="refresh-icon" class="icon-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path>
             <path d="M3 3v5h5"></path>
@@ -134,8 +140,8 @@
 
     <!-- VIEW 1: MARKETS -->
     <section role="tabpanel" id="panel-picks" aria-labelledby="tab-picks">
-      <div class="toolbar">
-        <div class="toolbar-group">
+      <div class="toolbar markets-toolbar">
+        <div class="toolbar-group toolbar-filters">
           <div class="segmented" role="group" aria-label="Slate timing">
             <button type="button" class="seg-btn active" data-seg="mode" data-val="all" id="seg-mode-all">All</button>
             <button type="button" class="seg-btn" data-seg="mode" data-val="live" id="seg-mode-live">
@@ -163,7 +169,7 @@
           </div>
         </div>
 
-        <div class="toolbar-group">
+        <div class="toolbar-group toolbar-utilities">
           <input id="filter-search" class="search-input" type="search" placeholder="Search team or player..." aria-label="Search team or player">
 
           <button type="button" id="toggle-filters-btn" class="btn btn-secondary" aria-expanded="false" aria-controls="filters-form">
@@ -275,11 +281,11 @@
       <div class="strategy-controls">
         <div class="field-inline">
           <label for="strat-arb-stake">Arb / Middle Stake ($)</label>
-          <input id="strat-arb-stake" type="number" min="10" step="10" value="100">
+          <input id="strat-arb-stake" type="number" inputmode="decimal" min="10" step="10" value="100">
         </div>
         <div class="field-inline">
           <label for="strat-bonus-size">Bonus Bet Size ($)</label>
-          <input id="strat-bonus-size" type="number" min="5" step="5" value="50">
+          <input id="strat-bonus-size" type="number" inputmode="decimal" min="5" step="5" value="50">
         </div>
         <div class="field-inline">
           <label for="strat-boost-pct">Profit Boost</label>
@@ -354,7 +360,7 @@
                 <h3 class="panel-heading" style="margin:0;">Quick-Add from Active Slate</h3>
                 <span class="field-hint">Click any loaded market to toggle it in your parlay slip.</span>
               </div>
-              <input id="parlay-slate-search" class="search-input" type="search" placeholder="Filter slate legs..." aria-label="Filter slate legs" style="inline-size:175px;">
+              <input id="parlay-slate-search" class="search-input parlay-slate-search" type="search" placeholder="Filter slate legs..." aria-label="Filter slate legs">
             </div>
             <div id="parlay-slate-picker" class="parlay-slate-picker"></div>
           </div>
@@ -408,11 +414,11 @@
                 </div>
                 <div class="field">
                   <label for="pl-custom-ask">Ask Price (¢)</label>
-                  <input id="pl-custom-ask" type="number" min="1" max="99" step="0.5" value="60">
+                  <input id="pl-custom-ask" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="60">
                 </div>
                 <div class="field">
                   <label for="pl-custom-prob-dkex">Win Prob (%)</label>
-                  <input id="pl-custom-prob-dkex" type="number" min="1" max="99" step="0.5" value="66">
+                  <input id="pl-custom-prob-dkex" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="66">
                 </div>
               </div>
 
@@ -437,11 +443,11 @@
                 </div>
                 <div class="field">
                   <label for="pl-custom-prob-sb">Win Prob (%)</label>
-                  <input id="pl-custom-prob-sb" type="number" min="1" max="99" step="0.5" value="56">
+                  <input id="pl-custom-prob-sb" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="56">
                 </div>
               </div>
 
-              <div style="display:flex;justify-content:flex-end;">
+              <div class="form-submit-end">
                 <button type="submit" class="btn btn-secondary btn-sm">Add Leg to Slip</button>
               </div>
             </form>
@@ -455,7 +461,7 @@
             <div id="parlay-dkex-controls" class="parlay-controls-stack">
               <div class="field">
                 <span class="field-label">Predictions Parlay Structure</span>
-                <div class="segmented" role="group" aria-label="Predictions parlay structure">
+                <div class="segmented segmented-full" role="group" aria-label="Predictions parlay structure">
                   <button type="button" class="seg-btn active" data-pl-struct="COMBO_CONTRACT" id="pl-struct-combo">Combo Contract ($1)</button>
                   <button type="button" class="seg-btn" data-pl-struct="SEQUENTIAL_ROLLOVER" id="pl-struct-rollover">Sequential Rollover</button>
                 </div>
@@ -463,11 +469,11 @@
               <div class="form-grid-2">
                 <div class="field" id="pl-custom-combo-ask-wrap">
                   <label for="pl-custom-combo-ask">Quoted Combo Ask (¢ opt.)</label>
-                  <input id="pl-custom-combo-ask" type="number" min="1" max="99" step="0.5" placeholder="Auto product">
+                  <input id="pl-custom-combo-ask" type="number" inputmode="decimal" min="1" max="99" step="0.5" placeholder="Auto product">
                 </div>
                 <div class="field">
                   <label for="pl-contracts-override">Contracts Qty (opt.)</label>
-                  <input id="pl-contracts-override" type="number" min="1" step="1" placeholder="Auto Kelly">
+                  <input id="pl-contracts-override" type="number" inputmode="numeric" min="1" step="1" placeholder="Auto Kelly">
                 </div>
               </div>
             </div>
@@ -499,7 +505,7 @@
                 </div>
                 <div class="field">
                   <label for="pl-sb-stake">Stake ($ opt.)</label>
-                  <input id="pl-sb-stake" type="number" min="0.5" step="any" placeholder="Auto Kelly">
+                  <input id="pl-sb-stake" type="number" inputmode="decimal" min="0.5" step="any" placeholder="Auto Kelly">
                 </div>
               </div>
               <label for="pl-sb-bonus" class="toggle-check" style="padding:0;">
@@ -572,7 +578,7 @@
           <form id="custom-calc-form" class="stack-form">
             <div class="field">
               <span id="calc-side-lbl" class="field-label">Contract Side</span>
-              <div class="segmented" role="group" aria-labelledby="calc-side-lbl">
+              <div class="segmented segmented-full" role="group" aria-labelledby="calc-side-lbl">
                 <button type="button" class="seg-btn active" id="calc-side-yes" data-side="YES">YES Contract</button>
                 <button type="button" class="seg-btn" id="calc-side-no" data-side="NO">NO Contract</button>
               </div>
@@ -581,13 +587,13 @@
 
             <div class="field">
               <label for="calc-prob">Estimated True YES Win Probability (%)</label>
-              <input id="calc-prob" type="number" min="1" max="99" step="0.5" value="68.5" required>
+              <input id="calc-prob" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="68.5" required>
               <span class="field-hint">Model or blended true probability for the YES outcome.</span>
             </div>
 
             <div class="field">
               <label for="calc-price">DraftKings Ask Price (¢)</label>
-              <input id="calc-price" type="number" min="1" max="99" step="0.5" value="60" required>
+              <input id="calc-price" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="60" required>
               <span class="field-hint">Current exchange offer between 1¢ and 99¢.</span>
             </div>
 
@@ -611,7 +617,7 @@
 
           <div id="calc-output-body" class="kv-list"></div>
 
-          <div style="margin-top: 1rem; display: flex; justify-content: flex-end;">
+          <div class="calc-log-row">
             <button type="button" id="calc-log-btn" class="btn btn-secondary">Log Position to Ledger...</button>
           </div>
         </div>
@@ -619,7 +625,7 @@
 
       <!-- Traditional Sportsbooks Analyzer (Shown when Traditional Mode is ON) -->
       <div id="analyzer-sportsbook" hidden>
-        <div class="toolbar" style="margin-bottom: 1rem;">
+        <div class="toolbar sb-analyzer-toolbar">
           <div class="segmented" role="group" aria-label="Sportsbook analyzer mode">
             <button type="button" class="seg-btn active" data-sb-calc="ev" id="sb-calc-tab-ev">+EV &amp; Profit Boost</button>
             <button type="button" class="seg-btn" data-sb-calc="arb" id="sb-calc-tab-arb">Arb &amp; Hedge</button>
@@ -646,7 +652,7 @@
               <div class="form-grid-2">
                 <div class="field">
                   <label for="sb-ev-prob">True Win Prob (% — optional if Sharp Odds entered)</label>
-                  <input id="sb-ev-prob" type="number" min="1" max="99" step="0.5" value="55.0">
+                  <input id="sb-ev-prob" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="55.0">
                 </div>
                 <div class="field">
                   <label for="sb-ev-boost">Profit Boost (%)</label>
@@ -717,7 +723,7 @@
                 </div>
                 <div class="field">
                   <label for="sb-arb-total">Total Outlay ($)</label>
-                  <input id="sb-arb-total" type="number" min="1" step="10" value="100" required>
+                  <input id="sb-arb-total" type="number" inputmode="decimal" min="1" step="10" value="100" required>
                 </div>
                 <div class="field">
                   <label for="sb-arb-round">Stake Rounding</label>
@@ -730,7 +736,7 @@
               </div>
               <div class="field">
                 <label for="sb-arb-fixed-a">Fixed Leg 1 Stake ($ — optional for live hedge)</label>
-                <input id="sb-arb-fixed-a" type="number" min="0" step="1" placeholder="Leave blank to split Total Outlay">
+                <input id="sb-arb-fixed-a" type="number" inputmode="decimal" min="0" step="1" placeholder="Leave blank to split Total Outlay">
               </div>
               <button type="submit" class="btn btn-primary">Calculate Arb / Hedge</button>
             </form>
@@ -763,7 +769,7 @@
                 </div>
                 <div class="field">
                   <label for="sb-bon-amt">Bonus Bet Amount ($)</label>
-                  <input id="sb-bon-amt" type="number" min="1" step="5" value="50" required>
+                  <input id="sb-bon-amt" type="number" inputmode="decimal" min="1" step="5" value="50" required>
                 </div>
                 <div class="field">
                   <label for="sb-bon-odds">Underdog Bonus Odds</label>
@@ -798,7 +804,7 @@
           <h2 id="ledger-table-caption">Position Ledger &amp; Cash-Out Monitor</h2>
           <p id="ledger-sub-meta">Itemized contract fees, live hold-vs-exit signals, Closing Line Value (CLV), and $1.00 settlements.</p>
         </div>
-        <div class="toolbar-group">
+        <div class="toolbar-group ledger-toolbar-group">
           <div id="ledger-venue-filters" class="segmented" role="group" aria-label="Filter by venue" hidden>
             <button type="button" class="seg-btn active" data-venue-filter="ALL">All Venues</button>
             <button type="button" class="seg-btn" data-venue-filter="DRAFTKINGS">DK</button>
@@ -818,8 +824,8 @@
 
       <div id="ledger-guidance-notice" class="info-callout" role="status" hidden></div>
 
-      <div class="table-container" role="region" aria-labelledby="ledger-table-caption" tabindex="0">
-        <table class="data-table">
+      <div class="table-container ledger-table-wrap" role="region" aria-labelledby="ledger-table-caption" tabindex="0">
+        <table class="data-table ledger-table">
           <thead>
             <tr>
               <th scope="col">Position / Venue</th>
@@ -846,7 +852,7 @@
           <h2 id="backtest-heading">Walk-Forward Calibration &amp; Model Engine</h2>
           <p id="backtest-sub">Strict chronological out-of-sample evaluation with zero lookahead bias and itemized contract fee accounting.</p>
         </div>
-        <div class="toolbar-group">
+        <div class="toolbar-group calibration-actions">
           <button type="button" id="run-backtest-btn" class="btn btn-secondary">Re-run Backtest</button>
           <button type="button" id="train-models-btn" class="btn btn-secondary">Retrain Models</button>
           <button type="button" id="sync-btn" class="btn btn-primary">Sync Data &amp; Retrain</button>
@@ -893,7 +899,7 @@
   </dialog>
 
   <!-- DIALOG 2: WORKSPACE SETTINGS & DATA FEEDS -->
-  <dialog id="settings-dialog" closedby="any" aria-labelledby="settings-dialog-title">
+  <dialog id="settings-dialog" class="dialog-sheet" closedby="any" aria-labelledby="settings-dialog-title">
     <form id="settings-form" class="dialog-form">
       <div class="dialog-head">
         <h2 id="settings-dialog-title">Workspace Settings</h2>
@@ -915,7 +921,7 @@
       <div class="form-grid-2">
         <div class="field">
           <label for="global-bankroll">Total Bankroll ($)</label>
-          <input id="global-bankroll" type="number" min="1" step="any" value="1000.00" required>
+          <input id="global-bankroll" type="number" inputmode="decimal" min="1" step="any" value="1000.00" required>
         </div>
 
         <div class="field" id="setting-dkex-fee-wrap">
@@ -939,12 +945,12 @@
 
         <div class="field">
           <label for="setting-kelly">Kelly Multiplier</label>
-          <input id="setting-kelly" type="number" min="0.05" max="1.0" step="0.05" value="0.25" required>
+          <input id="setting-kelly" type="number" inputmode="decimal" min="0.05" max="1.0" step="0.05" value="0.25" required>
         </div>
 
         <div class="field">
           <label for="setting-max-bet">Max Single Bet (%)</label>
-          <input id="setting-max-bet" type="number" min="1" max="25" step="0.5" value="4.0" required>
+          <input id="setting-max-bet" type="number" inputmode="decimal" min="1" max="25" step="0.5" value="4.0" required>
         </div>
       </div>
 
@@ -953,18 +959,18 @@
         <div class="form-grid-2" style="margin-bottom: 0.75rem;">
           <div class="field">
             <label for="setting-dk-bankroll">DraftKings Bankroll ($ opt.)</label>
-            <input id="setting-dk-bankroll" type="number" min="0" step="any" placeholder="Auto 50/50 split">
+            <input id="setting-dk-bankroll" type="number" inputmode="decimal" min="0" step="any" placeholder="Auto 50/50 split">
           </div>
           <div class="field">
             <label for="setting-fd-bankroll">FanDuel Bankroll ($ opt.)</label>
-            <input id="setting-fd-bankroll" type="number" min="0" step="any" placeholder="Auto 50/50 split">
+            <input id="setting-fd-bankroll" type="number" inputmode="decimal" min="0" step="any" placeholder="Auto 50/50 split">
           </div>
           <div class="field">
             <label for="setting-min-arb-roi">Min Arb ROI (%)</label>
-            <input id="setting-min-arb-roi" type="number" min="0" max="15" step="0.1" value="0.5">
+            <input id="setting-min-arb-roi" type="number" inputmode="decimal" min="0" max="15" step="0.1" value="0.5">
           </div>
-          <div class="field" style="justify-content: flex-end;">
-            <label for="setting-include-dkex-arb" class="toggle-check" style="margin-top: 1.1rem;">
+          <div class="field setting-checkbox-field">
+            <label for="setting-include-dkex-arb" class="toggle-check">
               <input id="setting-include-dkex-arb" type="checkbox" checked>
               <span>Include DKeX cross-arbs</span>
             </label>
@@ -988,7 +994,7 @@
   </dialog>
 
   <!-- DIALOG 3: MANUAL / CUSTOM POSITION LOGGER -->
-  <dialog id="new-trade-dialog" closedby="any" aria-labelledby="new-trade-dialog-title">
+  <dialog id="new-trade-dialog" class="dialog-sheet" closedby="any" aria-labelledby="new-trade-dialog-title">
     <form id="new-trade-form" class="dialog-form">
       <div class="dialog-head">
         <h2 id="new-trade-dialog-title">Log DKeX Position</h2>
@@ -1056,15 +1062,15 @@
         </div>
         <div class="field">
           <label for="nt-contracts">Contracts (Qty)</label>
-          <input id="nt-contracts" type="number" min="1" step="1" value="10">
+          <input id="nt-contracts" type="number" inputmode="numeric" min="1" step="1" value="10">
         </div>
         <div class="field">
           <label for="nt-price">Entry Price (¢)</label>
-          <input id="nt-price" type="number" min="1" max="99" step="0.5" value="58">
+          <input id="nt-price" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="58">
         </div>
         <div class="field">
           <label for="nt-prob">Model Win Prob (%)</label>
-          <input id="nt-prob" type="number" min="1" max="99" step="0.5" value="66">
+          <input id="nt-prob" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="66">
         </div>
       </div>
 
@@ -1086,11 +1092,11 @@
           </div>
           <div class="field">
             <label for="nt-sb-stake">Stake ($)</label>
-            <input id="nt-sb-stake" type="number" min="0.5" step="any" value="25">
+            <input id="nt-sb-stake" type="number" inputmode="decimal" min="0.5" step="any" value="25">
           </div>
           <div class="field">
             <label for="nt-sb-prob">Model Win Prob (%)</label>
-            <input id="nt-sb-prob" type="number" min="1" max="99" step="0.5" value="56">
+            <input id="nt-sb-prob" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="56">
           </div>
         </div>
         <label for="nt-sb-bonus" class="toggle-check" style="margin-top: 0.5rem;">
@@ -1107,7 +1113,7 @@
   </dialog>
 
   <!-- DIALOG 4: SETTLE / SELL EARLY / CASHOUT -->
-  <dialog id="settle-dialog" closedby="any" aria-labelledby="settle-dialog-title">
+  <dialog id="settle-dialog" class="dialog-sheet" closedby="any" aria-labelledby="settle-dialog-title">
     <form id="settle-form" class="dialog-form">
       <div class="dialog-head">
         <h2 id="settle-dialog-title">Settle Position</h2>
@@ -1132,22 +1138,22 @@
       <div id="sold-fields" class="form-grid-2" hidden>
         <div class="field">
           <label for="settle-sell-price">Sale Price (¢, 1–99)</label>
-          <input id="settle-sell-price" type="number" min="1" max="99" step="0.5" value="75">
+          <input id="settle-sell-price" type="number" inputmode="decimal" min="1" max="99" step="0.5" value="75">
         </div>
         <div class="field">
           <label for="settle-sell-fee">Exit Fee / Contract (¢)</label>
-          <input id="settle-sell-fee" type="number" min="0" max="10" step="0.5" value="1.5">
+          <input id="settle-sell-fee" type="number" inputmode="decimal" min="0" max="10" step="0.5" value="1.5">
         </div>
       </div>
 
       <div id="cashout-fields" class="field" hidden>
         <label for="settle-cashout-amt">Cashout Payout Received ($)</label>
-        <input id="settle-cashout-amt" type="number" min="0" step="0.01" value="30.00">
+        <input id="settle-cashout-amt" type="number" inputmode="decimal" min="0" step="0.01" value="30.00">
       </div>
 
       <div class="field" id="settle-clv-cents-wrap">
         <label for="settle-closing-price">Closing Pre-Game Price (¢, optional for CLV)</label>
-        <input id="settle-closing-price" type="number" min="1" max="99" step="0.5" placeholder="e.g. 66">
+        <input id="settle-closing-price" type="number" inputmode="decimal" min="1" max="99" step="0.5" placeholder="e.g. 66">
       </div>
 
       <div class="field" id="settle-clv-odds-wrap" hidden>
