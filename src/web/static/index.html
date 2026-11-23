@@ -37,6 +37,10 @@
             Strategies
             <span id="strategies-badge" class="tab-count" hidden>0</span>
           </button>
+          <button type="button" role="tab" id="tab-parlay" aria-selected="false" aria-controls="panel-parlay">
+            Parlay
+            <span id="parlay-count-badge" class="tab-count" hidden>0</span>
+          </button>
           <button type="button" role="tab" id="tab-calculator" aria-selected="false" aria-controls="panel-calculator">
             Analyzer
           </button>
@@ -298,6 +302,263 @@
       </div>
 
       <div id="strategies-container" class="strategies-stack" aria-live="polite"></div>
+    </section>
+
+    <!-- VIEW 1C: PARLAY BUILDER (Predictions DKeX & Traditional DK/FD Sportsbooks) -->
+    <section role="tabpanel" id="panel-parlay" aria-labelledby="tab-parlay" hidden>
+      <div class="view-header">
+        <div>
+          <h2 id="parlay-heading">DKeX Predictions Parlay &amp; Combo Builder</h2>
+          <p id="parlay-sub">Combine binary event contracts into fee-adjusted Combo Contracts or Sequential Rollovers with SGP correlation modeling and Fractional Kelly sizing.</p>
+        </div>
+        <div class="toolbar-group">
+          <span id="parlay-mode-pill" class="venue-pill venue-dkex">DKeX Predictions</span>
+          <button type="button" id="parlay-clear-top-btn" class="btn btn-secondary btn-sm">Clear Slip</button>
+        </div>
+      </div>
+
+      <div class="parlay-shell">
+        <!-- Left Column: Active Parlay Slip, Conflicts/SGP Correlations, Slate Picker, Custom Leg -->
+        <div class="parlay-left-col">
+          <div class="surface-panel">
+            <div class="parlay-card-head">
+              <div>
+                <h3 class="panel-heading" style="margin:0;">Active Parlay Slip (<span id="parlay-leg-count" class="mono">0</span> legs)</h3>
+                <span class="field-hint">Add legs from Markets, pick from the active slate below, or enter custom legs.</span>
+              </div>
+              <span id="parlay-sgp-badge" class="strat-pill strat-middle" hidden>SGP</span>
+            </div>
+
+            <div id="parlay-conflicts" class="parlay-conflicts" hidden></div>
+
+            <div id="parlay-legs-list" class="parlay-legs-list" aria-live="polite">
+              <div class="empty-state" style="padding: 1.5rem 1rem;">
+                <h3>Your parlay slip is empty</h3>
+                <p>Click <strong>+ Parlay</strong> on any Market card, add from the slate picker below, or run <strong>Generate +EV Parlays</strong>.</p>
+              </div>
+            </div>
+
+            <div id="parlay-correlations-wrap" class="parlay-corr-wrap" hidden>
+              <div class="parlay-sub-head">
+                <h4>Same-Game Correlations (Gaussian Copula)</h4>
+                <button type="button" id="parlay-reset-corr-btn" class="link-btn">Reset to model</button>
+              </div>
+              <div id="parlay-correlations-list" class="parlay-corr-list"></div>
+            </div>
+          </div>
+
+          <!-- Quick-Add from Loaded Slate -->
+          <div class="surface-panel">
+            <div class="parlay-card-head" style="margin-bottom:0.65rem;">
+              <div>
+                <h3 class="panel-heading" style="margin:0;">Quick-Add from Active Slate</h3>
+                <span class="field-hint">Click any loaded market to toggle it in your parlay slip.</span>
+              </div>
+              <input id="parlay-slate-search" class="search-input" type="search" placeholder="Filter slate legs..." aria-label="Filter slate legs" style="inline-size:175px;">
+            </div>
+            <div id="parlay-slate-picker" class="parlay-slate-picker"></div>
+          </div>
+
+          <!-- Manual / Custom Leg Form -->
+          <details class="surface-panel parlay-custom-details" id="parlay-custom-details">
+            <summary class="parlay-custom-summary">
+              <span>+ Add Custom Manual Leg</span>
+              <span class="field-hint">Enter any custom matchup, odds/price, and win probability</span>
+            </summary>
+            <form id="parlay-custom-leg-form" class="stack-form" style="margin-top:0.85rem;">
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="pl-custom-sport">League</label>
+                  <select id="pl-custom-sport">
+                    <option value="NBA" selected>NBA</option>
+                    <option value="NFL">NFL</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pl-custom-market">Market Type</label>
+                  <select id="pl-custom-market">
+                    <option value="Moneyline" selected>Moneyline</option>
+                    <option value="Spread">Spread</option>
+                    <option value="Total">Total</option>
+                    <option value="Prop: Points">Prop: Points</option>
+                    <option value="Prop: Passing Yards">Prop: Passing Yards</option>
+                    <option value="Prop: Receiving Yards">Prop: Receiving Yards</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="pl-custom-event">Matchup (same name groups SGP)</label>
+                  <input id="pl-custom-event" type="text" placeholder="e.g. NYK @ BOS" required>
+                </div>
+                <div class="field">
+                  <label for="pl-custom-selection">Selection Label</label>
+                  <input id="pl-custom-selection" type="text" placeholder="e.g. BOS to Win" required>
+                </div>
+              </div>
+
+              <!-- DKeX Predictions custom fields -->
+              <div id="pl-custom-dkex-fields" class="form-grid-3">
+                <div class="field">
+                  <label for="pl-custom-side">Side</label>
+                  <select id="pl-custom-side">
+                    <option value="YES" selected>YES</option>
+                    <option value="NO">NO</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pl-custom-ask">Ask Price (¢)</label>
+                  <input id="pl-custom-ask" type="number" min="1" max="99" step="0.5" value="60">
+                </div>
+                <div class="field">
+                  <label for="pl-custom-prob-dkex">Win Prob (%)</label>
+                  <input id="pl-custom-prob-dkex" type="number" min="1" max="99" step="0.5" value="66">
+                </div>
+              </div>
+
+              <!-- Sportsbook custom fields -->
+              <div id="pl-custom-sb-fields" class="form-grid-3" hidden>
+                <div class="field">
+                  <label for="pl-custom-sb-side">Side</label>
+                  <select id="pl-custom-sb-side">
+                    <option value="HOME" selected>HOME</option>
+                    <option value="AWAY">AWAY</option>
+                    <option value="OVER">OVER</option>
+                    <option value="UNDER">UNDER</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pl-custom-dk-odds">DK Odds (Am.)</label>
+                  <input id="pl-custom-dk-odds" type="number" step="1" value="-110">
+                </div>
+                <div class="field">
+                  <label for="pl-custom-fd-odds">FD Odds (opt.)</label>
+                  <input id="pl-custom-fd-odds" type="number" step="1" placeholder="-108">
+                </div>
+                <div class="field">
+                  <label for="pl-custom-prob-sb">Win Prob (%)</label>
+                  <input id="pl-custom-prob-sb" type="number" min="1" max="99" step="0.5" value="56">
+                </div>
+              </div>
+
+              <div style="display:flex;justify-content:flex-end;">
+                <button type="submit" class="btn btn-secondary btn-sm">Add Leg to Slip</button>
+              </div>
+            </form>
+          </details>
+        </div>
+
+        <!-- Right Column: Pricing Controls, Book Comparison, Valuation & Log -->
+        <div class="parlay-right-col">
+          <div class="surface-panel parlay-eval-panel">
+            <!-- Predictions Mode Controls -->
+            <div id="parlay-dkex-controls" class="parlay-controls-stack">
+              <div class="field">
+                <span class="field-label">Predictions Parlay Structure</span>
+                <div class="segmented" role="group" aria-label="Predictions parlay structure">
+                  <button type="button" class="seg-btn active" data-pl-struct="COMBO_CONTRACT" id="pl-struct-combo">Combo Contract ($1)</button>
+                  <button type="button" class="seg-btn" data-pl-struct="SEQUENTIAL_ROLLOVER" id="pl-struct-rollover">Sequential Rollover</button>
+                </div>
+              </div>
+              <div class="form-grid-2">
+                <div class="field" id="pl-custom-combo-ask-wrap">
+                  <label for="pl-custom-combo-ask">Quoted Combo Ask (¢ opt.)</label>
+                  <input id="pl-custom-combo-ask" type="number" min="1" max="99" step="0.5" placeholder="Auto product">
+                </div>
+                <div class="field">
+                  <label for="pl-contracts-override">Contracts Qty (opt.)</label>
+                  <input id="pl-contracts-override" type="number" min="1" step="1" placeholder="Auto Kelly">
+                </div>
+              </div>
+            </div>
+
+            <!-- Sportsbooks Mode Controls -->
+            <div id="parlay-sb-controls" class="parlay-controls-stack" hidden>
+              <div class="form-grid-2">
+                <div class="field">
+                  <label for="pl-sb-book">Sportsbook Venue</label>
+                  <select id="pl-sb-book">
+                    <option value="BEST" selected>Best Book (Auto)</option>
+                    <option value="DRAFTKINGS">DraftKings</option>
+                    <option value="FANDUEL">FanDuel</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pl-sb-boost">Parlay Profit Boost</label>
+                  <select id="pl-sb-boost">
+                    <option value="0" selected>No Boost (0%)</option>
+                    <option value="0.25">+25% Profit Boost</option>
+                    <option value="0.30">+30% Profit Boost</option>
+                    <option value="0.50">+50% Profit Boost</option>
+                    <option value="1.00">+100% Profit Boost</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="pl-sb-custom-odds">Offered SGP / Parlay Odds (opt.)</label>
+                  <input id="pl-sb-custom-odds" type="number" step="1" placeholder="Auto multiply">
+                </div>
+                <div class="field">
+                  <label for="pl-sb-stake">Stake ($ opt.)</label>
+                  <input id="pl-sb-stake" type="number" min="0.5" step="any" placeholder="Auto Kelly">
+                </div>
+              </div>
+              <label for="pl-sb-bonus" class="toggle-check" style="padding:0;">
+                <input id="pl-sb-bonus" type="checkbox">
+                <span>Bonus Bet / Free Bet ($0 cash risk, profit-only payout)</span>
+              </label>
+            </div>
+
+            <hr class="dialog-divider" style="margin:0.85rem 0;">
+
+            <div class="verdict-header">
+              <div>
+                <h3 id="parlay-verdict-title" class="verdict-title">Add 2+ legs to price parlay</h3>
+                <span id="parlay-verdict-sub" class="field-hint">Combined odds, joint win probability &amp; Kelly sizing</span>
+              </div>
+              <span id="parlay-tier-pill" class="tier-pill">—</span>
+            </div>
+
+            <!-- DK vs FD Side-by-Side Parlay Comparison (Sportsbooks Mode) -->
+            <div id="parlay-book-compare" class="book-odds-strip" style="margin-bottom:0.75rem;" hidden></div>
+
+            <div id="parlay-output-body" class="kv-list">
+              <div class="kv-row"><span>Status</span><strong>Waiting for legs…</strong></div>
+            </div>
+
+            <div class="parlay-eval-actions">
+              <button type="button" id="parlay-clear-btn" class="btn btn-secondary">Clear</button>
+              <button type="button" id="parlay-log-btn" class="btn btn-primary" disabled>Log Parlay to Ledger</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Auto-Build +EV Parlays Section -->
+      <div class="parlay-suggest-section">
+        <div class="strategy-section-head">
+          <div>
+            <h3>Auto-Build +EV Parlays</h3>
+            <span class="field-hint">Search the active slate for highest-EV uncorrelated parlays (or enable SGP to include correlated same-game stacks).</span>
+          </div>
+          <div class="toolbar-group">
+            <div class="segmented" role="group" aria-label="Suggested parlay leg count">
+              <button type="button" class="seg-btn active" data-pl-suggest-legs="2" id="pl-sug-2">2-Leg</button>
+              <button type="button" class="seg-btn" data-pl-suggest-legs="3" id="pl-sug-3">3-Leg</button>
+              <button type="button" class="seg-btn" data-pl-suggest-legs="4" id="pl-sug-4">4-Leg</button>
+            </div>
+            <label for="parlay-suggest-sgp" class="toggle-check" style="padding:0;">
+              <input id="parlay-suggest-sgp" type="checkbox">
+              <span>Allow SGP</span>
+            </label>
+            <button type="button" id="parlay-suggest-btn" class="btn btn-primary btn-sm">Generate +EV Parlays</button>
+          </div>
+        </div>
+        <div id="parlay-suggestions-grid" class="strategy-grid" aria-live="polite">
+          <div class="empty-state" style="grid-column:1/-1;padding:1.5rem;">
+            <p>Click <strong>Generate +EV Parlays</strong> to scan your active slate for optimal multi-leg combinations.</p>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- VIEW 2: ANALYZER -->
@@ -601,6 +862,18 @@
     </section>
   </main>
 
+  <!-- FLOATING PARLAY SLIP BAR (Visible when legs are queued while viewing other tabs) -->
+  <aside id="parlay-floating-bar" class="parlay-floating-bar" aria-label="Parlay slip summary" hidden>
+    <div class="parlay-float-meta">
+      <strong id="parlay-float-title" class="mono">Parlay Slip (0 legs)</strong>
+      <span id="parlay-float-stats" class="mono"></span>
+    </div>
+    <div class="parlay-float-actions">
+      <button type="button" id="parlay-float-clear-btn" class="btn btn-ghost btn-sm">Clear</button>
+      <button type="button" id="parlay-float-open-btn" class="btn btn-primary btn-sm">Open Builder →</button>
+    </div>
+  </aside>
+
   <!-- DIALOG 1: PASSCODE UNLOCK (Remote Hosting Protection) -->
   <dialog id="auth-dialog" aria-labelledby="auth-dialog-title">
     <form id="auth-form" class="dialog-form">
@@ -735,6 +1008,7 @@
           <label for="nt-strategy">Strategy</label>
           <select id="nt-strategy">
             <option value="EV" selected>+EV Line Shop</option>
+            <option value="PARLAY">Parlay / SGP</option>
             <option value="ARB">Arbitrage</option>
             <option value="MIDDLE">Middle</option>
             <option value="BONUS_BET">Bonus Bet</option>
@@ -756,6 +1030,7 @@
             <option value="Spread">Spread</option>
             <option value="Total">Total</option>
             <option value="Player Prop">Player Prop</option>
+            <option value="Parlay">Parlay / Combo</option>
           </select>
         </div>
       </div>

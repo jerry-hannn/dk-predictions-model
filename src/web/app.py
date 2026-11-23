@@ -115,7 +115,7 @@ def _validate_american_odds(value: Optional[float]) -> Optional[float]:
     """American odds must be <= -100 or >= +100 (e.g. -110, +150); values in (-100, 100) are invalid."""
     if value is None:
         return value
-    if not (abs(float(value)) >= 100.0 and abs(float(value)) <= 100000.0):
+    if not (abs(float(value)) >= 100.0 and abs(float(value)) <= 1000000.0):
         raise ValueError("American odds must be <= -100 or >= +100 (e.g. -110 or +150).")
     return value
 
@@ -245,6 +245,80 @@ class UpdateTradeRequest(BaseModel):
     notes: Optional[str] = None
 
     _check_odds = field_validator("closing_odds_american")(_validate_american_odds)
+
+
+class ParlayLegPayload(BaseModel):
+    leg_id: Optional[str] = None
+    pick_id: Optional[str] = None
+    sport: str = "NBA"
+    event_id: str = ""
+    event_name: str = "Custom Event"
+    short_name: str = ""
+    market_type: str = "Moneyline"
+    selection_label: str = Field(..., min_length=1)
+    side: str = "YES"
+    model_prob: float = Field(..., gt=0.001, lt=0.999)
+    conservative_prob: Optional[float] = Field(None, gt=0.001, lt=0.999)
+    anchor_prob: Optional[float] = Field(None, gt=0.001, lt=0.999)
+    market_prob: Optional[float] = Field(None, gt=0.001, lt=0.999)
+    player_name: Optional[str] = None
+    line_value: Optional[float] = None
+    # DKeX Predictions fields
+    contract_price: Optional[float] = Field(None, ge=0.01, le=0.99)
+    fee_per_contract: Optional[float] = Field(None, ge=0.0, le=0.10)
+    # Sportsbook fields
+    book: Optional[str] = None
+    american_odds: Optional[float] = None
+    dk_odds: Optional[float] = None
+    fd_odds: Optional[float] = None
+    is_live: bool = False
+    game_state: Optional[str] = None
+
+    _check_odds = field_validator("american_odds", "dk_odds", "fd_odds")(_validate_american_odds)
+
+
+class ParlayEvaluateRequest(BaseModel):
+    mode: str = Field("predictions", pattern="^(predictions|sportsbook)$")
+    legs: list[ParlayLegPayload] = Field(..., min_length=1, max_length=12)
+    # Predictions (DKeX) options
+    pricing_structure: str = Field(
+        "COMBO_CONTRACT", pattern="^(COMBO_CONTRACT|SEQUENTIAL_ROLLOVER)$"
+    )
+    fee_per_contract: Optional[float] = Field(None, ge=0.0, le=0.10)
+    custom_combo_ask: Optional[float] = Field(None, ge=0.01, le=0.99)
+    contracts_override: Optional[int] = Field(None, ge=1, le=100000)
+    # Sportsbook (DK/FD) options
+    book: str = Field("BEST", pattern="^(BEST|DRAFTKINGS|FANDUEL|best|draftkings|fanduel)$")
+    profit_boost_pct: float = Field(0.0, ge=0.0, le=2.0)
+    is_bonus_bet: bool = False
+    custom_parlay_odds: Optional[float] = None
+    stake_override: Optional[float] = Field(None, gt=0.0)
+    # Shared options
+    bankroll: Optional[float] = Field(None, gt=0.0)
+    correlation_overrides: Optional[dict[str, float]] = None
+
+    _check_odds = field_validator("custom_parlay_odds")(_validate_american_odds)
+
+
+class ParlaySuggestRequest(BaseModel):
+    mode: str = Field("predictions", pattern="^(predictions|sportsbook)$")
+    num_legs: int = Field(2, ge=2, le=4)
+    allow_same_game: bool = False
+    max_results: int = Field(6, ge=1, le=12)
+    sport: str = "all"
+    market: str = "all"
+    timing_mode: str = "all"
+    book: str = Field("BEST", pattern="^(BEST|DRAFTKINGS|FANDUEL|best|draftkings|fanduel)$")
+    date: Optional[str] = None
+    pricing_structure: str = Field(
+        "COMBO_CONTRACT", pattern="^(COMBO_CONTRACT|SEQUENTIAL_ROLLOVER)$"
+    )
+    fee_per_contract: Optional[float] = Field(None, ge=0.0, le=0.10)
+    profit_boost_pct: float = Field(0.0, ge=0.0, le=2.0)
+    is_bonus_bet: bool = False
+    bankroll: Optional[float] = Field(None, gt=0.0)
+    live_props: bool = True
+    legs_pool: Optional[list[ParlayLegPayload]] = None
 
 
 @app.get("/healthz")
@@ -616,6 +690,57 @@ def evaluate_contract_endpoint(req: ContractEvalRequest) -> dict[str, Any]:
         min_net_edge=req.min_net_edge,
         is_live=req.is_live,
     )
+
+
+@app.post("/api/parlay/evaluate")
+def evaluate_parlay_endpoint(req: ParlayEvaluateRequest) -> dict[str, Any]:
+    """Evaluate a multi-leg parlay or SGP in either Predictions (DKeX) or Sportsbooks (DK/FD) mode."""
+    hub = _get_hub()
+    try:
+        return hub.evaluate_parlay(
+            mode=req.mode,
+            legs=[lg.model_dump() for lg in req.legs],
+            pricing_structure=req.pricing_structure,  # type: ignore[arg-type]
+            fee_per_contract=req.fee_per_contract,
+            custom_combo_ask=req.custom_combo_ask,
+            contracts_override=req.contracts_override,
+            book=req.book,
+            profit_boost_pct=req.profit_boost_pct,
+            is_bonus_bet=req.is_bonus_bet,
+            custom_parlay_odds=req.custom_parlay_odds,
+            stake_override=req.stake_override,
+            bankroll=req.bankroll,
+            correlation_overrides=req.correlation_overrides,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/parlay/suggest")
+def suggest_parlays_endpoint(req: ParlaySuggestRequest) -> dict[str, Any]:
+    """Auto-build optimal +EV N-leg parlays for Predictions (DKeX) or Sportsbooks (DK/FD)."""
+    hub = _get_hub()
+    try:
+        return hub.suggest_parlays(
+            mode=req.mode,
+            num_legs=req.num_legs,
+            allow_same_game=req.allow_same_game,
+            max_results=req.max_results,
+            sport=req.sport,
+            market_filter=req.market,
+            timing_mode=req.timing_mode,
+            book=req.book,
+            target_date=req.date,
+            pricing_structure=req.pricing_structure,  # type: ignore[arg-type]
+            fee_per_contract=req.fee_per_contract,
+            profit_boost_pct=req.profit_boost_pct,
+            is_bonus_bet=req.is_bonus_bet,
+            bankroll=req.bankroll,
+            live_props=req.live_props,
+            legs_pool=[lg.model_dump() for lg in req.legs_pool] if req.legs_pool is not None else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/line-override")

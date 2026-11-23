@@ -1672,3 +1672,434 @@ button[aria-busy="true"] {
   }
 }
 
+/* --- Parlay Builder (Predictions & Sportsbooks) --- */
+.parlay-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.95fr);
+  gap: 1.1rem;
+  align-items: start;
+}
+
+.parlay-left-col,
+.parlay-right-col {
+  display: flex;
+  flex-direction: column;
+  gap: 0.95rem;
+  min-inline-size: 0;
+}
+
+.parlay-eval-panel {
+  position: sticky;
+  inset-block-start: 72px;
+}
+
+.parlay-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.55rem;
+  margin-bottom: 0.85rem;
+}
+
+.parlay-controls-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.form-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.parlay-legs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.parlay-leg-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.7rem 0.8rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  transition: border-color 0.14s ease;
+}
+
+.parlay-leg-row.has-conflict {
+  border-color: var(--negative-border);
+  background: var(--negative-bg);
+}
+
+.parlay-leg-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.parlay-leg-info {
+  min-inline-size: 0;
+}
+
+.parlay-leg-title {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.3;
+}
+
+.parlay-leg-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.18rem;
+  font-size: 0.73rem;
+  color: var(--text-muted);
+}
+
+.parlay-leg-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--border);
+}
+
+.parlay-leg-inputs {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.parlay-mini-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.parlay-mini-input {
+  inline-size: 68px;
+  padding: 0.22rem 0.38rem !important;
+  font-size: 0.76rem !important;
+  text-align: right;
+}
+
+.parlay-mini-select {
+  padding: 0.22rem 0.38rem !important;
+  font-size: 0.74rem !important;
+  font-family: var(--font-mono) !important;
+}
+
+.parlay-leg-ev {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+.parlay-conflicts {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.parlay-conflict-item {
+  padding: 0.5rem 0.7rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.77rem;
+  line-height: 1.38;
+}
+
+.parlay-conflict-item.is-error {
+  border: 1px solid var(--negative-border);
+  background: var(--negative-bg);
+  color: var(--negative);
+}
+
+.parlay-conflict-item.is-warning {
+  border: 1px solid var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.parlay-corr-wrap {
+  margin-top: 0.85rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--border);
+}
+
+.parlay-sub-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.55rem;
+}
+
+.parlay-sub-head h4 {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.parlay-corr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.parlay-corr-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.32rem;
+  padding: 0.55rem 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 0.76rem;
+}
+
+.parlay-corr-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.parlay-corr-slider-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.parlay-corr-slider-row input[type="range"] {
+  flex: 1;
+  cursor: pointer;
+}
+
+.parlay-slate-picker {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(265px, 100%), 1fr));
+  gap: 0.5rem;
+  max-block-size: 290px;
+  overflow-y: auto;
+  padding-right: 0.15rem;
+}
+
+.parlay-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  text-align: left;
+  width: 100%;
+  padding: 0.52rem 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  color: var(--text);
+  font-family: var(--font-sans);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+
+.parlay-picker-item:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+
+.parlay-picker-item.is-selected {
+  border-color: var(--positive-border);
+  background: var(--positive-bg);
+}
+
+.parlay-picker-main {
+  min-inline-size: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.parlay-picker-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.parlay-picker-sub {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.parlay-picker-price {
+  flex-shrink: 0;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.parlay-custom-details {
+  padding: 0.9rem 1.1rem;
+}
+
+.parlay-custom-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.35rem 0.75rem;
+  cursor: pointer;
+  list-style: none;
+  font-size: 0.84rem;
+  font-weight: 600;
+  user-select: none;
+}
+
+.parlay-custom-summary::-webkit-details-marker {
+  display: none;
+}
+
+.parlay-eval-actions {
+  margin-top: 1rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.55rem;
+}
+
+.parlay-eval-actions .btn-primary {
+  flex: 1;
+}
+
+.parlay-suggest-section {
+  margin-top: 1.5rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.parlay-sug-legs {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.parlay-sug-leg {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.42rem 0.58rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--surface-subtle);
+  font-size: 0.76rem;
+}
+
+/* Add-to-Parlay toggle button on Market Cards & Table Rows */
+.pick-action-btns {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  flex-wrap: wrap;
+}
+
+.btn-parlay-toggle.is-added {
+  border-color: var(--positive-border);
+  background: var(--positive-bg);
+  color: var(--positive);
+}
+
+.strat-parlay {
+  border-color: rgba(167, 139, 250, 0.38);
+  background: rgba(167, 139, 250, 0.12);
+  color: #a78bfa;
+}
+
+[data-theme="light"] .strat-parlay {
+  color: #7c3aed;
+}
+
+/* Floating Parlay Slip Bar */
+.parlay-floating-bar {
+  position: fixed;
+  inset-inline-end: 1.25rem;
+  inset-block-end: 1.1rem;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 0.85rem;
+  padding: 0.62rem 0.9rem;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-glass);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: var(--shadow-dialog);
+  max-inline-size: calc(100vw - 2rem);
+}
+
+.parlay-float-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 0.08rem;
+  font-size: 0.78rem;
+}
+
+.parlay-float-meta span {
+  font-size: 0.73rem;
+  color: var(--text-secondary);
+}
+
+.parlay-float-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+@media (max-width: 940px) {
+  .parlay-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .parlay-eval-panel {
+    position: static;
+  }
+}
+
+@media (max-width: 560px) {
+  .form-grid-3 {
+    grid-template-columns: 1fr;
+  }
+
+  .parlay-floating-bar {
+    inset-inline: 0.75rem;
+    justify-content: space-between;
+  }
+}
+
+

@@ -104,3 +104,23 @@ In addition to DraftKings Predictions (DKeX) binary contracts, the workspace inc
 ### Reading the Calibration Strategy Verification Scorecard
 - When Traditional Sportsbooks Mode is ON, the **Calibration** tab renders our zero-lookahead walk-forward **Strategy Verification Scorecard** across historical NFL and NBA seasons plus a **3-Regime Stress Sensitivity Matrix** (`Standard 4.5% Vig`, `Tight 4.8% Vig Stress`, and `Active Steam / High Dispersion`). Click **Re-run Sportsbook Backtest** at any time to re-verify profitability, CLV, rounding invariants, and max drawdown directly from the UI.
 
+---
+
+## 6. Parlay & SGP Builder (`Parlay` Tab — Both Modes)
+
+The **Parlay** tab supports multi-leg parlays and Same-Game Parlays (SGPs) in **both** workspace modes, with independent saved slips per mode:
+
+- **One-Click Leg Selection**: Click **`+ Parlay`** on any card or table row in `Markets`, use the searchable **Quick-Add from Active Slate** panel inside the `Parlay` tab, or add custom manual legs. A floating slip bar tracks your queued legs while browsing other tabs.
+- **Predictions Mode (DKeX)**:
+  - Switch between **Combo Contract (`$1.00` settlement)** (single exchange fee + optional quoted combo ask price override) and **Sequential Rollover** (compounded per-leg exchange fee drag across legs).
+  - Surfaces post-fee net edge, expected ROI, max limit combo buy price (`¢`), negative-edge `"TAX"` leg warnings, and variance-dampened Quarter-Kelly contract sizing.
+- **Traditional Sportsbooks Mode (DraftKings & FanDuel)**:
+  - Automatically compares full-ticket **DraftKings vs. FanDuel** combined parlay odds and line-shopping gain when legs have quotes on both books.
+  - Supports **Parlay Profit Boosts** (`+25%` to `+100%`), **Bonus Bets** (profit-only payout), and **Offered SGP / Parlay Odds** overrides for custom sportsbook SGP pricing.
+- **Same-Game Parlay (SGP) Correlation & Conflict Detection**:
+  - Automatically flags duplicate or mutually exclusive legs (e.g., opposing sides of the same Moneyline, Spread, Total, or Player Prop) and blocks logging invalid slips.
+  - Models same-game leg pairs with a **Gaussian copula** using empirical NFL/NBA correlation defaults (e.g., Team ML + Spread, Total Over + Player Scoring Over, QB Passing + WR Receiving), with interactive `ρ` sliders to inspect or adjust correlation impact live.
+- **Auto-Build +EV Parlays & Ledger Logging**:
+  - Click **Generate +EV Parlays** to scan the active slate for top `2-Leg`, `3-Leg`, or `4-Leg` combinations (uncorrelated by default, or with **Allow SGP** enabled), then load any suggestion into the builder or log directly to the Ledger under the `PARLAY` strategy tag.
+
+

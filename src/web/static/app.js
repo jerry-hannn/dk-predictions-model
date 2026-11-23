@@ -1,5 +1,15 @@
 // DKeX & Traditional DK/FD — Minimalist UI-First Client
 
+function loadSavedParlaySlip(modeKey) {
+  try {
+    const raw = localStorage.getItem(`dkex_parlay_${modeKey}`);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.slice(0, 12) : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 const state = {
   traditionalMode: false,
   mode: 'all',
@@ -26,11 +36,22 @@ const state = {
   authEnabled: false,
   authenticated: true,
   serverConfig: {},
+  parlay: {
+    predictions: loadSavedParlaySlip('predictions'),
+    sportsbook: loadSavedParlaySlip('sportsbook'),
+    pricingStructure: 'COMBO_CONTRACT',
+    suggestLegs: 2,
+    suggestions: [],
+    correlationOverrides: {},
+    lastEval: null,
+    slateSearch: '',
+  },
 };
 
 let bannerTimer = null;
 let autoRefreshTimer = null;
 let calcDebounceTimer = null;
+let parlayEvalTimer = null;
 
 // --- Theme Management ---
 const themeToggleBtn = document.getElementById('theme-toggle-btn');
@@ -270,6 +291,11 @@ function selectTab(selected) {
   if (selected.id === 'tab-strategies' && state.traditionalMode) {
     renderStrategies();
   }
+  if (selected.id === 'tab-parlay') {
+    renderParlayBuilder();
+    evaluateActiveParlay();
+  }
+  updateParlayFloatingBar();
 }
 
 tabs.forEach((tab, idx) => {
@@ -502,6 +528,7 @@ function applyWorkspaceMode() {
     ? 'Log Sportsbook Bet'
     : 'Log DKeX Position';
 
+  syncParlayModeUI();
   updateHeaderChip();
 }
 
@@ -783,6 +810,10 @@ document.getElementById('settings-form').addEventListener('submit', async (e) =>
       }
       if (!document.getElementById('panel-ledger').hidden) loadLedger();
       if (!document.getElementById('panel-backtest').hidden) loadBacktest();
+      if (!document.getElementById('panel-parlay').hidden || getParlayLegs().length > 0) {
+        renderParlayBuilder();
+        evaluateActiveParlay();
+      }
       showBanner(
         state.traditionalMode
           ? 'Switched to Traditional DraftKings & FanDuel Sportsbooks mode.'
@@ -1008,6 +1039,7 @@ async function loadPicks() {
       updateSlateMetaBar();
       renderPicks();
       renderStrategies();
+      renderParlaySlatePicker();
       return;
     }
 
@@ -1037,6 +1069,7 @@ async function loadPicks() {
     updateKPIs(data.ledger_summary, state.picks);
     updateSlateMetaBar();
     renderPicks();
+    renderParlaySlatePicker();
   } catch (err) {
     if (ctrl !== picksAbortCtrl || isSilentError(err)) return;
     console.error('Failed loading markets:', err);
@@ -1229,7 +1262,10 @@ function buildPickCardInnerHtml(p, idx) {
           <span class="cents-suffix" aria-hidden="true">¢</span>
         </div>
       </div>
-      <button type="button" class="${btnCls}" data-idx="${idx}">${btnLabel}</button>
+      <div class="pick-action-btns">
+        <button type="button" class="btn btn-secondary btn-sm btn-parlay-toggle ${isPickInParlay(p) ? 'is-added' : ''}" data-parlay-idx="${idx}" aria-pressed="${isPickInParlay(p)}">${isPickInParlay(p) ? '✓ Parlay' : '+ Parlay'}</button>
+        <button type="button" class="${btnCls}" data-idx="${idx}">${btnLabel}</button>
+      </div>
     </div>
   `;
 }
@@ -1439,6 +1475,12 @@ function submitCardInput(inp) {
 // re-attaching listeners to every control on each render.
 function bindPicksDelegation(container) {
   container.addEventListener('click', (e) => {
+    const parlayBtn = e.target.closest('.btn-parlay-toggle');
+    if (parlayBtn && container.contains(parlayBtn)) {
+      const idx = parseInt(parlayBtn.dataset.parlayIdx, 10);
+      togglePickInParlayByIndex(idx);
+      return;
+    }
     const logBtn = e.target.closest('.log-trade-btn');
     if (logBtn && container.contains(logBtn)) {
       const idx = parseInt(logBtn.dataset.idx, 10);
@@ -1577,7 +1619,10 @@ function buildSportsbookCardInnerHtml(p, idx) {
       <span class="mono" style="font-size:0.75rem;color:var(--text-secondary);">
         ${p.recommended_stake > 0 ? `Kelly $${p.recommended_stake.toFixed(2)} → +$${p.potential_profit.toFixed(2)} win` : `Edge ${evSign}${(p.prob_edge * 100).toFixed(1)}%`}
       </span>
-      <button type="button" class="${btnCls}" data-sb-idx="${idx}">${btnLbl}</button>
+      <div class="pick-action-btns">
+        <button type="button" class="btn btn-secondary btn-sm btn-parlay-toggle ${isPickInParlay(p) ? 'is-added' : ''}" data-parlay-idx="${idx}" aria-pressed="${isPickInParlay(p)}">${isPickInParlay(p) ? '✓ Parlay' : '+ Parlay'}</button>
+        <button type="button" class="${btnCls}" data-sb-idx="${idx}">${btnLbl}</button>
+      </div>
     </div>
   `;
 }
@@ -1642,6 +1687,7 @@ function renderPicks() {
             ? `<span class="live-indicator"><span class="live-dot"></span>${escapeHtml(p.score_display || p.status_detail || 'LIVE')}</span>`
             : `${escapeHtml(p.short_name || p.event_name)}${startTxt ? ` <span class="muted">· ${escapeHtml(startTxt)}</span>` : ''}`;
           const stakeDisp = Number(p.recommended_stake) > 0 ? `$${toFixedSafe(p.recommended_stake, 0)}` : '—';
+          const inParlay = isPickInParlay(p);
           return `
             <tr>
               <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${escapeHtml(p.confidence_score ?? '')}</span></td>
@@ -1653,7 +1699,12 @@ function renderPicks() {
               <td class="num-col">${pctSafe(p.model_prob, 1)}%</td>
               <td class="num-col ${evCls}">${evSign}${pctSafe(p.ev_pct, 1)}%</td>
               <td class="num-col">${stakeDisp}</td>
-              <td><button type="button" class="btn btn-secondary btn-sm log-sb-pick-btn" data-sb-idx="${idx}" aria-label="Log ${escapeHtml(p.selection_label)} on ${escapeHtml(venueDisplayName(p.book))}">Log</button></td>
+              <td>
+                <div class="row-actions">
+                  <button type="button" class="btn btn-secondary btn-sm btn-parlay-toggle ${inParlay ? 'is-added' : ''}" data-parlay-idx="${idx}" aria-pressed="${inParlay}">${inParlay ? '✓' : '+P'}</button>
+                  <button type="button" class="btn btn-secondary btn-sm log-sb-pick-btn" data-sb-idx="${idx}" aria-label="Log ${escapeHtml(p.selection_label)} on ${escapeHtml(venueDisplayName(p.book))}">Log</button>
+                </div>
+              </td>
             </tr>`;
         })
         .join('');
@@ -1680,6 +1731,7 @@ function renderPicks() {
           ? ` <button type="button" class="line-reset-btn" data-reset-idx="${idx}" title="Reset to synced line (${syncedLine})" aria-label="Reset ${escapeHtml(p.selection_label)} to synced line ${syncedLine}">↺</button>`
           : '';
         const qty = Math.max(1, p.recommended_contracts || 1);
+        const inParlay = isPickInParlay(p);
         return `
           <tr>
             <td><span class="${tierPillClass(p.confidence_tier)}">${escapeHtml(p.confidence_tier)} ${escapeHtml(p.confidence_score ?? '')}</span></td>
@@ -1691,7 +1743,12 @@ function renderPicks() {
             <td class="num-col">${pctSafe(p.model_prob, 1)}%</td>
             <td class="num-col ${edgeCls}">${edgeSign}${pctSafe(p.net_edge, 1)}%</td>
             <td class="num-col">${p.recommended_contracts ?? 0}x ($${toFixedSafe(p.recommended_outlay, 2)})</td>
-            <td><button type="button" class="btn btn-secondary btn-sm log-trade-btn" data-idx="${idx}" aria-label="Log ${qty}x ${escapeHtml(p.recommended_side)} ${escapeHtml(p.selection_label)}">Log ${qty}x</button></td>
+            <td>
+              <div class="row-actions">
+                <button type="button" class="btn btn-secondary btn-sm btn-parlay-toggle ${inParlay ? 'is-added' : ''}" data-parlay-idx="${idx}" aria-pressed="${inParlay}">${inParlay ? '✓' : '+P'}</button>
+                <button type="button" class="btn btn-secondary btn-sm log-trade-btn" data-idx="${idx}" aria-label="Log ${qty}x ${escapeHtml(p.recommended_side)} ${escapeHtml(p.selection_label)}">Log ${qty}x</button>
+              </div>
+            </td>
           </tr>
         `;
       })
@@ -2592,7 +2649,7 @@ function renderLedgerRows() {
         : `${t.contracts ?? 0} @ ${pctSafe(t.entry_price, 1)}¢`;
       const stratBadge =
         t.strategy_tag && t.strategy_tag !== 'EV'
-          ? ` <span class="strat-pill">${escapeHtml(t.strategy_tag)}</span>`
+          ? ` <span class="strat-pill ${t.strategy_tag === 'PARLAY' ? 'strat-parlay' : ''}">${escapeHtml(t.strategy_tag)}</span>`
           : '';
       const vBadge = state.traditionalMode || (t.venue && t.venue !== 'DKEX') ? `${venueBadgeHtml(t.venue)} ` : '';
       const statusUpper = String(t.status || '').toUpperCase();
@@ -3133,10 +3190,1078 @@ async function refreshLiveLines(silent = false) {
 
 document.getElementById('refresh-live-btn').addEventListener('click', () => refreshLiveLines(false));
 
+// --- Parlay Builder (Predictions DKeX & Traditional DK/FD Sportsbooks) ---
+function activeParlayMode() {
+  return state.traditionalMode ? 'sportsbook' : 'predictions';
+}
+
+function getParlayLegs() {
+  return state.parlay[activeParlayMode()] || [];
+}
+
+function persistParlaySlip(modeKey) {
+  try {
+    localStorage.setItem(`dkex_parlay_${modeKey}`, JSON.stringify(state.parlay[modeKey] || []));
+  } catch (_) {}
+}
+
+function setParlayLegs(nextLegs, { resetCorrelations = false } = {}) {
+  const mk = activeParlayMode();
+  state.parlay[mk] = nextLegs.slice(0, 12);
+  if (resetCorrelations) state.parlay.correlationOverrides = {};
+  persistParlaySlip(mk);
+  updateParlayCountBadge();
+  syncMarketParlayButtons();
+  renderParlaySlatePicker();
+  renderParlayLegs();
+  updateParlayFloatingBar();
+  scheduleParlayEvaluation(40);
+}
+
+function pickKeyForParlay(pick) {
+  if (!pick) return '';
+  return String(
+    pick.pick_id ||
+      pick.leg_id ||
+      `${pick.sport || 'NBA'}:${pick.event_id || pick.event_name}:${pick.market_type}:${pick.selection_label}`
+  );
+}
+
+function isPickInParlay(pick) {
+  const key = pickKeyForParlay(pick);
+  if (!key) return false;
+  return getParlayLegs().some((lg) => lg.leg_id === key);
+}
+
+function pickToParlayLeg(pick) {
+  const key = pickKeyForParlay(pick);
+  const isSb = state.traditionalMode;
+  if (isSb) {
+    return {
+      leg_id: key,
+      sport: pick.sport || 'NBA',
+      event_id: String(pick.event_id || pick.short_name || pick.event_name || ''),
+      event_name: pick.event_name || pick.short_name || 'Matchup',
+      short_name: pick.short_name || pick.event_name || 'Matchup',
+      market_type: pick.market_type || 'Moneyline',
+      selection_label: pick.selection_label || 'Selection',
+      side: String(pick.side || 'HOME').toUpperCase(),
+      model_prob: Number(pick.model_prob || 0.55),
+      conservative_prob: pick.conservative_prob != null ? Number(pick.conservative_prob) : null,
+      anchor_prob: pick.market_prob != null ? Number(pick.market_prob) : null,
+      player_name: pick.player_name || null,
+      line_value: pick.line_value != null ? Number(pick.line_value) : null,
+      book: pick.book || 'DRAFTKINGS',
+      american_odds: pick.american_odds != null ? Math.round(Number(pick.american_odds)) : -110,
+      dk_odds: pick.dk_odds != null ? Math.round(Number(pick.dk_odds)) : null,
+      fd_odds: pick.fd_odds != null ? Math.round(Number(pick.fd_odds)) : null,
+      is_live: pick.game_state === 'LIVE' || Boolean(pick.is_live),
+    };
+  }
+  return {
+    leg_id: key,
+    sport: pick.sport || 'NBA',
+    event_id: String(pick.event_id || pick.short_name || pick.event_name || ''),
+    event_name: pick.event_name || pick.short_name || 'Matchup',
+    short_name: pick.short_name || pick.event_name || 'Matchup',
+    market_type: pick.market_type || 'Moneyline',
+    selection_label: pick.selection_label || 'Selection',
+    side: String(pick.recommended_side || pick.side || 'YES').toUpperCase(),
+    model_prob: Number(pick.model_prob || 0.55),
+    conservative_prob: pick.conservative_prob != null ? Number(pick.conservative_prob) : null,
+    anchor_prob: pick.market_prob != null ? Number(pick.market_prob) : null,
+    player_name: pick.player_name || null,
+    line_value: pick.line_value != null ? Number(pick.line_value) : null,
+    contract_price: Number(pick.contract_price ?? 0.50),
+    fee_per_contract: Number(pick.fee_per_contract ?? getFee()),
+    is_live: pick.game_state === 'LIVE' || Boolean(pick.is_live),
+  };
+}
+
+function togglePickInParlayByIndex(idx) {
+  const pick = state.picks[idx];
+  if (!pick) return;
+  const key = pickKeyForParlay(pick);
+  const current = getParlayLegs();
+  const existsIdx = current.findIndex((lg) => lg.leg_id === key);
+  if (existsIdx >= 0) {
+    const next = current.filter((_, i) => i !== existsIdx);
+    setParlayLegs(next);
+    showBanner(`Removed "${pick.selection_label}" from parlay slip (${next.length} legs).`);
+  } else {
+    if (current.length >= 12) {
+      showBanner('Parlay slip supports up to 12 legs.', true);
+      return;
+    }
+    const next = [...current, pickToParlayLeg(pick)];
+    setParlayLegs(next);
+    showBanner(`Added "${pick.selection_label}" to parlay slip (${next.length} legs).`);
+  }
+}
+
+function updateParlayCountBadge() {
+  const legs = getParlayLegs();
+  const badge = document.getElementById('parlay-count-badge');
+  if (badge) {
+    badge.textContent = String(legs.length);
+    badge.hidden = legs.length === 0;
+  }
+  const cntEl = document.getElementById('parlay-leg-count');
+  if (cntEl) cntEl.textContent = String(legs.length);
+}
+
+function syncMarketParlayButtons() {
+  document.querySelectorAll('.btn-parlay-toggle').forEach((btn) => {
+    const idx = parseInt(btn.dataset.parlayIdx, 10);
+    const p = state.picks[idx];
+    if (!p) return;
+    const inSlip = isPickInParlay(p);
+    btn.classList.toggle('is-added', inSlip);
+    btn.setAttribute('aria-pressed', String(inSlip));
+    const isCompact = btn.closest('td') !== null;
+    btn.textContent = isCompact ? (inSlip ? '✓' : '+P') : (inSlip ? '✓ Parlay' : '+ Parlay');
+  });
+}
+
+function updateParlayFloatingBar() {
+  const bar = document.getElementById('parlay-floating-bar');
+  if (!bar) return;
+  const legs = getParlayLegs();
+  const onParlayTab = !document.getElementById('panel-parlay').hidden;
+  if (!legs.length || onParlayTab) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const title = document.getElementById('parlay-float-title');
+  const stats = document.getElementById('parlay-float-stats');
+  title.textContent = `Parlay Slip (${legs.length} ${legs.length === 1 ? 'leg' : 'legs'})`;
+  const ev = state.parlay.lastEval;
+  if (ev && ev.mode === activeParlayMode() && ev.num_legs === legs.length) {
+    if (ev.has_conflicts) {
+      stats.textContent = 'Conflict detected — open builder';
+      stats.className = 'mono negative';
+    } else if (ev.mode === 'sportsbook') {
+      const evSign = ev.ev_pct >= 0 ? '+' : '';
+      stats.textContent = `${formatAmerican(ev.effective_american_odds)} · ${evSign}${(ev.ev_pct * 100).toFixed(1)}% EV · Win ${(ev.joint_model_prob * 100).toFixed(1)}%`;
+      stats.className = `mono ${ev.ev_pct >= 0 ? 'positive' : 'negative'}`;
+    } else {
+      const edgeSign = ev.net_edge >= 0 ? '+' : '';
+      stats.textContent = `${(ev.combo_ask_price * 100).toFixed(1)}¢ (${formatAmerican(ev.american_equivalent)}) · ${edgeSign}${(ev.net_edge * 100).toFixed(1)}% Edge`;
+      stats.className = `mono ${ev.net_edge >= 0 ? 'positive' : 'negative'}`;
+    }
+  } else {
+    stats.textContent = legs.length === 1 ? 'Add 1+ more leg to price parlay' : 'Pricing parlay...';
+    stats.className = 'mono';
+  }
+}
+
+function syncParlayModeUI() {
+  const isTrad = state.traditionalMode;
+  const heading = document.getElementById('parlay-heading');
+  const sub = document.getElementById('parlay-sub');
+  const pill = document.getElementById('parlay-mode-pill');
+  if (heading) {
+    heading.textContent = isTrad
+      ? 'DraftKings & FanDuel Parlay & SGP Builder'
+      : 'DKeX Predictions Parlay & Combo Builder';
+  }
+  if (sub) {
+    sub.textContent = isTrad
+      ? 'Compare combined DK vs. FD parlay odds, apply Profit Boosts or Bonus Bets, model SGP correlations, and size with Fractional Kelly.'
+      : 'Combine binary event contracts into fee-adjusted Combo Contracts or Sequential Rollovers with SGP correlation modeling and Fractional Kelly sizing.';
+  }
+  if (pill) {
+    pill.textContent = isTrad ? 'DK · FD Sportsbooks' : 'DKeX Predictions';
+    pill.className = `venue-pill ${isTrad ? 'venue-dk' : 'venue-dkex'}`;
+  }
+
+  document.getElementById('parlay-dkex-controls').hidden = isTrad;
+  document.getElementById('parlay-sb-controls').hidden = !isTrad;
+  document.getElementById('pl-custom-dkex-fields').hidden = isTrad;
+  document.getElementById('pl-custom-sb-fields').hidden = !isTrad;
+
+  state.parlay.suggestions = [];
+  state.parlay.correlationOverrides = {};
+  state.parlay.lastEval = null;
+
+  const sugGrid = document.getElementById('parlay-suggestions-grid');
+  if (sugGrid) {
+    sugGrid.innerHTML =
+      '<div class="empty-state" style="grid-column:1/-1;padding:1.5rem;"><p>Click <strong>Generate +EV Parlays</strong> to scan your active slate for optimal multi-leg combinations.</p></div>';
+  }
+
+  updateParlayCountBadge();
+  renderParlayBuilder();
+  if (getParlayLegs().length > 0) {
+    scheduleParlayEvaluation(30);
+  }
+  updateParlayFloatingBar();
+}
+
+function renderParlayBuilder() {
+  updateParlayCountBadge();
+  renderParlayLegs();
+  renderParlaySlatePicker();
+  if (!getParlayLegs().length) {
+    renderEmptyParlayEvaluation();
+  }
+}
+
+function renderEmptyParlayEvaluation() {
+  state.parlay.lastEval = null;
+  document.getElementById('parlay-conflicts').hidden = true;
+  document.getElementById('parlay-correlations-wrap').hidden = true;
+  document.getElementById('parlay-sgp-badge').hidden = true;
+  document.getElementById('parlay-book-compare').hidden = true;
+  document.getElementById('parlay-verdict-title').textContent = 'Add 2+ legs to price parlay';
+  document.getElementById('parlay-verdict-title').className = 'verdict-title';
+  document.getElementById('parlay-verdict-sub').textContent = state.traditionalMode
+    ? 'Combined DK/FD odds, SGP correlation adjustment & Fractional Kelly sizing'
+    : 'Fee-adjusted combo pricing, SGP correlation adjustment & Quarter-Kelly sizing';
+  const pill = document.getElementById('parlay-tier-pill');
+  pill.textContent = '—';
+  pill.className = 'tier-pill';
+  document.getElementById('parlay-output-body').innerHTML =
+    '<div class="kv-row"><span>Status</span><strong>Add at least 2 legs to evaluate</strong></div>';
+  document.getElementById('parlay-log-btn').disabled = true;
+}
+
+function renderParlayLegs() {
+  const container = document.getElementById('parlay-legs-list');
+  if (!container) return;
+  const legs = getParlayLegs();
+  const isTrad = state.traditionalMode;
+  const evalData = state.parlay.lastEval && state.parlay.lastEval.mode === activeParlayMode() ? state.parlay.lastEval : null;
+
+  if (!legs.length) {
+    container.innerHTML = `
+      <div class="empty-state" style="padding: 1.5rem 1rem;">
+        <h3>Your parlay slip is empty</h3>
+        <p>Click <strong>+ Parlay</strong> on any Market card, add from the slate picker below, or run <strong>Generate +EV Parlays</strong>.</p>
+      </div>`;
+    return;
+  }
+
+  // Track which indices have error conflicts or share a game (SGP)
+  const conflictIndices = new Set();
+  if (evalData && Array.isArray(evalData.conflicts)) {
+    evalData.conflicts.forEach((c) => {
+      if (c.severity === 'ERROR') (c.leg_indices || []).forEach((i) => conflictIndices.add(i));
+    });
+  }
+  const eventCounts = {};
+  legs.forEach((lg) => {
+    const k = String(lg.event_id || lg.short_name || lg.event_name);
+    eventCounts[k] = (eventCounts[k] || 0) + 1;
+  });
+
+  container.innerHTML = legs
+    .map((lg, idx) => {
+      const evKey = String(lg.event_id || lg.short_name || lg.event_name);
+      const isSgpLeg = (eventCounts[evKey] || 0) > 1;
+      const hasConf = conflictIndices.has(idx);
+      const diag = evalData && evalData.legs && evalData.legs[idx] ? evalData.legs[idx] : null;
+
+      let evBadgeHtml = '';
+      if (diag) {
+        if (isTrad) {
+          const v = Number(diag.ev_pct || 0);
+          evBadgeHtml = `<span class="${v >= 0 ? 'positive' : 'negative'}">${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}% EV</span>${diag.is_parlay_tax ? '<span class="strat-pill strat-middle" title="Negative-EV leg drags down parlay expected return">TAX</span>' : ''}`;
+        } else {
+          const v = Number(diag.net_edge || 0);
+          evBadgeHtml = `<span class="${v >= 0 ? 'positive' : 'negative'}">${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}% Edge</span>${diag.is_parlay_tax ? '<span class="strat-pill strat-middle" title="Negative-edge leg drags down combo EV">TAX</span>' : ''}`;
+        }
+      }
+
+      const controlsHtml = isTrad
+        ? `
+          <div class="parlay-leg-inputs">
+            <label class="parlay-mini-field">
+              <span>Odds</span>
+              <input type="number" step="1" class="parlay-mini-input pl-leg-odds" data-leg-idx="${idx}" value="${Math.round(Number(lg.american_odds ?? lg.dk_odds ?? lg.fd_odds ?? -110))}" aria-label="American odds for ${escapeHtml(lg.selection_label)}">
+            </label>
+            <label class="parlay-mini-field">
+              <span>Win %</span>
+              <input type="number" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-prob" data-leg-idx="${idx}" value="${Number((Number(lg.model_prob || 0.55) * 100).toFixed(1))}" aria-label="Win probability for ${escapeHtml(lg.selection_label)}">
+            </label>
+          </div>`
+        : `
+          <div class="parlay-leg-inputs">
+            <select class="parlay-mini-select pl-leg-side" data-leg-idx="${idx}" aria-label="Contract side for ${escapeHtml(lg.selection_label)}">
+              <option value="YES" ${String(lg.side).toUpperCase() === 'YES' ? 'selected' : ''}>YES</option>
+              <option value="NO" ${String(lg.side).toUpperCase() === 'NO' ? 'selected' : ''}>NO</option>
+            </select>
+            <label class="parlay-mini-field">
+              <span>Ask ¢</span>
+              <input type="number" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-ask" data-leg-idx="${idx}" value="${Number((Number(lg.contract_price ?? 0.5) * 100).toFixed(1))}" aria-label="Contract ask cents for ${escapeHtml(lg.selection_label)}">
+            </label>
+            <label class="parlay-mini-field">
+              <span>Win %</span>
+              <input type="number" min="1" max="99" step="0.5" class="parlay-mini-input pl-leg-prob" data-leg-idx="${idx}" value="${Number((Number(lg.model_prob || 0.55) * 100).toFixed(1))}" aria-label="Win probability for ${escapeHtml(lg.selection_label)}">
+            </label>
+          </div>`;
+
+      const bookPills = isTrad
+        ? `${lg.dk_odds != null ? `<span class="mono">DK ${formatAmerican(lg.dk_odds)}</span>` : ''}${lg.fd_odds != null ? `<span class="mono">FD ${formatAmerican(lg.fd_odds)}</span>` : ''}`
+        : '';
+
+      return `
+        <div class="parlay-leg-row ${hasConf ? 'has-conflict' : ''}" data-leg-idx="${idx}">
+          <div class="parlay-leg-top">
+            <div class="parlay-leg-info">
+              <div class="parlay-leg-title">${escapeHtml(lg.selection_label)}</div>
+              <div class="parlay-leg-meta">
+                <span class="sport-label">${escapeHtml(lg.sport)}</span>
+                <span>·</span>
+                <span>${escapeHtml(lg.short_name || lg.event_name)}</span>
+                <span>·</span>
+                <span>${escapeHtml(lg.market_type)}</span>
+                ${isSgpLeg ? '<span class="strat-pill strat-middle">SGP</span>' : ''}
+                ${bookPills}
+              </div>
+            </div>
+            <button type="button" class="close-x pl-remove-leg-btn" data-leg-idx="${idx}" aria-label="Remove leg ${escapeHtml(lg.selection_label)}">&times;</button>
+          </div>
+          <div class="parlay-leg-controls">
+            ${controlsHtml}
+            <div class="parlay-leg-ev">${evBadgeHtml}</div>
+          </div>
+        </div>`;
+    })
+    .join('');
+}
+
+function renderParlaySlatePicker() {
+  const picker = document.getElementById('parlay-slate-picker');
+  if (!picker) return;
+  const q = state.parlay.slateSearch;
+  const isTrad = state.traditionalMode;
+  const rows = state.picks
+    .map((p, idx) => ({ p, idx }))
+    .filter(({ p }) => {
+      if (!q) return true;
+      const hay = `${p.selection_label} ${p.event_name} ${p.short_name || ''} ${p.market_type} ${p.sport}`.toLowerCase();
+      return hay.includes(q);
+    })
+    .slice(0, 40);
+
+  if (!rows.length) {
+    picker.innerHTML = `<p class="field-hint" style="margin:0.25rem 0;grid-column:1/-1;">${
+      state.picks.length
+        ? 'No slate lines match your search.'
+        : 'No lines loaded yet. Open Markets or enable "Show PASS lines" to load more candidates.'
+    }</p>`;
+    return;
+  }
+
+  picker.innerHTML = rows
+    .map(({ p, idx }) => {
+      const selected = isPickInParlay(p);
+      const priceTxt = isTrad
+        ? `${formatAmerican(p.american_odds)}`
+        : `${escapeHtml(p.recommended_side)} ${(Number(p.contract_price || 0.5) * 100).toFixed(0)}¢`;
+      const edgeVal = isTrad ? Number(p.ev_pct || 0) : Number(p.net_edge || 0);
+      const edgeTxt = `${edgeVal >= 0 ? '+' : ''}${(edgeVal * 100).toFixed(1)}%`;
+      return `
+        <button type="button" class="parlay-picker-item ${selected ? 'is-selected' : ''}" data-picker-idx="${idx}" aria-pressed="${selected}">
+          <div class="parlay-picker-main">
+            <span class="parlay-picker-title">${selected ? '✓ ' : ''}${escapeHtml(p.selection_label)}</span>
+            <span class="parlay-picker-sub">${escapeHtml(p.sport)} · ${escapeHtml(p.short_name || p.event_name)} · Win ${(Number(p.model_prob || 0) * 100).toFixed(0)}%</span>
+          </div>
+          <div class="parlay-picker-price">
+            <strong>${priceTxt}</strong>
+            <span class="${edgeVal >= 0 ? 'positive' : 'negative'}">${edgeTxt}</span>
+          </div>
+        </button>`;
+    })
+    .join('');
+}
+
+function renderParlayCorrelations(evalData) {
+  const wrap = document.getElementById('parlay-correlations-wrap');
+  const list = document.getElementById('parlay-correlations-list');
+  const sgpBadge = document.getElementById('parlay-sgp-badge');
+  const pairs = evalData && Array.isArray(evalData.correlation_pairs) ? evalData.correlation_pairs : [];
+
+  sgpBadge.hidden = !(evalData && evalData.is_sgp);
+  if (!pairs.length) {
+    wrap.hidden = true;
+    list.innerHTML = '';
+    return;
+  }
+
+  wrap.hidden = false;
+  list.innerHTML = pairs
+    .map((cp) => {
+      const key = `${cp.leg_a_idx}:${cp.leg_b_idx}`;
+      const rho = Number(cp.correlation || 0);
+      const rhoCls = rho > 0.05 ? 'positive' : rho < -0.05 ? 'negative' : '';
+      return `
+        <div class="parlay-corr-row">
+          <div class="parlay-corr-head">
+            <span><strong>${escapeHtml(cp.leg_a_label)}</strong> ↔ <strong>${escapeHtml(cp.leg_b_label)}</strong></span>
+            <strong class="mono ${rhoCls}" data-corr-val="${key}">ρ = ${rho >= 0 ? '+' : ''}${rho.toFixed(2)}</strong>
+          </div>
+          <div class="parlay-corr-slider-row">
+            <input type="range" min="-0.80" max="0.80" step="0.05" value="${rho.toFixed(2)}" class="pl-corr-slider" data-corr-key="${key}" aria-label="Correlation between ${escapeHtml(cp.leg_a_label)} and ${escapeHtml(cp.leg_b_label)}">
+            <span class="field-hint">${escapeHtml(cp.reason)}</span>
+          </div>
+        </div>`;
+    })
+    .join('');
+}
+
+function scheduleParlayEvaluation(delayMs = 120) {
+  if (parlayEvalTimer) clearTimeout(parlayEvalTimer);
+  parlayEvalTimer = setTimeout(() => evaluateActiveParlay(), delayMs);
+}
+
+function buildParlayEvaluatePayload(legs) {
+  const mode = activeParlayMode();
+  const payload = {
+    mode,
+    legs,
+    bankroll: getBankroll(),
+    correlation_overrides:
+      Object.keys(state.parlay.correlationOverrides).length > 0
+        ? state.parlay.correlationOverrides
+        : null,
+  };
+
+  if (mode === 'predictions') {
+    payload.pricing_structure = state.parlay.pricingStructure;
+    payload.fee_per_contract = getFee();
+    const askRaw = document.getElementById('pl-custom-combo-ask')?.value.trim() || '';
+    if (askRaw !== '' && state.parlay.pricingStructure === 'COMBO_CONTRACT') {
+      const c = parseFloat(askRaw);
+      if (Number.isFinite(c) && c >= 1 && c <= 99) payload.custom_combo_ask = c / 100;
+    }
+    const qtyRaw = document.getElementById('pl-contracts-override')?.value.trim() || '';
+    if (qtyRaw !== '') {
+      const q = parseInt(qtyRaw, 10);
+      if (Number.isInteger(q) && q >= 1) payload.contracts_override = q;
+    }
+  } else {
+    payload.book = document.getElementById('pl-sb-book')?.value || 'BEST';
+    payload.profit_boost_pct = parseFloat(document.getElementById('pl-sb-boost')?.value || '0') || 0;
+    payload.is_bonus_bet = Boolean(document.getElementById('pl-sb-bonus')?.checked);
+    const oddsRaw = document.getElementById('pl-sb-custom-odds')?.value.trim() || '';
+    if (oddsRaw !== '') {
+      const o = parseFloat(oddsRaw);
+      if (Number.isFinite(o) && Math.abs(o) >= 100) payload.custom_parlay_odds = o;
+    }
+    const stakeRaw = document.getElementById('pl-sb-stake')?.value.trim() || '';
+    if (stakeRaw !== '') {
+      const s = parseFloat(stakeRaw);
+      if (Number.isFinite(s) && s > 0) payload.stake_override = s;
+    }
+  }
+  return payload;
+}
+
+function updateParlayLegBadgesInPlace(ev) {
+  const isTrad = ev.mode === 'sportsbook';
+  const conflictIndices = new Set();
+  (ev.conflicts || []).forEach((c) => {
+    if (c.severity === 'ERROR') (c.leg_indices || []).forEach((i) => conflictIndices.add(i));
+  });
+  (ev.legs || []).forEach((diag, idx) => {
+    const row = document.querySelector(`.parlay-leg-row[data-leg-idx="${idx}"]`);
+    if (!row) return;
+    row.classList.toggle('has-conflict', conflictIndices.has(idx));
+    const evEl = row.querySelector('.parlay-leg-ev');
+    if (!evEl) return;
+    if (isTrad) {
+      const v = Number(diag.ev_pct || 0);
+      evEl.innerHTML = `<span class="${v >= 0 ? 'positive' : 'negative'}">${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}% EV</span>${diag.is_parlay_tax ? '<span class="strat-pill strat-middle" title="Negative-EV leg drags down parlay expected return">TAX</span>' : ''}`;
+    } else {
+      const v = Number(diag.net_edge || 0);
+      evEl.innerHTML = `<span class="${v >= 0 ? 'positive' : 'negative'}">${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}% Edge</span>${diag.is_parlay_tax ? '<span class="strat-pill strat-middle" title="Negative-edge leg drags down combo EV">TAX</span>' : ''}`;
+    }
+  });
+}
+
+async function evaluateActiveParlay() {
+  const legs = getParlayLegs();
+  if (!legs.length) {
+    renderEmptyParlayEvaluation();
+    updateParlayFloatingBar();
+    return;
+  }
+
+  const seq = nextSeq('parlay-eval');
+  const payload = buildParlayEvaluatePayload(legs);
+  try {
+    const ev = await apiJson('/api/parlay/evaluate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!isLatestSeq('parlay-eval', seq)) return;
+    state.parlay.lastEval = ev;
+    renderParlayEvaluationResult(ev);
+
+    const activeEl = document.activeElement;
+    const legsListEl = document.getElementById('parlay-legs-list');
+    const corrListEl = document.getElementById('parlay-correlations-list');
+    if (activeEl && legsListEl && legsListEl.contains(activeEl)) {
+      updateParlayLegBadgesInPlace(ev);
+    } else {
+      renderParlayLegs();
+    }
+    if (!(activeEl && corrListEl && corrListEl.contains(activeEl))) {
+      renderParlayCorrelations(ev);
+    }
+    updateParlayFloatingBar();
+  } catch (err) {
+    if (isLatestSeq('parlay-eval', seq)) reportError('Parlay pricing error', err);
+  }
+}
+
+function renderParlayEvaluationResult(ev) {
+  const confWrap = document.getElementById('parlay-conflicts');
+  const conflicts = ev.conflicts || [];
+  if (conflicts.length) {
+    confWrap.hidden = false;
+    confWrap.innerHTML = conflicts
+      .map(
+        (c) =>
+          `<div class="parlay-conflict-item ${c.severity === 'ERROR' ? 'is-error' : 'is-warning'}"><strong>${c.severity === 'ERROR' ? 'Conflict:' : 'Note:'}</strong> ${escapeHtml(c.message)}</div>`
+      )
+      .join('');
+  } else {
+    confWrap.hidden = true;
+    confWrap.innerHTML = '';
+  }
+
+  const verdictEl = document.getElementById('parlay-verdict-title');
+  const subEl = document.getElementById('parlay-verdict-sub');
+  const pillEl = document.getElementById('parlay-tier-pill');
+  const bookStrip = document.getElementById('parlay-book-compare');
+  const outBody = document.getElementById('parlay-output-body');
+  const logBtn = document.getElementById('parlay-log-btn');
+
+  const corrTxt =
+    Math.abs(ev.correlation_impact || 0) >= 0.001
+      ? `${pctSafe(ev.independent_model_prob, 1)}% → <strong>${pctSafe(ev.joint_model_prob, 1)}%</strong> (${ev.correlation_impact >= 0 ? '+' : ''}${pctSafe(ev.correlation_impact, 1)}% SGP)`
+      : `<strong>${pctSafe(ev.joint_model_prob, 1)}%</strong>`;
+
+  if (ev.has_conflicts) {
+    verdictEl.textContent = 'CONFLICT — Fix mutually exclusive legs';
+    verdictEl.className = 'verdict-title negative';
+    subEl.textContent = 'Remove duplicate or opposing legs in the same market';
+    pillEl.textContent = 'INVALID';
+    pillEl.className = 'tier-pill tier-pass';
+    logBtn.disabled = true;
+  } else if (ev.num_legs < 2) {
+    verdictEl.textContent = 'Add 1+ more leg to form a parlay';
+    verdictEl.className = 'verdict-title';
+    subEl.textContent = 'Single-leg preview active — add a second leg for multi-leg pricing';
+    pillEl.textContent = '1 LEG';
+    pillEl.className = 'tier-pill tier-pass';
+    logBtn.disabled = true;
+  } else {
+    logBtn.disabled = false;
+    pillEl.textContent = `${ev.confidence_tier} · ${ev.confidence_score}/100`;
+    pillEl.className = tierPillClass(ev.confidence_tier);
+
+    if (ev.mode === 'sportsbook') {
+      const bookName = venueDisplayName(ev.book);
+      verdictEl.textContent =
+        ev.confidence_tier === 'PASS'
+          ? `PASS — ${formatAmerican(ev.effective_american_odds)} on ${bookName}`
+          : `${ev.is_sgp ? 'SGP' : 'PARLAY'} ${formatAmerican(ev.effective_american_odds)} · ${bookName}`;
+      verdictEl.className = `verdict-title ${ev.confidence_tier === 'PASS' ? '' : 'positive'}`;
+      subEl.textContent = ev.is_bonus_bet
+        ? `Bonus bet retention ${pctSafe(ev.ev_pct, 1)}% expected cash yield`
+        : ev.profit_boost_pct > 0
+          ? `Boosted +${Math.round(ev.profit_boost_pct * 100)}% from ${formatAmerican(ev.raw_american_odds)} (+${pctSafe(ev.boost_ev_lift, 1)}% EV lift)`
+          : `${ev.num_legs}-leg ${ev.is_sgp ? 'Same-Game Parlay' : 'parlay'} valuation`;
+    } else {
+      const structLabel = ev.pricing_structure === 'SEQUENTIAL_ROLLOVER' ? 'Rollover' : 'Combo';
+      verdictEl.textContent =
+        ev.confidence_tier === 'PASS'
+          ? `PASS — ${structLabel} @ ${pctSafe(ev.combo_ask_price, 1)}¢`
+          : `BUY ${structLabel.toUpperCase()} @ ${pctSafe(ev.combo_ask_price, 1)}¢ · ${ev.confidence_tier}`;
+      verdictEl.className = `verdict-title ${ev.confidence_tier === 'PASS' ? '' : 'positive'}`;
+      subEl.textContent =
+        ev.pricing_structure === 'SEQUENTIAL_ROLLOVER'
+          ? `Sequential rollover across ${ev.num_legs} contracts (compounded fee drag ${pctSafe(ev.fee_drag, 2)}¢)`
+          : `Single $1.00 binary combo contract (${pctSafe(ev.fee_per_contract, 2)}¢ fee)`;
+    }
+  }
+
+  // Book Comparison Strip (Sportsbooks mode only)
+  if (ev.mode === 'sportsbook' && ev.book_comparison && (ev.book_comparison.DRAFTKINGS || ev.book_comparison.FANDUEL)) {
+    const dk = ev.book_comparison.DRAFTKINGS;
+    const fd = ev.book_comparison.FANDUEL;
+    const dkBest = ev.book === 'DRAFTKINGS';
+    const fdBest = ev.book === 'FANDUEL';
+    bookStrip.hidden = false;
+    bookStrip.innerHTML = `
+      <div class="book-odds-box ${dkBest ? 'is-best' : ''}">
+        <span>DraftKings</span>
+        <strong class="mono">${dk ? `${formatAmerican(dk.effective_american_odds)} (${dk.ev_pct >= 0 ? '+' : ''}${pctSafe(dk.ev_pct, 1)}%)${dkBest ? ' ★' : ''}` : '—'}</strong>
+      </div>
+      <div class="book-odds-box ${fdBest ? 'is-best' : ''}">
+        <span>FanDuel</span>
+        <strong class="mono">${fd ? `${formatAmerican(fd.effective_american_odds)} (${fd.ev_pct >= 0 ? '+' : ''}${pctSafe(fd.ev_pct, 1)}%)${fdBest ? ' ★' : ''}` : '—'}</strong>
+      </div>`;
+  } else {
+    bookStrip.hidden = true;
+    bookStrip.innerHTML = '';
+  }
+
+  // Detailed Valuation Key-Value Rows
+  if (ev.mode === 'sportsbook') {
+    const evCls = ev.ev_pct >= 0 ? 'positive' : 'negative';
+    const evSign = ev.ev_pct >= 0 ? '+' : '';
+    const shopRow =
+      ev.line_shopping_gain_pct != null && ev.line_shopping_gain_pct >= 0.002
+        ? `<div class="kv-row"><span>Parlay Line-Shopping Gain</span><strong class="positive">+${pctSafe(ev.line_shopping_gain_pct, 2)}% EV</strong></div>`
+        : '';
+    const boostRow =
+      ev.profit_boost_pct > 0
+        ? `<div class="kv-row"><span>Profit Boost (+${Math.round(ev.profit_boost_pct * 100)}%)</span><strong class="positive">${formatAmerican(ev.raw_american_odds)} → ${formatAmerican(ev.effective_american_odds)} (+${pctSafe(ev.boost_ev_lift, 1)}% EV)</strong></div>`
+        : '';
+    const taxRow =
+      ev.parlay_tax_legs_count > 0
+        ? `<div class="kv-row"><span>Parlay Tax Legs (-EV)</span><strong class="warning-text">${ev.parlay_tax_legs_count} of ${ev.num_legs} legs</strong></div>`
+        : '';
+
+    outBody.innerHTML = `
+      <div class="kv-row"><span>Combined Odds (${venueDisplayName(ev.book)})</span><strong>${formatAmerican(ev.effective_american_odds)} (${toFixedSafe(ev.effective_decimal_odds, 2)}x)</strong></div>
+      ${boostRow}
+      <div class="kv-row"><span>Joint True Win Probability</span><span>${corrTxt}</span></div>
+      <div class="kv-row"><span>Fair Parlay Odds vs. Implied</span><strong>${formatAmerican(ev.fair_american_odds)} vs. ${pctSafe(ev.implied_prob, 1)}%</strong></div>
+      <div class="kv-row"><span>${ev.is_bonus_bet ? 'Expected Bonus Retention' : 'Expected Parlay ROI (EV)'}</span><strong class="${evCls}">${evSign}${pctSafe(ev.ev_pct, 2)}% (${ev.ev_dollars >= 0 ? '+' : '-'}$${toFixedSafe(Math.abs(ev.ev_dollars), 2)})</strong></div>
+      ${shopRow}
+      ${taxRow}
+      <div class="kv-row"><span>Fractional Kelly Stake</span><strong>$${toFixedSafe(ev.recommended_stake, 2)} (${pctSafe(ev.kelly_fraction_applied, 2)}% bk)</strong></div>
+      <div class="kv-row"><span>Ticket Payout ($${toFixedSafe(ev.active_stake, 2)} ${ev.is_bonus_bet ? 'Bonus' : 'Stake'})</span><strong class="positive">+$${toFixedSafe(ev.potential_profit, 2)} profit ($${toFixedSafe(ev.potential_payout, 2)} total)</strong></div>
+    `;
+  } else {
+    const edgeCls = ev.net_edge >= 0 ? 'positive' : 'negative';
+    const edgeSign = ev.net_edge >= 0 ? '+' : '';
+    const taxRow =
+      ev.parlay_tax_legs_count > 0
+        ? `<div class="kv-row"><span>Negative-Edge Legs</span><strong class="warning-text">${ev.parlay_tax_legs_count} of ${ev.num_legs} legs</strong></div>`
+        : '';
+
+    outBody.innerHTML = `
+      <div class="kv-row"><span>Combo Ask / All-In Cost</span><strong>${pctSafe(ev.combo_ask_price, 1)}¢ → ${pctSafe(ev.all_in_cost, 2)}¢ (${formatAmerican(ev.american_equivalent)})</strong></div>
+      <div class="kv-row"><span>Exchange Fee Drag</span><strong>${pctSafe(ev.fee_drag, 2)}¢ / $1 contract</strong></div>
+      <div class="kv-row"><span>Joint True Win Probability</span><span>${corrTxt}</span></div>
+      <div class="kv-row"><span>Break-Even vs. Fair Odds</span><strong>${pctSafe(ev.breakeven_prob, 1)}% (${formatAmerican(ev.fair_american_odds)})</strong></div>
+      <div class="kv-row"><span>Post-Fee Net Edge / ROI</span><strong class="${edgeCls}">${edgeSign}${pctSafe(ev.net_edge, 2)}% (${ev.roi_pct >= 0 ? '+' : ''}${pctSafe(ev.roi_pct, 1)}% ROI)</strong></div>
+      <div class="kv-row"><span>Max Limit Buy Price</span><strong>${pctSafe(ev.fair_combo_max_price, 1)}¢</strong></div>
+      ${taxRow}
+      <div class="kv-row"><span>Quarter-Kelly Position</span><strong>${ev.recommended_contracts ?? 0}x ($${toFixedSafe(ev.recommended_outlay, 2)})</strong></div>
+      <div class="kv-row"><span>Ticket Payout (${ev.active_contracts}x · $${toFixedSafe(ev.active_outlay, 2)})</span><strong class="positive">+$${toFixedSafe(ev.potential_profit, 2)} profit ($${toFixedSafe(ev.potential_payout, 2)} settle)</strong></div>
+    `;
+  }
+}
+
+async function logParlayEvaluationToLedger(ev) {
+  if (!ev || ev.has_conflicts || ev.num_legs < 2) {
+    showBanner('Add at least 2 valid non-conflicting legs before logging a parlay.', true);
+    return;
+  }
+  const sports = Array.from(new Set((ev.legs || []).map((lg) => lg.sport).filter(Boolean)));
+  const sportLabel = sports.length === 1 ? sports[0] : 'MULTI';
+  const uniqueEvents = Array.from(new Set((ev.legs || []).map((lg) => lg.event_name).filter(Boolean)));
+  const eventLabel = uniqueEvents.length === 1 ? uniqueEvents[0] : `${uniqueEvents.length} Games (${ev.num_legs}-Leg)`;
+
+  let body;
+  if (ev.mode === 'sportsbook') {
+    const mktPrefix = ev.is_sgp ? 'SGP' : 'Parlay';
+    const boostSuffix = ev.profit_boost_pct > 0 ? ` (+${Math.round(ev.profit_boost_pct * 100)}% Boost)` : '';
+    body = {
+      sport: sportLabel,
+      event_name: eventLabel,
+      market_type: `${mktPrefix} (${ev.num_legs}-Leg)`,
+      selection_label: `${ev.summary_label}${boostSuffix}`,
+      side: 'PARLAY',
+      venue: ev.book,
+      bet_format: 'SPORTSBOOK',
+      odds_american: ev.effective_american_odds,
+      stake: Math.max(0.5, Number(ev.active_stake || ev.recommended_stake || 10)),
+      is_bonus_bet: Boolean(ev.is_bonus_bet),
+      model_prob: Math.min(0.999, Math.max(0.001, Number(ev.joint_model_prob))),
+      strategy_tag: 'PARLAY',
+      notes: ev.ledger_notes || '',
+    };
+  } else {
+    const mktPrefix = ev.pricing_structure === 'SEQUENTIAL_ROLLOVER' ? 'Rollover Parlay' : 'Combo Parlay';
+    const entryPx = Math.min(0.99, Math.max(0.01, Number(ev.combo_ask_price || 0.25)));
+    const feeVal = Math.min(0.10, Math.max(0.0, Number(ev.fee_per_contract ?? getFee())));
+    body = {
+      sport: sportLabel,
+      event_name: eventLabel,
+      market_type: `${mktPrefix} (${ev.num_legs}-Leg)`,
+      selection_label: ev.summary_label,
+      side: 'YES',
+      entry_price: entryPx,
+      fee_per_contract: feeVal,
+      contracts: Math.max(1, Number(ev.active_contracts || ev.recommended_contracts || 1)),
+      model_prob: Math.min(0.999, Math.max(0.001, Number(ev.joint_model_prob))),
+      fair_exit_price: Math.min(0.99, Math.max(0.01, Number(ev.joint_model_prob) + feeVal * 0.5)),
+      venue: 'DKEX',
+      bet_format: 'CONTRACT',
+      strategy_tag: 'PARLAY',
+      notes: ev.ledger_notes || '',
+    };
+  }
+
+  await postLedgerTrade(body);
+  showBanner(
+    ev.mode === 'sportsbook'
+      ? `Logged ${ev.num_legs}-leg ${venueDisplayName(ev.book)} Parlay ($${toFixedSafe(body.stake, 2)} @ ${formatAmerican(body.odds_american)}).`
+      : `Logged ${ev.num_legs}-leg DKeX Combo (${body.contracts}x @ ${pctSafe(body.entry_price, 1)}¢).`
+  );
+  await refreshLedgerAfterLog();
+}
+
+async function generateParlaySuggestions() {
+  const btn = document.getElementById('parlay-suggest-btn');
+  const grid = document.getElementById('parlay-suggestions-grid');
+  const mode = activeParlayMode();
+  const allowSgp = Boolean(document.getElementById('parlay-suggest-sgp')?.checked);
+  const payload = {
+    mode,
+    num_legs: state.parlay.suggestLegs,
+    allow_same_game: allowSgp,
+    max_results: 6,
+    sport: state.sport,
+    market: state.market,
+    timing_mode: state.mode,
+    bankroll: getBankroll(),
+    pricing_structure: state.parlay.pricingStructure,
+    fee_per_contract: getFee(),
+    book: document.getElementById('pl-sb-book')?.value || 'BEST',
+    profit_boost_pct: parseFloat(document.getElementById('pl-sb-boost')?.value || '0') || 0,
+    is_bonus_bet: Boolean(document.getElementById('pl-sb-bonus')?.checked),
+    legs_pool: state.picks.length >= state.parlay.suggestLegs ? state.picks.map(pickToParlayLeg) : null,
+  };
+
+  await withBusy(btn, async () => {
+    grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1;padding:1.5rem;"><p>Searching slate combinations for highest-EV parlays...</p></div>';
+    try {
+      const data = await apiJson('/api/parlay/suggest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      state.parlay.suggestions = data.suggestions || [];
+      renderParlaySuggestions();
+    } catch (err) {
+      reportError('Could not generate parlay suggestions', err);
+      grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;padding:1.5rem;"><p class="negative">${escapeHtml(errText(err))}</p></div>`;
+    }
+  });
+}
+
+function renderParlaySuggestions() {
+  const grid = document.getElementById('parlay-suggestions-grid');
+  const list = state.parlay.suggestions || [];
+  if (!list.length) {
+    grid.innerHTML =
+      '<div class="empty-state" style="grid-column:1/-1;padding:1.5rem;"><p>Not enough eligible games/lines on the current filter to build that leg count. Try enabling "Show PASS lines" in Markets or selecting fewer legs.</p></div>';
+    return;
+  }
+
+  grid.innerHTML = list
+    .map((s, idx) => {
+      const isSb = s.mode === 'sportsbook';
+      const metricVal = isSb ? s.ev_pct : s.roi_pct;
+      const metricSign = metricVal >= 0 ? '+' : '';
+      const headPrice = isSb
+        ? `${venueBadgeHtml(s.book)} <strong class="mono">${formatAmerican(s.effective_american_odds)}</strong>`
+        : `${venueBadgeHtml('DKEX')} <strong class="mono">${pctSafe(s.combo_ask_price, 1)}¢ (${formatAmerican(s.american_equivalent)})</strong>`;
+      const legsHtml = (s.legs || [])
+        .map(
+          (lg) => `
+            <div class="parlay-sug-leg">
+              <span><strong>${escapeHtml(lg.selection_label)}</strong> <span class="muted">(${escapeHtml(lg.event_name)})</span></span>
+              <span class="mono">${isSb ? formatAmerican(lg.american_odds) : `${escapeHtml(lg.side)} ${pctSafe(lg.contract_price, 0)}¢`} · ${pctSafe(lg.model_prob, 0)}%</span>
+            </div>`
+        )
+        .join('');
+
+      return `
+        <article class="strategy-card">
+          <div class="pick-header">
+            <div class="pick-meta">
+              <span class="strat-pill strat-parlay">${s.num_legs}-LEG${s.is_sgp ? ' SGP' : ''}</span>
+              ${headPrice}
+            </div>
+            <span class="${tierPillClass(s.confidence_tier)}">${metricSign}${pctSafe(metricVal, 1)}% ${isSb ? 'EV' : 'ROI'}</span>
+          </div>
+          <div class="parlay-sug-legs">${legsHtml}</div>
+          <div class="strategy-foot">
+            <span class="mono">Joint Win <strong>${pctSafe(s.joint_model_prob, 1)}%</strong> · ${
+              isSb
+                ? `Kelly $${toFixedSafe(s.recommended_stake, 0)}`
+                : `Edge ${s.net_edge >= 0 ? '+' : ''}${pctSafe(s.net_edge, 1)}%`
+            }</span>
+            <div class="row-actions">
+              <button type="button" class="btn btn-secondary btn-sm pl-load-sug-btn" data-sug-idx="${idx}">Load</button>
+              <button type="button" class="btn btn-primary btn-sm pl-log-sug-btn" data-sug-idx="${idx}">Log</button>
+            </div>
+          </div>
+        </article>`;
+    })
+    .join('');
+}
+
+// --- Parlay Event Listeners ---
+document.querySelectorAll('[data-pl-struct]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    state.parlay.pricingStructure = btn.dataset.plStruct;
+    setSegActive(document.querySelectorAll('[data-pl-struct]'), btn);
+    document.getElementById('pl-custom-combo-ask-wrap').hidden =
+      state.parlay.pricingStructure !== 'COMBO_CONTRACT';
+    evaluateActiveParlay();
+  });
+});
+
+document.querySelectorAll('[data-pl-suggest-legs]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    state.parlay.suggestLegs = parseInt(btn.dataset.plSuggestLegs, 10) || 2;
+    setSegActive(document.querySelectorAll('[data-pl-suggest-legs]'), btn);
+  });
+});
+
+['pl-custom-combo-ask', 'pl-contracts-override', 'pl-sb-book', 'pl-sb-boost', 'pl-sb-custom-odds', 'pl-sb-stake', 'pl-sb-bonus'].forEach((id) => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const evt = el.tagName === 'INPUT' && el.type !== 'checkbox' ? 'input' : 'change';
+  el.addEventListener(evt, () => scheduleParlayEvaluation(160));
+});
+
+['parlay-clear-btn', 'parlay-clear-top-btn', 'parlay-float-clear-btn'].forEach((id) => {
+  const el = document.getElementById(id);
+  if (el) {
+    el.addEventListener('click', () => {
+      setParlayLegs([], { resetCorrelations: true });
+      showBanner('Cleared parlay slip.');
+    });
+  }
+});
+
+document.getElementById('parlay-float-open-btn').addEventListener('click', () => {
+  selectTab(document.getElementById('tab-parlay'));
+});
+
+document.getElementById('parlay-reset-corr-btn').addEventListener('click', () => {
+  state.parlay.correlationOverrides = {};
+  evaluateActiveParlay();
+});
+
+document.getElementById('parlay-log-btn').addEventListener('click', (e) => {
+  withBusy(e.currentTarget, async () => {
+    try {
+      await logParlayEvaluationToLedger(state.parlay.lastEval);
+    } catch (err) {
+      reportError('Could not log parlay', err);
+    }
+  });
+});
+
+document.getElementById('parlay-suggest-btn').addEventListener('click', generateParlaySuggestions);
+
+// Delegated interactions inside Active Slip Legs list
+document.getElementById('parlay-legs-list').addEventListener('click', (e) => {
+  const rmBtn = e.target.closest('.pl-remove-leg-btn');
+  if (!rmBtn) return;
+  const idx = parseInt(rmBtn.dataset.legIdx, 10);
+  const next = getParlayLegs().filter((_, i) => i !== idx);
+  setParlayLegs(next, { resetCorrelations: true });
+});
+
+document.getElementById('parlay-legs-list').addEventListener('change', (e) => {
+  const el = e.target;
+  const idx = parseInt(el.dataset.legIdx, 10);
+  const legs = getParlayLegs();
+  if (!Number.isInteger(idx) || !legs[idx]) return;
+  const leg = { ...legs[idx] };
+
+  if (el.classList.contains('pl-leg-odds')) {
+    const val = Math.round(parseFloat(el.value));
+    if (!Number.isFinite(val) || Math.abs(val) < 100) {
+      showBanner('American odds must be <= -100 or >= +100.', true);
+      el.value = String(leg.american_odds ?? -110);
+      return;
+    }
+    leg.american_odds = val;
+    if (leg.book === 'FANDUEL') leg.fd_odds = val;
+    else leg.dk_odds = val;
+  } else if (el.classList.contains('pl-leg-ask')) {
+    const cents = Math.min(99, Math.max(1, parseFloat(el.value) || 50));
+    leg.contract_price = cents / 100;
+  } else if (el.classList.contains('pl-leg-side')) {
+    const nextSide = el.value === 'NO' ? 'NO' : 'YES';
+    if (nextSide !== leg.side) {
+      leg.side = nextSide;
+      leg.model_prob = Number((1 - Number(leg.model_prob || 0.5)).toFixed(4));
+      leg.contract_price = Number(Math.min(0.99, Math.max(0.01, 1 - Number(leg.contract_price || 0.5))).toFixed(3));
+      leg.conservative_prob = null;
+    }
+  } else if (el.classList.contains('pl-leg-prob')) {
+    const pct = Math.min(99, Math.max(1, parseFloat(el.value) || 55));
+    leg.model_prob = pct / 100;
+    leg.conservative_prob = null;
+  }
+
+  const next = legs.slice();
+  next[idx] = leg;
+  setParlayLegs(next);
+});
+
+// Delegated SGP Correlation Slider updates
+document.getElementById('parlay-correlations-list').addEventListener('input', (e) => {
+  const slider = e.target.closest('.pl-corr-slider');
+  if (!slider) return;
+  const key = slider.dataset.corrKey;
+  const val = parseFloat(slider.value);
+  if (!Number.isFinite(val)) return;
+  state.parlay.correlationOverrides[key] = val;
+  const lbl = document.querySelector(`[data-corr-val="${key}"]`);
+  if (lbl) lbl.textContent = `ρ = ${val >= 0 ? '+' : ''}${val.toFixed(2)}`;
+  scheduleParlayEvaluation(140);
+});
+
+// Quick-Add Slate Picker search & clicks
+document.getElementById('parlay-slate-search').addEventListener('input', (e) => {
+  state.parlay.slateSearch = e.target.value.trim().toLowerCase();
+  renderParlaySlatePicker();
+});
+
+document.getElementById('parlay-slate-picker').addEventListener('click', (e) => {
+  const btn = e.target.closest('.parlay-picker-item');
+  if (!btn) return;
+  const idx = parseInt(btn.dataset.pickerIdx, 10);
+  togglePickInParlayByIndex(idx);
+});
+
+// Custom Manual Leg Form
+document.getElementById('parlay-custom-leg-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const legs = getParlayLegs();
+  if (legs.length >= 12) {
+    showBanner('Parlay slip supports up to 12 legs.', true);
+    return;
+  }
+  const sport = document.getElementById('pl-custom-sport').value;
+  const market = document.getElementById('pl-custom-market').value;
+  const eventName = document.getElementById('pl-custom-event').value.trim();
+  const selection = document.getElementById('pl-custom-selection').value.trim();
+  const legId = `custom:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+
+  let newLeg;
+  if (state.traditionalMode) {
+    const dkOdds = parseInt(document.getElementById('pl-custom-dk-odds').value, 10);
+    const fdRaw = document.getElementById('pl-custom-fd-odds').value.trim();
+    const fdOdds = fdRaw !== '' ? parseInt(fdRaw, 10) : null;
+    if (!Number.isFinite(dkOdds) || Math.abs(dkOdds) < 100) {
+      showBanner('Enter valid American odds (<= -100 or >= +100).', true);
+      return;
+    }
+    if (fdOdds !== null && (!Number.isFinite(fdOdds) || Math.abs(fdOdds) < 100)) {
+      showBanner('FanDuel odds must be <= -100 or >= +100.', true);
+      return;
+    }
+    const prob = Math.min(99, Math.max(1, parseFloat(document.getElementById('pl-custom-prob-sb').value) || 55)) / 100;
+    newLeg = {
+      leg_id: legId,
+      sport,
+      event_id: eventName.toLowerCase(),
+      event_name: eventName,
+      short_name: eventName,
+      market_type: market,
+      selection_label: selection,
+      side: document.getElementById('pl-custom-sb-side').value,
+      model_prob: prob,
+      book: 'DRAFTKINGS',
+      american_odds: dkOdds,
+      dk_odds: dkOdds,
+      fd_odds: fdOdds,
+      is_live: false,
+    };
+  } else {
+    const ask = Math.min(99, Math.max(1, parseFloat(document.getElementById('pl-custom-ask').value) || 55)) / 100;
+    const prob = Math.min(99, Math.max(1, parseFloat(document.getElementById('pl-custom-prob-dkex').value) || 62)) / 100;
+    newLeg = {
+      leg_id: legId,
+      sport,
+      event_id: eventName.toLowerCase(),
+      event_name: eventName,
+      short_name: eventName,
+      market_type: market,
+      selection_label: selection,
+      side: document.getElementById('pl-custom-side').value,
+      model_prob: prob,
+      contract_price: ask,
+      fee_per_contract: getFee(),
+      is_live: false,
+    };
+  }
+
+  setParlayLegs([...legs, newLeg]);
+  document.getElementById('pl-custom-selection').value = '';
+  showBanner(`Added custom leg "${selection}" to parlay slip.`);
+});
+
+// Delegated handlers for Auto-Build Suggestions
+document.getElementById('parlay-suggestions-grid').addEventListener('click', (e) => {
+  const loadBtn = e.target.closest('.pl-load-sug-btn');
+  if (loadBtn) {
+    const s = state.parlay.suggestions[parseInt(loadBtn.dataset.sugIdx, 10)];
+    if (!s) return;
+    const loadedLegs = (s.legs || []).map((lg) => ({
+      leg_id: lg.leg_id,
+      sport: lg.sport,
+      event_id: lg.event_id,
+      event_name: lg.event_name,
+      short_name: lg.event_name,
+      market_type: lg.market_type,
+      selection_label: lg.selection_label,
+      side: lg.side,
+      model_prob: lg.model_prob,
+      contract_price: lg.contract_price,
+      fee_per_contract: lg.fee_per_contract,
+      book: lg.book,
+      american_odds: lg.american_odds,
+      dk_odds: lg.dk_odds,
+      fd_odds: lg.fd_odds,
+      is_live: Boolean(lg.is_live),
+    }));
+    setParlayLegs(loadedLegs, { resetCorrelations: true });
+    showBanner(`Loaded ${loadedLegs.length}-leg suggested parlay into builder.`);
+    document.getElementById('panel-parlay').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  const logBtn = e.target.closest('.pl-log-sug-btn');
+  if (logBtn) {
+    const s = state.parlay.suggestions[parseInt(logBtn.dataset.sugIdx, 10)];
+    if (!s) return;
+    withBusy(logBtn, async () => {
+      try {
+        await logParlayEvaluationToLedger(s);
+      } catch (err) {
+        reportError('Could not log suggested parlay', err);
+      }
+    });
+  }
+});
+
 // --- Boot Lifecycle ---
 async function bootWorkspace() {
   await loadServerConfig();
   await loadPicks();
+  syncParlayModeUI();
   if (state.traditionalMode) runSportsbookAnalyzer();
   else runCustomCalculator();
 }

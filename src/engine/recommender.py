@@ -27,6 +27,15 @@ from src.engine.dk_math import (
     normalize_player_name,
     prob_to_american_odds,
 )
+from src.engine.parlay_math import (
+    ParlayLeg,
+    ParlayPricingStructure,
+    evaluate_predictions_parlay,
+    evaluate_sportsbook_parlay,
+    format_parlay_notes,
+    format_parlay_summary_label,
+    suggest_optimal_parlays,
+)
 from src.engine.sportsbook_math import (
     NFL_KEY_NUMBERS,
     american_to_decimal,
@@ -3161,4 +3170,206 @@ class ModelHub:
             bonus_amount=bonus_amount,
         )
         return conv.to_dict()
+
+    @staticmethod
+    def _dict_to_parlay_leg(raw: dict[str, Any], idx: int = 0) -> ParlayLeg:
+        leg_id = str(raw.get("leg_id") or raw.get("pick_id") or f"leg_{idx}")
+        side_raw = raw.get("side") or raw.get("recommended_side") or "YES"
+        book_raw = raw.get("book") or raw.get("venue")
+        book_norm: Any = None
+        if book_raw:
+            b_u = str(book_raw).strip().upper()
+            if b_u in ("DK", "DRAFTKINGS"):
+                book_norm = "DRAFTKINGS"
+            elif b_u in ("FD", "FANDUEL"):
+                book_norm = "FANDUEL"
+            elif b_u == "DKEX":
+                book_norm = "DKEX"
+
+        is_live = bool(raw.get("is_live")) or str(raw.get("game_state") or "").upper() == "LIVE"
+        ev_name = str(raw.get("event_name") or raw.get("short_name") or "Custom Event")
+        short_name = str(raw.get("short_name") or ev_name)
+
+        return ParlayLeg(
+            leg_id=leg_id,
+            sport=str(raw.get("sport") or "NBA").upper(),
+            event_id=str(raw.get("event_id") or short_name),
+            event_name=ev_name,
+            short_name=short_name,
+            market_type=str(raw.get("market_type") or "Moneyline"),
+            selection_label=str(raw.get("selection_label") or f"Leg {idx + 1}"),
+            side=str(side_raw).upper(),
+            model_prob=float(raw.get("model_prob", 0.55)),
+            conservative_prob=(
+                float(raw["conservative_prob"])
+                if raw.get("conservative_prob") is not None
+                else None
+            ),
+            anchor_prob=(
+                float(raw["anchor_prob"])
+                if raw.get("anchor_prob") is not None
+                else (float(raw["market_prob"]) if raw.get("market_prob") is not None else None)
+            ),
+            player_name=raw.get("player_name"),
+            line_value=(
+                float(raw["line_value"]) if raw.get("line_value") is not None else None
+            ),
+            contract_price=(
+                float(raw["contract_price"]) if raw.get("contract_price") is not None else None
+            ),
+            fee_per_contract=(
+                float(raw["fee_per_contract"])
+                if raw.get("fee_per_contract") is not None
+                else None
+            ),
+            book=book_norm,
+            american_odds=(
+                int(round(float(raw["american_odds"])))
+                if raw.get("american_odds") is not None
+                else None
+            ),
+            dk_odds=(
+                int(round(float(raw["dk_odds"]))) if raw.get("dk_odds") is not None else None
+            ),
+            fd_odds=(
+                int(round(float(raw["fd_odds"]))) if raw.get("fd_odds") is not None else None
+            ),
+            is_live=is_live,
+        )
+
+    def evaluate_parlay(
+        self,
+        *,
+        mode: str,
+        legs: list[dict[str, Any]],
+        pricing_structure: ParlayPricingStructure = "COMBO_CONTRACT",
+        fee_per_contract: float | None = None,
+        custom_combo_ask: float | None = None,
+        contracts_override: int | None = None,
+        book: str = "BEST",
+        profit_boost_pct: float = 0.0,
+        is_bonus_bet: bool = False,
+        custom_parlay_odds: float | None = None,
+        stake_override: float | None = None,
+        bankroll: float | None = None,
+        correlation_overrides: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Evaluate a multi-leg parlay in either Predictions (DKeX) or Sportsbooks (DK/FD) mode."""
+        eff_bankroll = bankroll if bankroll is not None else self.settings.bankroll
+        eff_fee = fee_per_contract if fee_per_contract is not None else self.settings.default_fee_dollars
+        parsed_legs = [self._dict_to_parlay_leg(lg, idx) for idx, lg in enumerate(legs)]
+        norm_mode = str(mode or "predictions").strip().lower()
+
+        if norm_mode == "sportsbook":
+            result = evaluate_sportsbook_parlay(
+                parsed_legs,
+                book=book,
+                profit_boost_pct=profit_boost_pct,
+                is_bonus_bet=is_bonus_bet,
+                custom_parlay_odds=custom_parlay_odds,
+                stake_override=stake_override,
+                bankroll=eff_bankroll,
+                kelly_multiplier=self.settings.kelly_fraction,
+                max_bet_pct=self.settings.max_single_bet_pct,
+                min_ev_edge=self.settings.min_sb_ev_edge,
+                correlation_overrides=correlation_overrides,
+            )
+        else:
+            result = evaluate_predictions_parlay(
+                parsed_legs,
+                pricing_structure=pricing_structure,
+                fee_per_contract=eff_fee,
+                custom_combo_ask=custom_combo_ask,
+                contracts_override=contracts_override,
+                bankroll=eff_bankroll,
+                kelly_multiplier=self.settings.kelly_fraction,
+                max_bet_pct=self.settings.max_single_bet_pct,
+                min_net_edge=min(self.settings.min_net_edge, 0.015),
+                correlation_overrides=correlation_overrides,
+            )
+
+        result["summary_label"] = format_parlay_summary_label(result["legs"])
+        result["ledger_notes"] = format_parlay_notes(result)
+        return result
+
+    def suggest_parlays(
+        self,
+        *,
+        mode: str,
+        num_legs: int = 2,
+        allow_same_game: bool = False,
+        max_results: int = 6,
+        sport: str = "all",
+        market_filter: str = "all",
+        timing_mode: str = "all",
+        book: str = "BEST",
+        target_date: str | None = None,
+        pricing_structure: ParlayPricingStructure = "COMBO_CONTRACT",
+        fee_per_contract: float | None = None,
+        profit_boost_pct: float = 0.0,
+        is_bonus_bet: bool = False,
+        bankroll: float | None = None,
+        live_props: bool = True,
+        legs_pool: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Auto-build optimal +EV N-leg parlays from either a provided legs pool or the active slate."""
+        eff_bankroll = bankroll if bankroll is not None else self.settings.bankroll
+        eff_fee = fee_per_contract if fee_per_contract is not None else self.settings.default_fee_dollars
+        norm_mode = "sportsbook" if str(mode or "").strip().lower() == "sportsbook" else "predictions"
+
+        if legs_pool is not None:
+            raw_pool = legs_pool
+        elif norm_mode == "sportsbook":
+            slate = self.generate_sportsbook_slate(
+                sport=sport,
+                market_filter=market_filter,
+                mode=timing_mode,
+                book_filter="all" if book.upper() == "BEST" else book.lower(),
+                target_date=target_date,
+                bankroll=eff_bankroll,
+                include_passes=True,
+                live_props=live_props,
+            )
+            raw_pool = slate.get("picks", [])
+        else:
+            raw_pool = self.generate_picks(
+                sport=sport,
+                market_filter=market_filter,
+                mode=timing_mode,
+                target_date=target_date,
+                fee_per_contract=eff_fee,
+                bankroll=eff_bankroll,
+                include_passes=True,
+                live_props=live_props,
+            )
+
+        parsed_pool = [self._dict_to_parlay_leg(p, idx) for idx, p in enumerate(raw_pool)]
+        suggestions = suggest_optimal_parlays(
+            parsed_pool,
+            mode=norm_mode,  # type: ignore[arg-type]
+            num_legs=num_legs,
+            allow_same_game=allow_same_game,
+            max_results=max_results,
+            bankroll=eff_bankroll,
+            kelly_multiplier=self.settings.kelly_fraction,
+            max_bet_pct=self.settings.max_single_bet_pct,
+            pricing_structure=pricing_structure,
+            fee_per_contract=eff_fee,
+            book=book,
+            profit_boost_pct=profit_boost_pct,
+            is_bonus_bet=is_bonus_bet,
+        )
+        for s in suggestions:
+            s["summary_label"] = format_parlay_summary_label(s["legs"])
+            s["ledger_notes"] = format_parlay_notes(s)
+
+        return {
+            "mode": norm_mode,
+            "num_legs": max(2, min(4, int(num_legs))),
+            "allow_same_game": allow_same_game,
+            "candidates_scanned": len(parsed_pool),
+            "count": len(suggestions),
+            "suggestions": suggestions,
+        }
+
 
