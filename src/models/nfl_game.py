@@ -18,6 +18,7 @@ from sklearn.preprocessing import StandardScaler
 
 from src.models import atomic_joblib_dump
 from src.config import get_settings
+from src.data.espn_client import classify_injury_status
 from src.engine.dk_math import clamp_prob, inv_logit, logit
 
 
@@ -323,21 +324,30 @@ class NFLGameModel:
 
         if injuries_by_team:
             for team_code, sign in ((h, -1.0), (a, 1.0)):
+                qb_pen_applied = False
                 for item in injuries_by_team.get(team_code, []):
                     pos = str(item.get("position", "")).upper()
-                    status = str(item.get("status", "")).lower()
+                    raw_status = str(item.get("status", "")).lower()
+                    cls_status = classify_injury_status(item)
                     pname = item.get("player_name", "")
                     if pos == "QB":
-                        if "out" in status or "doubtful" in status:
-                            inj_adj_margin += sign * 4.5
-                            status_text = "doubtful to play" if "doubtful" in status else "out"
+                        if cls_status in ("OUT", "DOUBTFUL") and not qb_pen_applied:
+                            is_long_ir = "injured reserve" in raw_status
+                            inj_adj_margin += sign * (2.2 if is_long_ir else 4.5)
+                            qb_pen_applied = True
+                            status_text = (
+                                "on injured reserve"
+                                if is_long_ir
+                                else ("doubtful to play" if cls_status == "DOUBTFUL" else "out")
+                            )
                             drivers.append(
                                 f"{team_code} quarterback {pname} is {status_text}, which weakens their offensive outlook."
                             )
-                        elif "questionable" in status:
+                        elif cls_status == "QUESTIONABLE":
                             injury_clarity = min(injury_clarity, 0.65)
-                    elif pos in ("WR", "LT", "OT", "CB", "DE", "EDGE") and "out" in status:
-                        inj_adj_margin += sign * 0.45
+                    elif pos in ("RB", "WR", "TE", "LT", "OT", "CB", "DE", "EDGE") and cls_status == "OUT":
+                        is_long_ir = "injured reserve" in raw_status
+                        inj_adj_margin += sign * (0.25 if is_long_ir else 0.45)
 
         eff_wind = 0.0 if is_indoor else wind_mph
         eff_temp = 70.0 if is_indoor else temp_f

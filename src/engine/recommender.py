@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,8 +14,8 @@ import joblib
 from scipy.stats import norm, t as student_t
 
 from src.config import PROJECT_ROOT, Settings, get_settings
-from src.data.espn_client import ESPNClient
-from src.data.nba_loader import NBALoader
+from src.data.espn_client import ESPNClient, classify_injury_status
+from src.data.nba_loader import NBALoader, is_csv_stale
 from src.data.nfl_loader import NFLLoader
 from src.data.odds_client import OddsClient, devig_american_pair
 from src.engine.dk_math import (
@@ -168,6 +169,10 @@ _ARTIFACT_CACHE: dict[str, tuple[tuple[float, int], Any]] = {}
 _ARTIFACT_CACHE_LOCK = threading.Lock()
 # Serializes training so concurrent cold-start requests don't all retrain simultaneously.
 _TRAIN_LOCK = threading.RLock()
+# Prevents redundant background historical CSV refreshes when logs age past 18h.
+_BG_SYNC_LOCK = threading.Lock()
+_BG_SYNC_LAST_TS: float = 0.0
+_BG_SYNC_IN_FLIGHT: bool = False
 
 
 def _artifact_signature(path: Path) -> tuple[float, int]:
@@ -244,15 +249,89 @@ class ModelHub:
     def props_path(self) -> Path:
         return self.settings.models_dir / "player_props_engine.joblib"
 
+    def _stale_historical_sports(self, sport: str = "all", max_age_hours: float = 18.0) -> list[str]:
+        sp = sport.lower()
+        stale: list[str] = []
+        if sp in ("all", "nfl") and (
+            is_csv_stale(self.nfl_loader.player_logs_csv, max_age_hours)
+            or is_csv_stale(self.nfl_loader.schedules_csv, max_age_hours)
+        ):
+            stale.append("nfl")
+        if sp in ("all", "nba") and (
+            is_csv_stale(self.nba_loader.player_logs_csv, max_age_hours)
+            or is_csv_stale(self.nba_loader.games_csv, max_age_hours)
+        ):
+            stale.append("nba")
+        return stale
+
+    def _maybe_schedule_stale_data_refresh(self) -> None:
+        """
+        Outside pytest, trigger a single non-blocking background historical CSV refresh +
+        retrain whenever local player logs/schedules age past 18 hours (rate-limited to
+        at most once every 3 hours).
+        """
+        global _BG_SYNC_LAST_TS, _BG_SYNC_IN_FLIGHT
+        if "PYTEST_CURRENT_TEST" in os.environ:
+            return
+        stale_sports = self._stale_historical_sports("all", max_age_hours=18.0)
+        if not stale_sports:
+            return
+        now_ts = time.time()
+        with _BG_SYNC_LOCK:
+            if _BG_SYNC_IN_FLIGHT or (now_ts - _BG_SYNC_LAST_TS) < 10800.0:
+                return
+            _BG_SYNC_IN_FLIGHT = True
+            _BG_SYNC_LAST_TS = now_ts
+
+        def _worker() -> None:
+            global _BG_SYNC_IN_FLIGHT
+            try:
+                for lg in stale_sports:
+                    if lg == "nfl":
+                        self.nfl_loader.load_schedules(force_refresh=True)
+                        self.nfl_loader.load_player_logs(force_refresh=True)
+                    elif lg == "nba":
+                        self.nba_loader.load_games(force_refresh=True)
+                        self.nba_loader.load_player_logs(force_refresh=True)
+                target_sp = "all" if len(stale_sports) > 1 else stale_sports[0]
+                self.train_all(target_sp)
+            except Exception:
+                pass
+            finally:
+                with _BG_SYNC_LOCK:
+                    _BG_SYNC_IN_FLIGHT = False
+
+        t = threading.Thread(target=_worker, name="dk-stale-log-sync", daemon=True)
+        t.start()
+
     def refresh_live_feeds(
         self, sport: str = "all", target_date: str | None = None
     ) -> dict[str, Any]:
         """
-        Lightweight live refresh: updates ONLY live ESPN scoreboards, injuries, live box scores,
-        DraftKings player props, and live Odds API lines (skipping slow historical CSV downloads).
+        Lightweight live refresh: updates live ESPN scoreboards, injuries, live box scores,
+        DraftKings player props, and live Odds API lines. Also refreshes historical player
+        logs/schedules automatically when local CSVs are older than 18 hours.
         """
         sp = sport.lower()
         out: dict[str, Any] = {}
+        stale_refreshed: list[str] = []
+        if "PYTEST_CURRENT_TEST" not in os.environ:
+            for lg in self._stale_historical_sports(sp, max_age_hours=18.0):
+                try:
+                    if lg == "nfl":
+                        self.nfl_loader.load_schedules(force_refresh=True)
+                        self.nfl_loader.load_player_logs(force_refresh=True)
+                    elif lg == "nba":
+                        self.nba_loader.load_games(force_refresh=True)
+                        self.nba_loader.load_player_logs(force_refresh=True)
+                    stale_refreshed.append(lg)
+                except Exception:
+                    pass
+            if stale_refreshed:
+                try:
+                    self.train_all("all" if len(stale_refreshed) > 1 else stale_refreshed[0])
+                except Exception:
+                    pass
         for lg in (["NFL", "NBA"] if sp == "all" else [sp.upper()]):
             sb = self.espn.fetch_scoreboard(lg, target_date=target_date, force_refresh=True)
             live_evs = [e for e in sb if e.get("state") == "IN"]
@@ -269,6 +348,7 @@ class ModelHub:
                 "injured_teams_tracked": len(inj),
                 "espn_prop_events": len(espn_props),
                 "sharp_odds_events": len(odds),
+                "historical_logs_refreshed": lg.lower() in stale_refreshed,
             }
         out["odds_quota"] = self.odds.get_quota_status()
         return out
@@ -381,6 +461,7 @@ class ModelHub:
                 props_path = _find_artifact("player_props_engine.joblib")
                 if not (nfl_path and nba_path and props_path):
                     self.train_all("all")
+                    self._maybe_schedule_stale_data_refresh()
                     return
         if self.nfl_model is None:
             self.nfl_model = _load_cached_artifact(nfl_path, NFLGameModel.load)
@@ -388,6 +469,7 @@ class ModelHub:
             self.nba_model = _load_cached_artifact(nba_path, NBAGameModel.load)
         if self.props_engine is None:
             self.props_engine = _load_cached_artifact(props_path, joblib.load)
+        self._maybe_schedule_stale_data_refresh()
 
     def _get_upcoming_events(
         self,
@@ -1629,11 +1711,15 @@ class ModelHub:
     ) -> str:
         notes = []
         for t in (away_abbr, home_abbr):
-            important = [
-                f"{i['player_name']} ({i['status']})"
-                for i in injuries.get(t, [])
-                if any(k in str(i.get("status", "")).lower() for k in ("out", "doubtful", "questionable"))
-            ][:3]
+            important = []
+            for i in injuries.get(t, []):
+                cls_st = classify_injury_status(i)
+                if cls_st in ("OUT", "DOUBTFUL", "QUESTIONABLE"):
+                    raw_st = str(i.get("status", "") or "").strip()
+                    lbl = "Out" if (cls_st == "OUT" and "out" not in raw_st.lower() and "injured reserve" not in raw_st.lower() and "suspen" not in raw_st.lower()) else (raw_st or cls_st.title())
+                    important.append(f"{i['player_name']} ({lbl})")
+                if len(important) >= 3:
+                    break
             if important:
                 notes.append(f"{t}: {', '.join(important)}")
         return " | ".join(notes)
@@ -2022,9 +2108,21 @@ class ModelHub:
                                 ov_copy["books"] = ov_books
                                 merged_prop_mkts[norm_k] = ov_copy
                             else:
-                                # Preserve both ESPN DraftKings AND Odds API DraftKings/FanDuel books
+                                # Preserve both ESPN DraftKings AND Odds API DraftKings/FanDuel books,
+                                # but drop an unpriced/estimated ESPN DK line if it wildly disagrees with
+                                # a real Odds API FanDuel line (prevents stale/mismatched phantom arbs/middles).
                                 comb_books = dict(prev.get("books") or {})
                                 comb_books.update(ov_books)
+                                if (
+                                    "draftkings" not in ov_books
+                                    and "draftkings" in comb_books
+                                    and "fanduel" in ov_books
+                                    and comb_books["draftkings"].get("odds_estimated")
+                                ):
+                                    dk_l = float(comb_books["draftkings"].get("line") or 0.0)
+                                    fd_l = float(ov_books["fanduel"].get("line") or 0.0)
+                                    if fd_l > 0.0 and abs(dk_l - fd_l) > max(3.5, 0.20 * fd_l):
+                                        comb_books.pop("draftkings", None)
                                 comb = {**prev, **ov, "books": comb_books}
                                 if "draftkings" in comb_books and "fanduel" in comb_books:
                                     comb["source"] = "DK + FD"

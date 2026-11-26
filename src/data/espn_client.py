@@ -278,6 +278,86 @@ def _parse_made_attempted(val: str) -> tuple[float, float]:
         return 0.0, 0.0
 
 
+_INJURY_OUT_STATUS_TOKENS = (
+    "out",
+    "injured reserve",
+    "suspen",
+    "pup",
+    "nfi",
+    "inactive",
+    "season-ending",
+)
+_INJURY_CLEAR_RE = re.compile(
+    r"\b(?:cleared to play|will play|expected to play|available to play|"
+    r"off the injury report|not on the injury report|no injury designation|"
+    r"active for (?:today|tonight|sunday|monday|tuesday|wednesday|thursday|friday|saturday))\b",
+    re.I,
+)
+_INJURY_COMMENT_OUT_RE = re.compile(
+    r"\b(?:has been ruled out|was ruled out|is ruled out|ruled out|"
+    r"will not play|won't play|will sit out|sitting out|will miss|expected to miss|"
+    r"sidelined|placed on injured reserve|placed on ir|season-ending|"
+    r"out for (?:the )?(?:season|year|game|today|tonight|sunday|monday|tuesday|wednesday|thursday|friday|saturday)|"
+    r"did not travel|will not travel|not expected to play|unlikely to play|will not return)\b",
+    re.I,
+)
+_INJURY_COMMENT_QUESTIONABLE_RE = re.compile(
+    r"\b(?:questionable|game-time decision|gtd|did not practice|won't practice|will not practice)\b",
+    re.I,
+)
+_PROMOTED_STARTER_COMMENT_RE = re.compile(
+    r"\b(?:preparing to start|expected to start|slated to start|set to start|"
+    r"will start|named (?:the )?starter|starting (?:qb|quarterback|rb|running back|"
+    r"wr|wide receiver|te|tight end|center|point guard|guard|forward|in place of)|"
+    r"in line to start|step(?:ping)? into the starting|draw(?:ing)? the start|"
+    r"getting the start|make (?:his|the) start)\b",
+    re.I,
+)
+
+
+def classify_injury_status(item: dict[str, Any]) -> str:
+    """
+    Classify an ESPN injury record into 'OUT', 'DOUBTFUL', 'QUESTIONABLE', or 'ACTIVE'
+    using BOTH the structured status field (including IR, Suspension, Day-To-Day) AND
+    ESPN's `shortComment` news text (catching late scratches before status flips).
+    """
+    st = str(item.get("status", "") or "").strip().lower()
+    comment = str(item.get("comment", "") or "").strip()
+    c_low = comment.lower()
+
+    if any(tok in st for tok in _INJURY_OUT_STATUS_TOKENS) or re.search(r"\bir\b", st):
+        return "OUT"
+    if "doubtful" in st:
+        return "DOUBTFUL"
+
+    base = (
+        "QUESTIONABLE"
+        if any(tok in st for tok in ("questionable", "day-to-day", "day to day", "gtd", "game-time"))
+        else "ACTIVE"
+    )
+
+    if comment and not _INJURY_CLEAR_RE.search(comment):
+        if _INJURY_COMMENT_OUT_RE.search(comment) and "not ruled out" not in c_low:
+            return "OUT"
+        if base == "ACTIVE":
+            if "doubtful" in c_low:
+                return "DOUBTFUL"
+            if _INJURY_COMMENT_QUESTIONABLE_RE.search(comment):
+                return "QUESTIONABLE"
+
+    return base
+
+
+def is_promoted_starter_comment(item: dict[str, Any]) -> bool:
+    """Return True when an active player's ESPN news note explicitly indicates they are starting."""
+    if classify_injury_status(item) in ("OUT", "DOUBTFUL"):
+        return False
+    comment = str(item.get("comment", "") or "").strip()
+    if not comment:
+        return False
+    return bool(_PROMOTED_STARTER_COMMENT_RE.search(comment))
+
+
 class ESPNClient:
     SITE_BASE = "https://site.api.espn.com/apis/site/v2/sports"
     CORE_BASE = "https://sports.core.api.espn.com/v2/sports"
@@ -693,7 +773,7 @@ class ESPNClient:
                 if abbr and items:
                     injuries_by_team[abbr] = items
 
-            self.db.set_cache(cache_key, injuries_by_team, ttl_seconds=600)
+            self.db.set_cache(cache_key, injuries_by_team, ttl_seconds=300)
         except Exception:
             stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
             return stale or {}
@@ -781,8 +861,35 @@ class ESPNClient:
         tname = str(type_obj.get("name", "")).strip().lower()
         if not tname:
             return None
-        # Exclude alternate, quarter/half, longest, and combo markets unless explicitly mapped
-        if any(bad in tname for bad in ("alternate", "alt ", "quarter", "1st ", "2nd ", "3rd ", "4th ", "half", "longest")):
+        # Exclude alternate, milestone ladders, quarter/half, longest, and specialty/prop-novelty markets
+        if any(
+            bad in tname
+            for bad in (
+                "alternate",
+                "alt ",
+                "milestone",
+                "quarter",
+                "1st ",
+                "2nd ",
+                "3rd ",
+                "4th ",
+                "half",
+                "longest",
+                "first ",
+                "last ",
+                "anytime",
+                "exact",
+                "team ",
+                "to record",
+                "to score",
+                "to throw",
+                "to rush",
+                "to catch",
+                "to have",
+                "double",
+                "triple",
+            )
+        ):
             return None
         if sport_u == "NBA":
             if tname in ("total points, rebounds, and assists", "points + rebounds + assists"):
@@ -793,11 +900,12 @@ class ESPNClient:
                 return "rebounds"
             if tname == "total assists":
                 return "assists"
-            if "3-point" in tname or "three point" in tname:
+            if ("3-point" in tname or "three point" in tname) and "plus" not in tname and "+" not in tname:
                 return "fg3m"
             return None
         # NFL flexible matching (handles "Total Passing Yards", "Passing Yards (Incl. Overtime)", etc.)
-        if "+" in tname or " and " in tname or "rush + rec" in tname:
+        # Reject all combo markets ("+", " plus ", " and ", "rush + rec", etc.)
+        if "+" in tname or " plus " in tname or " and " in tname or "rush + rec" in tname or "combo" in tname:
             return None
         if "passing yards" in tname or "pass yards" in tname:
             return "passing_yards"
@@ -820,9 +928,13 @@ class ESPNClient:
         """
         Parse ESPN Core API DraftKings (`odds/100/propBets`) items into `(player_key, stat_col)` dicts.
         Each `(athlete_id, col, line)` group emits Over first and Under second in feed order.
+        Milestone ladders (e.g. `150+` displayValue or `Milestones` market types) are strictly excluded.
         """
         sport_u = sport.upper()
+        prop_map = ESPN_PROP_TYPE_MAP_NBA if sport_u == "NBA" else ESPN_PROP_TYPE_MAP_NFL
+        # Map `(aid, col, line_val)` -> (is_exact_type_id, list of american prices)
         grouped: dict[tuple[str, str, float], list[float | None]] = {}
+        exact_type_flag: dict[tuple[str, str, float], bool] = {}
         for item in items or []:
             if not isinstance(item, dict):
                 continue
@@ -840,10 +952,18 @@ class ESPNClient:
             if not aid:
                 continue
 
-            cur_target = ((item.get("current") or {}).get("target") or {}).get("value")
+            cur_target_obj = (item.get("current") or {}).get("target") or {}
+            cur_disp = str(cur_target_obj.get("displayValue") or "").strip()
+            # One-way milestone targets ("150+", "10+", etc.) are never two-way Over/Under lines
+            if cur_disp.endswith("+"):
+                continue
+
+            cur_target = cur_target_obj.get("value")
             odds_obj = item.get("odds") or {}
             tot_field = odds_obj.get("total")
             tot_val = tot_field.get("value") if isinstance(tot_field, dict) else tot_field
+            if isinstance(tot_field, dict) and str(tot_field.get("displayValue") or "").strip().endswith("+"):
+                continue
             line_val = _parse_line_number(cur_target if cur_target is not None else tot_val)
             if line_val is None or line_val <= 0.0:
                 continue
@@ -851,9 +971,13 @@ class ESPNClient:
             am_field = odds_obj.get("american")
             am_raw = am_field.get("value") if isinstance(am_field, dict) else am_field
             am_px = _parse_american_str(am_raw)
-            grouped.setdefault((aid, col, round(line_val, 2)), []).append(am_px)
+            gkey = (aid, col, round(line_val, 2))
+            grouped.setdefault(gkey, []).append(am_px)
+            is_exact = str(type_obj.get("id", "")).strip() in prop_map
+            exact_type_flag[gkey] = exact_type_flag.get(gkey, False) or is_exact
 
-        best_by_player_col: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+        # Rank key: (prefer real two-way priced lines, prefer exact mapped O/U type_id, lower imbalance)
+        best_by_player_col: dict[tuple[str, str], tuple[tuple[int, int, float], dict[str, Any]]] = {}
         for (aid, col, line_val), prices in grouped.items():
             pname = athlete_names.get(aid, "").strip()
             if not pname:
@@ -863,6 +987,7 @@ class ESPNClient:
             dk_over_odds: int | None = None
             dk_under_odds: int | None = None
             imbalance = 0.25
+            has_two_way_odds = False
             if len(prices) >= 2 and prices[0] is not None and prices[1] is not None:
                 po, _ = devig_american_pair(float(prices[0]), float(prices[1]))
                 over_prob = round(po, 4)
@@ -870,6 +995,7 @@ class ESPNClient:
                 dk_over_odds = int(round(float(prices[0])))
                 dk_under_odds = int(round(float(prices[1])))
                 imbalance = abs(po - 0.50)
+                has_two_way_odds = True
 
             candidate: dict[str, Any] = {
                 "line": line_val,
@@ -902,9 +1028,14 @@ class ESPNClient:
                         "odds_estimated": True,
                     }
                 }
+            rank = (
+                0 if has_two_way_odds else 1,
+                0 if exact_type_flag.get((aid, col, line_val), False) else 1,
+                imbalance,
+            )
             existing = best_by_player_col.get((aid, col))
-            if existing is None or imbalance < existing[0]:
-                best_by_player_col[(aid, col)] = (imbalance, candidate)
+            if existing is None or rank < existing[0]:
+                best_by_player_col[(aid, col)] = (rank, candidate)
 
         out_props: dict[tuple[str, str], dict[str, Any]] = {}
         for (aid, col), (_, val_obj) in best_by_player_col.items():
@@ -934,7 +1065,7 @@ class ESPNClient:
 
         sport_u = sport.upper()
         sp, lg = SPORT_PATHS[sport_u]
-        cache_key = f"espn:v3:props:{sport_u}:{eid}"
+        cache_key = f"espn:v4:props:{sport_u}:{eid}"
         if not force_refresh:
             cached = self.db.get_cache(cache_key)
             if isinstance(cached, dict):

@@ -9,7 +9,89 @@ import numpy as np
 import pandas as pd
 from scipy.stats import gamma, nbinom, poisson, t as student_t
 
+from src.data.espn_client import classify_injury_status, is_promoted_starter_comment
 from src.engine.dk_math import clamp_prob, normalize_player_name
+
+
+_ROLE_SHIFT_MIN_GAP: dict[str, float] = {
+    "passing_yards": 35.0,
+    "passing_tds": 0.55,
+    "rushing_yards": 16.0,
+    "receiving_yards": 16.0,
+    "receptions": 1.5,
+    "points": 4.5,
+    "pra": 6.5,
+    "rebounds": 2.0,
+    "assists": 2.0,
+    "fg3m": 1.0,
+}
+
+
+def _apply_market_role_shift_guard(
+    *,
+    pname: str,
+    col: str,
+    proj_mean: float,
+    eff_std: float,
+    mkt_line: float,
+    inj_clarity: float,
+    has_role_news: bool = False,
+    relief_only_qb: bool = False,
+) -> tuple[float, float, float, str | None]:
+    """
+    Detect when a verified live sportsbook line diverges sharply from a player's historical-log
+    baseline (e.g. a backup promoted into a starter role after breaking injury/lineup news, or
+    a starter returning on a minutes limit). Dampens stale-role projections toward the market,
+    widens variance, and lowers `injury_clarity` so the model does not fire blind high-edge
+    Unders on backups stepping into starter snaps/minutes.
+    """
+    if mkt_line <= 0.0:
+        return proj_mean, eff_std, inj_clarity, None
+
+    min_gap = _ROLE_SHIFT_MIN_GAP.get(col, 4.0)
+    up_gap = mkt_line - proj_mean
+    down_gap = proj_mean - mkt_line
+    up_ratio = mkt_line / max(0.5, proj_mean)
+    down_ratio = proj_mean / max(0.5, mkt_line)
+
+    # 1. Relief-only backup QB starting: historical logs are garbage-time cameos, not full starts
+    if relief_only_qb and col in ("passing_yards", "passing_tds") and up_gap > 0.0:
+        adj_mean = 0.15 * proj_mean + 0.85 * mkt_line
+        adj_std = max(eff_std, 0.30 * mkt_line)
+        adj_clarity = min(inj_clarity, 0.55)
+        note = (
+            f"Limited full-start history for {pname} means the {mkt_line:.1f} line reflects an expanded starting role."
+        )
+        return adj_mean, adj_std, adj_clarity, note
+
+    # 2. Upward role shift (backup promoted / starter out / late lineup news)
+    up_ratio_thresh = 1.22 if has_role_news else 1.38
+    up_gap_thresh = (0.65 * min_gap) if has_role_news else min_gap
+    if up_gap >= up_gap_thresh and up_ratio >= up_ratio_thresh:
+        # Severity scales with how far market sits above historical baseline (capped at 0.85)
+        sev = float(np.clip(0.52 + 0.35 * (up_ratio - up_ratio_thresh), 0.55, 0.85))
+        if has_role_news:
+            sev = min(0.88, sev + 0.10)
+        adj_mean = (1.0 - sev) * proj_mean + sev * mkt_line
+        adj_std = max(eff_std, 0.28 * mkt_line)
+        adj_clarity = min(inj_clarity, 0.58)
+        note = (
+            f"The posted {mkt_line:.1f} line sits well above {pname}'s prior-role average ({proj_mean:.1f}), signaling an expanded role or lineup change."
+        )
+        return adj_mean, adj_std, adj_clarity, note
+
+    # 3. Extreme downward role shift (minutes restriction / demotion / return from injury)
+    if down_gap >= (1.15 * min_gap) and down_ratio >= 1.48:
+        sev = float(np.clip(0.50 + 0.30 * (down_ratio - 1.48), 0.52, 0.80))
+        adj_mean = (1.0 - sev) * proj_mean + sev * mkt_line
+        adj_std = max(eff_std, 0.28 * mkt_line)
+        adj_clarity = min(inj_clarity, 0.62)
+        note = (
+            f"The posted {mkt_line:.1f} line sits well below {pname}'s prior average ({proj_mean:.1f}), signaling a reduced role or minutes limit."
+        )
+        return adj_mean, adj_std, adj_clarity, note
+
+    return proj_mean, eff_std, inj_clarity, None
 
 
 @dataclass
@@ -341,8 +423,16 @@ class PlayerPropsEngine:
     def fit(self, nfl_logs: pd.DataFrame, nba_logs: pd.DataFrame) -> None:
         from src.data.nba_loader import NBALoader
 
-        self.nfl_logs = nfl_logs.sort_values("game_order").reset_index(drop=True)
-        nba_sorted = nba_logs.sort_values("gameday").reset_index(drop=True)
+        self.nfl_logs = (
+            nfl_logs.sort_values("game_order").reset_index(drop=True)
+            if len(nfl_logs) > 0 and "game_order" in nfl_logs.columns
+            else pd.DataFrame()
+        )
+        nba_sorted = (
+            nba_logs.sort_values("gameday").reset_index(drop=True)
+            if len(nba_logs) > 0 and "gameday" in nba_logs.columns
+            else pd.DataFrame()
+        )
         if len(nba_sorted) > 0 and "position" not in nba_sorted.columns:
             ldr = NBALoader()
             nba_sorted = ldr.attach_player_positions(nba_sorted, ldr.load_player_positions())
@@ -589,37 +679,61 @@ class PlayerPropsEngine:
 
             out_names: set[str] = set()
             q_names: set[str] = set()
+            promoted_names: set[str] = set()
             if injuries_by_team:
                 for item in injuries_by_team.get(team, []):
-                    st = str(item.get("status", "")).lower()
+                    cls_st = classify_injury_status(item)
                     nm = str(item.get("player_name", "")).lower()
                     nm_norm = normalize_player_name(nm)
-                    if "out" in st or "doubtful" in st:
+                    if cls_st in ("OUT", "DOUBTFUL"):
                         out_names.add(nm)
                         if nm_norm:
                             out_names.add(nm_norm)
-                    elif "questionable" in st:
+                    elif cls_st == "QUESTIONABLE":
                         q_names.add(nm)
                         if nm_norm:
                             q_names.add(nm_norm)
+                    if is_promoted_starter_comment(item):
+                        promoted_names.add(nm)
+                        if nm_norm:
+                            promoted_names.add(nm_norm)
 
             player_summaries = (
                 t_logs.groupby("player_name", as_index=False)
-                .agg(avg_min=("minutes", "mean"), avg_pts=("points", "mean"), n=("points", "count"))
+                .agg(
+                    avg_min=("minutes", "mean"),
+                    avg_pts=("points", "mean"),
+                    n=("points", "count"),
+                    pos=("position", "last"),
+                )
                 .sort_values("avg_pts", ascending=False)
             )
-            sidelined_rows = [
-                (str(r["player_name"]), float(r["avg_pts"]))
-                for _, r in player_summaries.iterrows()
+            nba_logs_by_name = {
+                str(name): grp for name, grp in t_logs.groupby("player_name", sort=False)
+            }
+            sidelined_info: list[dict[str, Any]] = []
+            for _, r in player_summaries.iterrows():
+                s_name = str(r["player_name"])
                 if (
-                    str(r["player_name"]).lower() in out_names
-                    or normalize_player_name(str(r["player_name"])) in out_names
-                )
-                and float(r["avg_min"]) >= 22.0
-            ]
-            vacated_pts = sum(pts for _, pts in sidelined_rows)
-            sidelined_stars = [nm for nm, _ in sidelined_rows[:2]]
-            usage_boost = float(np.clip(1.0 + (vacated_pts * 0.0045), 1.0, 1.12))
+                    s_name.lower() in out_names
+                    or normalize_player_name(s_name) in out_names
+                ) and float(r["avg_min"]) >= 20.0:
+                    s_grp = nba_logs_by_name.get(s_name)
+                    s_days = (
+                        set(s_grp[s_grp["minutes"] >= 12.0]["gameday"].astype(str))
+                        if s_grp is not None
+                        else set()
+                    )
+                    sidelined_info.append(
+                        {
+                            "name": s_name,
+                            "avg_min": float(r["avg_min"]),
+                            "avg_pts": float(r["avg_pts"]),
+                            "pos": str(r.get("pos", "")).upper(),
+                            "played_days": s_days,
+                        }
+                    )
+            sidelined_stars = [s["name"] for s in sidelined_info[:2]]
 
             if live_prop_markets or custom_lines:
                 cand_rows = [
@@ -628,21 +742,23 @@ class PlayerPropsEngine:
                     if str(r["player_name"]).lower() not in out_names
                     and normalize_player_name(str(r["player_name"])) not in out_names
                     and (not recently_active or str(r["player_name"]) in recently_active)
-                    and int(r["n"]) >= 4
+                    and int(r["n"]) >= 3
                     and (
                         float(r["avg_min"]) >= 24.0
                         or (
-                            float(r["avg_min"]) >= 16.0
+                            float(r["avg_min"]) >= 12.0
                             and (
                                 _has_any_player_prop(live_prop_markets, str(r["player_name"]))
                                 or _has_any_player_prop(custom_lines, str(r["player_name"]))
+                                or str(r["player_name"]).lower() in promoted_names
+                                or normalize_player_name(str(r["player_name"])) in promoted_names
                             )
                         )
                     )
                 ]
                 custom_p = [p for p in cand_rows if _has_any_player_prop(custom_lines, p)]
                 other_p = [p for p in cand_rows if p not in custom_p]
-                top_players = (custom_p + other_p)[:6]
+                top_players = (custom_p + other_p)[:8]
             else:
                 top_players = [
                     str(r["player_name"])
@@ -667,9 +783,9 @@ class PlayerPropsEngine:
                     if live_period >= 2 and float(p_live.get("minutes", 0.0) or 0.0) < 1.0:
                         continue
 
-                p_all = t_logs[t_logs["player_name"] == pname]
-                p_all_active = p_all[p_all["minutes"] >= 12.0]
-                if len(p_all_active) < 4:
+                p_all = nba_logs_by_name.get(pname, t_logs.iloc[0:0])
+                p_all_active = p_all[p_all["minutes"] >= 10.0]
+                if len(p_all_active) < 3:
                     continue
                 pos = (
                     str(p_all["position"].iloc[-1]).upper()
@@ -679,11 +795,49 @@ class PlayerPropsEngine:
                 opp_pos_map = nba_pos_stats.get((opp, pos), {}) if pos else {}
 
                 p_hist = p_all_active.tail(15)
+                p_recent_days = set(p_all_active.tail(8)["gameday"].astype(str))
                 min_vals = p_hist["minutes"].to_numpy(dtype=float)
                 ewma_min, _ = _ewma_mean_std(min_vals, span=5)
                 season_min = float(np.mean(p_all_active["minutes"]))
-                full_proj_min = (0.60 * ewma_min + 0.40 * season_min) * blowout_haircut
-                inj_clarity = (
+                base_proj_min = 0.60 * ewma_min + 0.40 * season_min
+                is_promoted = (
+                    pname.lower() in promoted_names
+                    or normalize_player_name(pname) in promoted_names
+                )
+
+                # Overlap-aware minutes & usage redistribution when rotation teammates are out
+                vacated_same_pos_min = 0.0
+                vacated_other_pos_min = 0.0
+                vacated_pts = 0.0
+                sidelined_same_pos: list[str] = []
+                for s_info in sidelined_info:
+                    s_days = s_info["played_days"]
+                    if p_recent_days and s_days:
+                        overlap = len(p_recent_days & s_days) / len(p_recent_days)
+                        # If teammate played in player's recent logs, historical stats don't yet reflect their absence
+                        w_ov = max(0.30, overlap) if overlap > 0.0 else 0.15
+                    else:
+                        w_ov = 0.50
+                    vacated_pts += s_info["avg_pts"] * w_ov
+                    if pos and s_info["pos"] == pos:
+                        vacated_same_pos_min += s_info["avg_min"] * w_ov
+                        sidelined_same_pos.append(s_info["name"])
+                    else:
+                        vacated_other_pos_min += s_info["avg_min"] * w_ov
+
+                headroom = max(0.0, 36.5 - base_proj_min)
+                raw_min_add = 0.40 * vacated_same_pos_min + 0.12 * vacated_other_pos_min
+                if is_promoted and raw_min_add < 6.0:
+                    raw_min_add = max(raw_min_add, 8.0)
+                min_cap = 14.0 if (is_promoted or vacated_same_pos_min >= 20.0) else 8.0
+                min_boost = (
+                    min(headroom, min_cap, raw_min_add * min(1.0, headroom / 10.0))
+                    if headroom > 0.5 and raw_min_add > 0.5
+                    else 0.0
+                )
+                usage_boost = float(np.clip(1.0 + (vacated_pts * 0.0045), 1.0, 1.14))
+                full_proj_min = (base_proj_min + min_boost) * blowout_haircut
+                base_inj_clarity = (
                     0.68
                     if (pname.lower() in q_names or normalize_player_name(pname) in q_names)
                     else 1.0
@@ -718,7 +872,7 @@ class PlayerPropsEngine:
                             or (live_period >= 4 and fouls >= 5)
                         ):
                             live_min_mult *= 0.78
-                            inj_clarity = min(inj_clarity, 0.72)
+                            base_inj_clarity = min(base_inj_clarity, 0.72)
                             live_notes.append(
                                 f"Foul trouble ({int(fouls)} personal fouls) could reduce remaining playing time."
                             )
@@ -740,8 +894,8 @@ class PlayerPropsEngine:
                     if col == "rebounds" and season_avg < (1.5 if has_explicit_line else 4.5):
                         continue
 
-                    season_rate = season_avg / max(15.0, season_min)
-                    recent_rate = ewma_val / max(15.0, ewma_min)
+                    season_rate = season_avg / max(12.0, season_min)
+                    recent_rate = ewma_val / max(12.0, ewma_min)
                     blended_rate = 0.55 * season_rate + 0.45 * recent_rate
 
                     pos_info = opp_pos_map.get(col)
@@ -762,6 +916,7 @@ class PlayerPropsEngine:
                     mkt_anchor = 0.55 * season_avg + 0.45 * ewma_val
                     stat_name = _plain_stat_name(col, label)
                     live_time_note = ""
+                    inj_clarity = base_inj_clarity
 
                     if is_live:
                         cur_stat = float(p_live.get(col, 0.0) or 0.0) if p_live else 0.0
@@ -847,7 +1002,7 @@ class PlayerPropsEngine:
                     else:
                         cur_stat = 0.0
                         raw_proj_mean = blended_rate * full_proj_min * pace_adj * opp_mult * boost_mult
-                        eff_std = base_std
+                        eff_std = max(base_std, base_std * (full_proj_min / max(12.0, base_proj_min)))
                         sync_default_line = (
                             float(mkt_prop["line"])
                             if mkt_prop is not None
@@ -858,6 +1013,17 @@ class PlayerPropsEngine:
                             if mkt_prop is not None
                             else mkt_anchor + 0.65 * (raw_proj_mean - mkt_anchor)
                         )
+                        role_shift_note: str | None = None
+                        if mkt_prop is not None:
+                            proj_mean, eff_std, inj_clarity, role_shift_note = _apply_market_role_shift_guard(
+                                pname=pname,
+                                col=col,
+                                proj_mean=proj_mean,
+                                eff_std=eff_std,
+                                mkt_line=float(mkt_prop["line"]),
+                                inj_clarity=inj_clarity,
+                                has_role_news=(is_promoted or bool(sidelined_same_pos) or min_boost >= 2.5),
+                            )
                         if custom_val is not None:
                             line_val = float(custom_val)
                             is_custom = True
@@ -906,6 +1072,8 @@ class PlayerPropsEngine:
                             line_source=line_src,
                         )
                         context_drivers = []
+                        if role_shift_note:
+                            context_drivers.append(role_shift_note)
                         pos_def_txt = _format_positional_defense_driver(
                             opp=opp,
                             pos=pos,
@@ -915,7 +1083,12 @@ class PlayerPropsEngine:
                         )
                         if pos_def_txt:
                             context_drivers.append(pos_def_txt)
-                        if usage_boost > 1.02:
+                        if min_boost >= 2.0 and (sidelined_same_pos or sidelined_stars):
+                            names_txt = " and ".join((sidelined_same_pos or sidelined_stars)[:2])
+                            context_drivers.append(
+                                f"With {names_txt} sidelined, {pname} is projected for about {min_boost:.0f} extra minutes and a larger offensive role."
+                            )
+                        elif usage_boost > 1.02:
                             if sidelined_stars:
                                 names_txt = " and ".join(sidelined_stars)
                                 context_drivers.append(
@@ -1081,19 +1254,24 @@ class PlayerPropsEngine:
 
             out_names: set[str] = set()
             q_names: set[str] = set()
+            promoted_names: set[str] = set()
             if injuries_by_team:
                 for item in injuries_by_team.get(team, []):
-                    st = str(item.get("status", "")).lower()
+                    cls_st = classify_injury_status(item)
                     nm = str(item.get("player_name", "")).lower()
                     nm_norm = normalize_player_name(nm)
-                    if "out" in st or "doubtful" in st:
+                    if cls_st in ("OUT", "DOUBTFUL"):
                         out_names.add(nm)
                         if nm_norm:
                             out_names.add(nm_norm)
-                    elif "questionable" in st:
+                    elif cls_st == "QUESTIONABLE":
                         q_names.add(nm)
                         if nm_norm:
                             q_names.add(nm_norm)
+                    if is_promoted_starter_comment(item):
+                        promoted_names.add(nm)
+                        if nm_norm:
+                            promoted_names.add(nm_norm)
 
             # Game-script pass/rush volume tilt (uses live scoreboard deficit when in-play!)
             if is_live and live_state is not None:
@@ -1134,6 +1312,7 @@ class PlayerPropsEngine:
                     py=("passing_yards", "mean"),
                     ry=("rushing_yards", "mean"),
                     recy=("receiving_yards", "mean"),
+                    rec=("receptions", "mean"),
                 )
             )
             # Split once (row order preserved within each group) instead of a boolean scan per player
@@ -1141,28 +1320,89 @@ class PlayerPropsEngine:
                 str(name): grp for name, grp in t_logs.groupby("player_name", sort=False)
             }
 
+            # Track sidelined contributors by position for vacated-workload redistribution
+            sidelined_by_pos: dict[str, list[dict[str, Any]]] = {"QB": [], "RB": [], "WR": [], "TE": []}
+            active_rb_count = 0
+            active_pass_catcher_count = 0
+            for _, grow in grouped.iterrows():
+                gname = str(grow["player_name"])
+                gpos = str(grow["position"]).upper()
+                is_g_out = gname.lower() in out_names or normalize_player_name(gname) in out_names
+                if is_g_out:
+                    if gpos in sidelined_by_pos and (
+                        (gpos == "QB" and float(grow["py"]) >= 140.0)
+                        or (gpos == "RB" and (float(grow["ry"]) >= 28.0 or float(grow["recy"]) >= 18.0))
+                        or (gpos in ("WR", "TE") and float(grow["recy"]) >= 25.0)
+                    ):
+                        s_grp = player_logs_by_name.get(gname)
+                        s_orders = (
+                            set(s_grp["game_order"].astype(int))
+                            if s_grp is not None and len(s_grp) > 0
+                            else set()
+                        )
+                        sidelined_by_pos[gpos].append(
+                            {
+                                "name": gname,
+                                "pos": gpos,
+                                "py": float(grow["py"]),
+                                "ry": float(grow["ry"]),
+                                "recy": float(grow["recy"]),
+                                "rec": float(grow["rec"]),
+                                "played_orders": s_orders,
+                            }
+                        )
+                else:
+                    if gpos == "RB" and (
+                        int(grow["recent_n"]) >= 2
+                        or _has_any_player_prop(live_prop_markets, gname)
+                    ):
+                        active_rb_count += 1
+                    if gpos in ("WR", "TE") and (
+                        float(grow["recy"]) >= 20.0
+                        or _has_any_player_prop(live_prop_markets, gname)
+                    ):
+                        active_pass_catcher_count += 1
+
             for _, prow in grouped.iterrows():
                 pname = str(prow["player_name"])
                 pos = str(prow["position"]).upper()
                 if pname.lower() in out_names or normalize_player_name(pname) in out_names:
                     continue
-                has_player_mkt = _has_any_player_prop(live_prop_markets, pname) or _has_any_player_prop(
-                    custom_lines, pname
+                is_promoted = (
+                    pname.lower() in promoted_names
+                    or normalize_player_name(pname) in promoted_names
                 )
-                if not has_player_mkt and int(prow["recent_n"]) < 2:
+                has_player_mkt = (
+                    _has_any_player_prop(live_prop_markets, pname)
+                    or _has_any_player_prop(custom_lines, pname)
+                )
+                if not has_player_mkt and not is_promoted and int(prow["recent_n"]) < 2:
                     continue
-                if has_player_mkt and int(prow["n"]) < 1:
+                if (has_player_mkt or is_promoted) and int(prow["n"]) < 1:
                     continue
-                if pos == "QB" and not has_player_mkt and (pname != active_qb1 or float(prow["py"]) < 145.0):
+                if (
+                    pos == "QB"
+                    and not has_player_mkt
+                    and not is_promoted
+                    and (pname != active_qb1 or float(prow["py"]) < 145.0)
+                ):
                     continue
                 if (
                     not has_player_mkt
+                    and not is_promoted
                     and pos == "RB"
+                    and not sidelined_by_pos["RB"]
                     and float(prow["ry"]) < 38.0
                     and float(prow["recy"]) < 22.0
                 ):
                     continue
-                if not has_player_mkt and pos in ("WR", "TE") and float(prow["recy"]) < 38.0:
+                if (
+                    not has_player_mkt
+                    and not is_promoted
+                    and pos in ("WR", "TE")
+                    and not (sidelined_by_pos["WR"] or sidelined_by_pos["TE"])
+                    and float(prow["recy"]) < 38.0
+                ):
                     continue
 
                 p_live = _lookup_live_player(live_boxscore, pname) if is_live else None
@@ -1170,17 +1410,67 @@ class PlayerPropsEngine:
                     continue
                 p_all = player_logs_by_name.get(pname, t_logs.iloc[0:0])
                 p_hist = p_all.tail(12)
+                p_recent_orders = set(p_all.tail(6)["game_order"].astype(int))
                 opp_pos_map = nfl_pos_stats.get((opp, pos), {})
-                inj_clarity = (
+                base_inj_clarity = (
                     0.68
                     if (pname.lower() in q_names or normalize_player_name(pname) in q_names)
                     else 1.0
                 )
 
+                # For QBs, isolate full-game starts (>=18 pass attempts) so 2-attempt relief/kneel-down
+                # cameos don't drag a promoted backup QB's baseline down to garbage-time numbers.
+                qb_full_starts = (
+                    p_all[p_all["attempts"] >= 18.0]
+                    if (pos == "QB" and "attempts" in p_all.columns)
+                    else p_all.iloc[0:0]
+                )
+                relief_only_qb = (
+                    pos == "QB"
+                    and len(qb_full_starts) < 2
+                    and (has_player_mkt or is_promoted or bool(sidelined_by_pos["QB"]))
+                )
+
+                # Compute overlap-weighted vacated workload from sidelined teammates
+                def _overlap_weight(s_orders: set[int]) -> float:
+                    if not p_recent_orders or not s_orders:
+                        return 0.55
+                    ov = len(p_recent_orders & s_orders) / len(p_recent_orders)
+                    # If starter played in the backup's recent logs, backup stats do NOT yet reflect starter's absence
+                    return max(0.35, ov) if ov > 0.0 else 0.15
+
+                sidelined_same_pos_names: list[str] = []
+                vac_rb_ry = 0.0
+                vac_rec_yds = 0.0
+                vac_recs = 0.0
+                if pos == "RB":
+                    for s_rb in sidelined_by_pos["RB"]:
+                        w_ov = _overlap_weight(s_rb["played_orders"])
+                        vac_rb_ry += s_rb["ry"] * w_ov
+                        vac_rec_yds += s_rb["recy"] * w_ov * 0.85
+                        vac_recs += s_rb["rec"] * w_ov * 0.85
+                        sidelined_same_pos_names.append(s_rb["name"])
+                if pos in ("WR", "TE", "RB"):
+                    for s_pos_k in ("WR", "TE", "RB"):
+                        pos_w = 1.0 if s_pos_k == pos else (0.55 if pos in ("WR", "TE") and s_pos_k in ("WR", "TE") else 0.30)
+                        for s_pc in sidelined_by_pos[s_pos_k]:
+                            if pos == "RB" and s_pos_k == "RB":
+                                continue
+                            w_ov = _overlap_weight(s_pc["played_orders"])
+                            vac_rec_yds += s_pc["recy"] * w_ov * pos_w
+                            vac_recs += s_pc["rec"] * w_ov * pos_w
+                            if s_pos_k == pos or (pos in ("WR", "TE") and s_pos_k in ("WR", "TE")):
+                                if s_pc["name"] not in sidelined_same_pos_names:
+                                    sidelined_same_pos_names.append(s_pc["name"])
+                if pos == "QB":
+                    for s_qb in sidelined_by_pos["QB"]:
+                        sidelined_same_pos_names.append(s_qb["name"])
+
                 # Recent volume metrics for concrete, human-friendly baseline explanations
+                vol_df = qb_full_starts.tail(12) if (pos == "QB" and len(qb_full_starts) >= 2) else p_hist
                 recent_attempts = (
-                    _ewma_mean_std(p_hist["attempts"].to_numpy(dtype=float), span=5)[0]
-                    if "attempts" in p_hist.columns and len(p_hist) > 0
+                    _ewma_mean_std(vol_df["attempts"].to_numpy(dtype=float), span=5)[0]
+                    if "attempts" in vol_df.columns and len(vol_df) > 0
                     else 0.0
                 )
                 recent_carries = (
@@ -1197,21 +1487,67 @@ class PlayerPropsEngine:
                 for col, label, allowed_pos, tail_fn in self.NFL_PROPS:
                     if pos not in allowed_pos:
                         continue
-                    vals = p_hist[col].to_numpy(dtype=float)
+                    use_qb_starts = (
+                        pos == "QB"
+                        and col in ("passing_yards", "passing_tds")
+                        and len(qb_full_starts) >= 2
+                    )
+                    stat_all = qb_full_starts if use_qb_starts else p_all
+                    stat_hist = stat_all.tail(12)
+                    vals = stat_hist[col].to_numpy(dtype=float)
                     ewma_val, std_val = _ewma_mean_std(vals, span=5)
 
                     mkt_prop = _lookup_player_prop(live_prop_markets, pname, col)
                     custom_val = _lookup_player_prop(custom_lines, pname, col)
                     has_explicit_line = mkt_prop is not None or custom_val is not None
 
-                    if col == "rushing_yards" and ewma_val < (12.0 if has_explicit_line else 28.0):
-                        continue
-                    if col == "receiving_yards" and ewma_val < (15.0 if has_explicit_line else 34.0):
-                        continue
-                    if col == "receptions" and ewma_val < (1.5 if has_explicit_line else 3.2):
-                        continue
-                    if col == "passing_tds" and ewma_val < (0.6 if has_explicit_line else 1.05):
-                        continue
+                    season_avg = float(np.mean(stat_all[col].to_numpy(dtype=float)))
+                    shrunk_base = 0.55 * season_avg + 0.45 * ewma_val
+
+                    # Positional teammate-out workload redistribution
+                    teammate_boost_note: str | None = None
+                    base_before_red = shrunk_base
+                    if pos == "RB" and col == "rushing_yards" and vac_rb_ry >= 12.0:
+                        rb_share = 0.52 / max(1, min(2, active_rb_count))
+                        add_ry = min(55.0, vac_rb_ry * rb_share)
+                        shrunk_base = min(118.0, shrunk_base + add_ry)
+                        if sidelined_same_pos_names and (shrunk_base - base_before_red) >= 8.0:
+                            names_txt = " and ".join(sidelined_same_pos_names[:2])
+                            teammate_boost_note = (
+                                f"With {names_txt} sidelined, {pname} is projected for an expanded rushing workload."
+                            )
+                    elif col == "receiving_yards" and vac_rec_yds >= 15.0:
+                        pc_div = max(1.5, min(3.5, float(active_pass_catcher_count or 2)))
+                        add_recy = min(28.0, (vac_rec_yds * 0.58) / pc_div)
+                        shrunk_base = min(115.0, shrunk_base + add_recy)
+                        if sidelined_same_pos_names and (shrunk_base - base_before_red) >= 5.0:
+                            names_txt = " and ".join(sidelined_same_pos_names[:2])
+                            teammate_boost_note = (
+                                f"With {names_txt} sidelined, {pname} is projected for an expanded target share."
+                            )
+                    elif col == "receptions" and vac_recs >= 1.2:
+                        pc_div = max(1.5, min(3.5, float(active_pass_catcher_count or 2)))
+                        add_rec = min(2.4, (vac_recs * 0.58) / pc_div)
+                        shrunk_base = min(9.5, shrunk_base + add_rec)
+                        if sidelined_same_pos_names and (shrunk_base - base_before_red) >= 0.45:
+                            names_txt = " and ".join(sidelined_same_pos_names[:2])
+                            teammate_boost_note = (
+                                f"With {names_txt} sidelined, {pname} is projected for an expanded target share."
+                            )
+
+                    eff_vol = max(ewma_val, shrunk_base)
+                    allow_backup_mkt = has_explicit_line and (
+                        is_promoted or bool(sidelined_same_pos_names) or relief_only_qb
+                    )
+                    if not allow_backup_mkt:
+                        if col == "rushing_yards" and eff_vol < (12.0 if has_explicit_line else 28.0):
+                            continue
+                        if col == "receiving_yards" and eff_vol < (15.0 if has_explicit_line else 34.0):
+                            continue
+                        if col == "receptions" and eff_vol < (1.5 if has_explicit_line else 3.2):
+                            continue
+                        if col == "passing_tds" and eff_vol < (0.6 if has_explicit_line else 1.05):
+                            continue
 
                     pos_info = opp_pos_map.get(col)
                     raw_opp_f = (
@@ -1226,12 +1562,13 @@ class PlayerPropsEngine:
                     else:
                         script_env = rush_script * env_rush_mult * (1.0 if is_live else tot_mult)
 
-                    season_avg = float(np.mean(p_all[col].to_numpy(dtype=float)))
-                    shrunk_base = 0.55 * season_avg + 0.45 * ewma_val
-                    base_std = max(std_val, 0.25 * season_avg)
+                    base_std = max(std_val, 0.25 * max(season_avg, shrunk_base))
                     mkt_anchor = 0.60 * season_avg + 0.40 * ewma_val
+                    if shrunk_base > base_before_red:
+                        mkt_anchor = max(mkt_anchor, shrunk_base)
                     stat_name = _plain_stat_name(col, label)
                     live_time_note = ""
+                    inj_clarity = base_inj_clarity
 
                     if is_live:
                         cur_stat = float(p_live.get(col, 0.0) or 0.0) if p_live else 0.0
@@ -1335,6 +1672,22 @@ class PlayerPropsEngine:
                             if mkt_prop is not None
                             else mkt_anchor + 0.65 * (raw_proj_mean - mkt_anchor)
                         )
+                        role_shift_note: str | None = None
+                        if mkt_prop is not None:
+                            proj_mean, eff_std, inj_clarity, role_shift_note = _apply_market_role_shift_guard(
+                                pname=pname,
+                                col=col,
+                                proj_mean=proj_mean,
+                                eff_std=eff_std,
+                                mkt_line=float(mkt_prop["line"]),
+                                inj_clarity=inj_clarity,
+                                has_role_news=(
+                                    is_promoted
+                                    or bool(sidelined_same_pos_names)
+                                    or teammate_boost_note is not None
+                                ),
+                                relief_only_qb=relief_only_qb,
+                            )
                         if custom_val is not None:
                             line_val = float(custom_val)
                             is_custom = True
@@ -1383,6 +1736,10 @@ class PlayerPropsEngine:
                             line_source=line_src,
                         )
                         context_drivers = []
+                        if role_shift_note:
+                            context_drivers.append(role_shift_note)
+                        if teammate_boost_note:
+                            context_drivers.append(teammate_boost_note)
 
                         # 1. Position-specific opponent defense
                         pos_def_txt = _format_positional_defense_driver(

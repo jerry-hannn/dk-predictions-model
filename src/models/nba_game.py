@@ -19,7 +19,8 @@ from sklearn.preprocessing import StandardScaler
 
 from src.models import atomic_joblib_dump
 from src.config import get_settings
-from src.engine.dk_math import clamp_prob, inv_logit, logit
+from src.data.espn_client import classify_injury_status
+from src.engine.dk_math import clamp_prob, inv_logit, logit, normalize_player_name
 
 
 @dataclass
@@ -89,9 +90,13 @@ class NBAGameModel:
                 # Approximate NetRtg swing when a high-minute rotation/star player sits:
                 # 30 PPG / 35 MPG star -> ~3.8 pts impact; 18 PPG starter -> ~1.8 pts impact
                 impact = max(0.5, (float(r["avg_pts"]) - 10.0) * 0.17)
-                self.star_scoring_share[(str(r["team"]).upper(), str(r["player_name"]).lower())] = round(
-                    min(4.8, impact), 2
-                )
+                t_up = str(r["team"]).upper()
+                p_raw = str(r["player_name"]).lower()
+                val = round(min(4.8, impact), 2)
+                self.star_scoring_share[(t_up, p_raw)] = val
+                p_norm = normalize_player_name(p_raw)
+                if p_norm:
+                    self.star_scoring_share.setdefault((t_up, p_norm), val)
 
     def build_chronological_features(
         self, games: pd.DataFrame
@@ -348,13 +353,15 @@ class NBAGameModel:
                 team_pen = 0.0
                 for item in injuries_by_team.get(team_code, []):
                     pname = str(item.get("player_name", ""))
-                    status = str(item.get("status", "")).lower()
+                    cls_status = classify_injury_status(item)
+                    p_norm = normalize_player_name(pname)
                     impact = self.star_scoring_share.get(
-                        (team_code, pname.lower()), 0.85
+                        (team_code, pname.lower()),
+                        self.star_scoring_share.get((team_code, p_norm), 0.85),
                     )
-                    if "out" in status or "doubtful" in status:
+                    if cls_status in ("OUT", "DOUBTFUL"):
                         if impact >= 1.5 and team_pen < 6.5:
-                            if "doubtful" in status:
+                            if cls_status == "DOUBTFUL":
                                 drivers.append(
                                     f"{team_code} key player {pname} is doubtful to play."
                                 )
@@ -363,7 +370,7 @@ class NBAGameModel:
                                     f"{team_code} is playing without key player {pname}."
                                 )
                         team_pen = min(7.0, team_pen + impact)
-                    elif "questionable" in status and impact >= 2.2:
+                    elif cls_status == "QUESTIONABLE" and impact >= 2.2:
                         injury_clarity = min(injury_clarity, 0.72)
                 inj_margin_adj += sign * team_pen
 
