@@ -542,11 +542,11 @@ def test_recommender_latency_lock_open_position_monitor_and_live_api(
     locked_picks = [p for p in picks if p["event_id"] == "live_lock_999"]
     assert len(locked_picks) > 0
     assert all(p["confidence_tier"] == "PASS" for p in locked_picks)
-    assert any("latency lock" in d.lower() for p in locked_picks for d in p["drivers"])
+    assert any("90 seconds" in d.lower() for p in locked_picks for d in p["drivers"])
 
     # Stale >240s Q3 game must carry staleness warning
     stale_picks = [p for p in picks if p["event_id"] == "live_q3_888"]
-    assert any("m old" in d.lower() for p in stale_picks for d in p["drivers"])
+    assert any("minutes old" in d.lower() for p in stale_picks for d in p["drivers"])
 
     # Open position monitor test (`HOLD TO $1.00` vs `EDGE REVERSED`)
     hub.db.log_trade(

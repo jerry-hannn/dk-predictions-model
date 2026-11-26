@@ -1165,7 +1165,7 @@ function buildPickCardInnerHtml(p, idx) {
     ? `<details class="card-details">
         <summary>Details &amp; exit (${(p.fair_midgame_exit_price * 100).toFixed(0)}¢ target)</summary>
         <div class="details-body">
-          ${p.line_movement ? `<p class="mono">${escapeHtml(p.line_movement)}</p>` : ''}
+          ${p.line_movement ? `<p>${escapeHtml(p.line_movement)}</p>` : ''}
           ${extraDrivers.map((d) => `<p>• ${escapeHtml(d)}</p>`).join('')}
           ${p.injury_notes ? `<p class="warning-text">Injuries: ${escapeHtml(p.injury_notes)}</p>` : ''}
           <p>Question: ${escapeHtml(p.contract_question || p.selection_label)}</p>

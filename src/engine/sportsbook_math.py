@@ -753,13 +753,13 @@ def evaluate_steam_lag(
     book_disp = "DraftKings" if book == "DRAFTKINGS" else "FanDuel"
     if triggered_line and book_line is not None and sharp_line is not None:
         summary = (
-            f"{book_disp} stale line {book_line:g} ({format_american(book_odds)}) vs "
-            f"{sharp_source} {sharp_line:g} (+{ev_vs_sharp*100:.1f}% vs sharp)"
+            f"{book_disp} is still posting {book_line:g} ({format_american(book_odds)}) while the sharper market "
+            f"has moved to {sharp_line:g}, creating a +{ev_vs_sharp*100:.1f}% edge."
         )
     else:
         summary = (
-            f"{book_disp} lagging {sharp_source} by +{prob_lag*100:.1f}% "
-            f"({format_american(book_odds)} vs fair {format_american(sharp_fair_am)})"
+            f"{book_disp} is lagging the sharper market by {prob_lag*100:.1f} percentage points, "
+            f"offering {format_american(book_odds)} compared to fair odds of {format_american(sharp_fair_am)}."
         )
 
     return SteamLagAlert(

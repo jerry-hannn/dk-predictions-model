@@ -190,7 +190,7 @@ def estimate_leg_pair_correlation(leg_a: ParlayLeg, leg_b: ParlayLeg) -> tuple[f
     Returns (rho, human_readable_reason).
     """
     if not _same_event(leg_a, leg_b):
-        return 0.0, "Independent games"
+        return 0.0, "These legs are from different games, so their outcomes are independent."
 
     cat_a = _market_category(leg_a)
     cat_b = _market_category(leg_b)
@@ -205,9 +205,9 @@ def estimate_leg_pair_correlation(leg_a: ParlayLeg, leg_b: ParlayLeg) -> tuple[f
         dir_b = _home_away_direction(leg_b)
         if dir_a and dir_b:
             if dir_a == dir_b:
-                return 0.78, "Same-team Moneyline & Spread strongly co-move"
-            return -0.65, "Opposing-team Moneyline & Spread negatively correlated"
-        return 0.0, "Same-game Moneyline & Spread"
+                return 0.78, "Backing the same team to win and cover the spread strongly moves together."
+            return -0.65, "Backing opposite teams on the moneyline and spread works against each other."
+        return 0.0, "These moneyline and spread legs come from the same game."
 
     # 2. Game Total + Player Prop
     if cats == {"TOTAL", "PROP"}:
@@ -220,9 +220,11 @@ def estimate_leg_pair_correlation(leg_a: ParlayLeg, leg_b: ParlayLeg) -> tuple[f
         base_rho = 0.14 if "rebound" in stat else 0.28
         if tot_dir and prop_dir:
             if tot_dir == prop_dir:
-                return base_rho, "Higher game scoring/pace lifts player production"
-            return -base_rho, "Opposing game total vs player production direction"
-        return 0.12, "Same-game Total & Player Prop"
+                if tot_dir == "OVER":
+                    return base_rho, "A higher-scoring game generally boosts individual player stats."
+                return base_rho, "A lower-scoring game generally holds individual player stats down."
+            return -base_rho, "The game total and this player prop point in opposite scoring directions."
+        return 0.12, "This player prop is tied to the overall scoring pace of the same game."
 
     # 3. Moneyline/Spread + Player Prop
     if ("MONEYLINE" in cats or "SPREAD" in cats) and "PROP" in cats:
@@ -235,10 +237,14 @@ def estimate_leg_pair_correlation(leg_a: ParlayLeg, leg_b: ParlayLeg) -> tuple[f
         if team_g and team_p:
             if team_g == team_p:
                 rho = 0.22 * sign
-                return round(rho, 2), f"Same-team win/cover correlates with {team_p} player output"
+                if prop_dir == "OVER":
+                    return round(rho, 2), f"A strong game from {team_p} makes a bigger stat line from their player more likely."
+                return round(rho, 2), f"A strong game from {team_p} makes an under on their own player less likely."
             rho = -0.12 * sign
-            return round(rho, 2), f"Opponent player output inversely linked to {team_g} cover"
-        return round(0.08 * sign, 2), "Mild same-game script correlation"
+            if prop_dir == "OVER":
+                return round(rho, 2), f"A strong showing by {team_g} usually limits production from opposing players."
+            return round(rho, 2), f"A strong showing by {team_g} helps keep opposing player stats under their line."
+        return round(0.08 * sign, 2), "Both legs share the same game flow, creating a mild link between them."
 
     # 4. Player Prop + Player Prop (same game)
     if cat_a == "PROP" and cat_b == "PROP":
@@ -253,12 +259,12 @@ def estimate_leg_pair_correlation(leg_a: ParlayLeg, leg_b: ParlayLeg) -> tuple[f
         if pa and pb and pa == pb:
             # Same player, different stats
             if "pts+reb+ast" in (stat_a, stat_b) or "pra" in (stat_a, stat_b):
-                return round(0.62 * same_dir, 2), "Same-player composite stat overlaps directly"
+                return round(0.62 * same_dir, 2), "These props belong to the same player and directly share stats."
             if {"passing", "td"} <= set(f"{stat_a} {stat_b}".split()) or (
                 "passing" in stat_a and "passing" in stat_b
             ):
-                return round(0.55 * same_dir, 2), "Same-QB passing yards & passing TDs strongly linked"
-            return round(0.18 * same_dir, 2), "Same-player minutes & usage create positive co-movement"
+                return round(0.55 * same_dir, 2), "A quarterback's passing yards and passing touchdowns tend to rise and fall together."
+            return round(0.18 * same_dir, 2), "Playing time and usage for the same player cause these stats to move together."
 
         team_a = _extract_team_code(leg_a)
         team_b = _extract_team_code(leg_b)
@@ -266,27 +272,27 @@ def estimate_leg_pair_correlation(leg_a: ParlayLeg, leg_b: ParlayLeg) -> tuple[f
             if ("passing" in stat_a and ("receiv" in stat_b or "recept" in stat_b)) or (
                 "passing" in stat_b and ("receiv" in stat_a or "recept" in stat_a)
             ):
-                return round(0.45 * same_dir, 2), "QB passing & teammate receiving stack"
+                return round(0.45 * same_dir, 2), "A quarterback's passing production directly feeds a teammate's receiving numbers."
             if ("assist" in stat_a and "point" in stat_b) or (
                 "assist" in stat_b and "point" in stat_a
             ):
-                return round(0.24 * same_dir, 2), "Teammate assists & scoring stack"
+                return round(0.24 * same_dir, 2), "One teammate's assists often come directly from another teammate's baskets."
             if "point" in stat_a and "point" in stat_b:
-                return round(-0.08 * same_dir, 2), "Teammate usage competition on scoring"
-            return round(0.08 * same_dir, 2), "Same-team offensive environment"
+                return round(-0.08 * same_dir, 2), "Teammates share the ball, so high scoring from one can slightly trim attempts for the other."
+            return round(0.08 * same_dir, 2), "Both players share the same team offense and game environment."
 
         # Opposing players in same game (pace / shootout / overtime)
-        return round(0.12 * same_dir, 2), "Same-game pace & overtime shootout link"
+        return round(0.12 * same_dir, 2), "A fast-paced or high-scoring game lifts stat chances for players on both sides."
 
     # 5. Spread + Total (same game)
     if cats == {"SPREAD", "TOTAL"}:
-        return 0.05, "Same-game Spread & Total weakly correlated"
+        return 0.05, "The spread and total in the same game have only a weak connection."
 
     # 6. Same market type (usually conflict if opposing, or alt lines if same direction)
     if cat_a == cat_b and cat_a in ("MONEYLINE", "SPREAD", "TOTAL"):
-        return 0.60, f"Same-game {cat_a.title()} markets heavily linked"
+        return 0.60, f"Two {cat_a.lower()} legs in the same game are closely tied to the same final result."
 
-    return 0.0, "Same-game mild correlation"
+    return 0.0, "Both legs come from the same game and share a mild connection."
 
 
 def detect_parlay_conflicts(
@@ -530,7 +536,11 @@ def build_correlation_matrix(
                         correlation=round(rho, 3),
                         estimated_correlation=round(est_rho, 3),
                         is_custom=is_custom,
-                        reason=reason if not is_custom else f"Custom override (model est. {est_rho:+.2f})",
+                        reason=(
+                            reason
+                            if not is_custom
+                            else f"Using your custom correlation override instead of the model's {est_rho:+.2f} estimate."
+                        ),
                     )
                 )
 

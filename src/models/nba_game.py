@@ -354,7 +354,14 @@ class NBAGameModel:
                     )
                     if "out" in status or "doubtful" in status:
                         if impact >= 1.5 and team_pen < 6.5:
-                            drivers.append(f"{team_code} missing {pname} ({item.get('status')})")
+                            if "doubtful" in status:
+                                drivers.append(
+                                    f"{team_code} key player {pname} is doubtful to play."
+                                )
+                            else:
+                                drivers.append(
+                                    f"{team_code} is playing without key player {pname}."
+                                )
                         team_pen = min(7.0, team_pen + impact)
                     elif "questionable" in status and impact >= 2.2:
                         injury_clarity = min(injury_clarity, 0.72)
@@ -463,10 +470,12 @@ class NBAGameModel:
                 float(1.0 - student_t.cdf(eff_total, df=14, loc=exp_total, scale=sigma_tot_rem))
             )
 
-            detail = str(live_state.get("status_detail") or f"{rem_mins:.1f}m left")
+            detail = str(live_state.get("status_detail") or f"{rem_mins:.0f} minutes left")
+            proj_h = 0.5 * (exp_total + exp_margin)
+            proj_a = 0.5 * (exp_total - exp_margin)
             drivers.insert(
                 0,
-                f"LIVE {detail}: {a} {int(a_sc)} - {h} {int(h_sc)} | Proj final {0.5*(exp_total+exp_margin):.1f}-{0.5*(exp_total-exp_margin):.1f}",
+                f"Live ({detail}): {a} {int(a_sc)}, {h} {int(h_sc)}, with a projected final of {h} {proj_h:.1f} to {a} {proj_a:.1f}.",
             )
         else:
             exp_margin = pre_exp_margin
@@ -502,14 +511,27 @@ class NBAGameModel:
         net_diff = hs["net_rtg"] - as_["net_rtg"]
         if abs(net_diff) >= 2.0:
             leader = h if net_diff > 0 else a
-            drivers.append(f"{leader} +{abs(net_diff):.1f} Opp-Adj Net Rating advantage")
+            drivers.append(
+                f"{leader} holds a {abs(net_diff):.1f}-point advantage in overall team efficiency."
+            )
         if a_b2b and not h_b2b:
-            drivers.append(f"{a} on fatigued back-to-back road spot")
+            drivers.append(f"{a} is playing the second night of a back-to-back on the road.")
         elif h_b2b and not a_b2b:
-            drivers.append(f"{h} playing on back-to-back")
+            drivers.append(f"{h} is playing on the second night of a back-to-back.")
         if h in ("DEN", "UTA"):
-            drivers.append(f"{h} high-altitude home court edge")
-        drivers.append(f"Projected pace: {matchup_pace:.1f} poss/48m")
+            drivers.append(f"{h} benefits from a strong high-altitude home-court advantage.")
+        if matchup_pace >= 101.5:
+            drivers.append(
+                f"This matchup is expected to be fast-paced at about {matchup_pace:.1f} possessions per game."
+            )
+        elif matchup_pace <= 96.5:
+            drivers.append(
+                f"This matchup is expected to be slow-paced at about {matchup_pace:.1f} possessions per game."
+            )
+        else:
+            drivers.append(
+                f"This matchup is expected to run at a steady pace of about {matchup_pace:.1f} possessions per game."
+            )
 
         return NBAGamePrediction(
             home_team=h,

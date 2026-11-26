@@ -37,6 +37,24 @@ class PlayerPropProjection:
     book_lines: dict[str, dict[str, Any]] | None = None
 
 
+_PLAIN_STAT_NAMES: dict[str, str] = {
+    "points": "points",
+    "rebounds": "rebounds",
+    "assists": "assists",
+    "fg3m": "three-pointers",
+    "pra": "points, rebounds, and assists",
+    "passing_yards": "passing yards",
+    "passing_tds": "passing touchdowns",
+    "rushing_yards": "rushing yards",
+    "receiving_yards": "receiving yards",
+    "receptions": "receptions",
+}
+
+
+def _plain_stat_name(col: str, fallback: str) -> str:
+    return _PLAIN_STAT_NAMES.get(col, fallback.lower())
+
+
 def _lookup_player_prop(
     mapping: dict[tuple[str, str], Any] | None,
     pname: str,
@@ -424,13 +442,19 @@ class PlayerPropsEngine:
                 if is_live:
                     if live_period >= 4 and live_abs_diff >= 18.0:
                         live_min_mult *= 0.38
-                        live_notes.append(f"Q4 blowout ({int(live_abs_diff)} pt diff) starter bench risk")
+                        live_notes.append(
+                            f"With a {int(live_abs_diff)}-point fourth-quarter blowout, starters may sit early."
+                        )
                     elif live_period == 3 and live_abs_diff >= 20.0:
                         live_min_mult *= 0.68
-                        live_notes.append(f"Blowout ({int(live_abs_diff)} pt diff) minutes haircut")
+                        live_notes.append(
+                            f"A {int(live_abs_diff)}-point blowout could cut into this player's remaining minutes."
+                        )
                     elif live_period >= 4 and live_abs_diff >= 14.0 and rem_mins <= 6.0:
                         live_min_mult *= 0.55
-                        live_notes.append("Late lead/deficit rotation risk")
+                        live_notes.append(
+                            "A large late-game margin could limit playing time down the stretch."
+                        )
 
                     if p_live is not None:
                         fouls = float(p_live.get("fouls", 0.0) or 0.0)
@@ -442,7 +466,9 @@ class PlayerPropsEngine:
                         ):
                             live_min_mult *= 0.78
                             inj_clarity = min(inj_clarity, 0.72)
-                            live_notes.append(f"Foul trouble ({int(fouls)} PF)")
+                            live_notes.append(
+                                f"Foul trouble ({int(fouls)} personal fouls) could reduce remaining playing time."
+                            )
 
                 for col, label, tail_fn in self.NBA_PROPS:
                     vals = p_hist[col].to_numpy(dtype=float)
@@ -538,8 +564,9 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
+                        stat_name = _plain_stat_name(col, label)
                         drivers = [
-                            f"LIVE: Has {cur_stat:.0f} now + {rem_mean:.1f} rem ({rem_proj_min:.1f}m left) = {proj_mean:.1f} vs {line_val:.1f}"
+                            f"Currently at {cur_stat:.0f} {stat_name} and projected to finish at {proj_mean:.1f} over {rem_proj_min:.1f} expected minutes left, compared to the {line_val:.1f} line."
                         ] + live_notes[:2]
                     else:
                         cur_stat = 0.0
@@ -589,17 +616,39 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
-                        src_note = f"{line_src} — verify DK line/¢" if line_src == "Model Ref Line" else line_src
-                        drivers = [
-                            f"Proj {proj_mean:.1f} vs {line_val:.1f} ({src_note}, {full_proj_min:.1f}m)",
-                        ]
+                        stat_name = _plain_stat_name(col, label)
+                        if line_src == "Model Ref Line":
+                            primary_driver = (
+                                f"Projected for {proj_mean:.1f} {stat_name} in about {full_proj_min:.0f} minutes against an estimated {line_val:.1f} line, so verify the posted DraftKings line."
+                            )
+                        else:
+                            primary_driver = (
+                                f"Projected for {proj_mean:.1f} {stat_name} in about {full_proj_min:.0f} minutes against the {line_val:.1f} line."
+                            )
+                        drivers = [primary_driver]
                         if usage_boost > 1.02:
-                            drivers.append(f"+{(usage_boost - 1.0)*100:.1f}% usage boost from injured teammates")
+                            drivers.append(
+                                f"Injured teammates are expected to increase this player's offensive role by {(usage_boost - 1.0)*100:.1f}%."
+                            )
                         if abs(opp_mult - 1.0) >= 0.03:
-                            dir_txt = "soft" if opp_mult > 1.0 else "stingy"
-                            drivers.append(f"{opp} {dir_txt} positional defense ({opp_mult:.2f}x)")
+                            pct_diff = abs(opp_mult - 1.0) * 100.0
+                            if opp_mult > 1.0:
+                                drivers.append(
+                                    f"{opp} has a favorable defense here, allowing {pct_diff:.0f}% more {stat_name} than average."
+                                )
+                            else:
+                                drivers.append(
+                                    f"{opp} has a tough defense here, holding opponents {pct_diff:.0f}% below average in {stat_name}."
+                                )
                         if abs(pace_factor - 1.0) >= 0.02:
-                            drivers.append(f"Matchup pace factor {pace_factor:.2f}x")
+                            if pace_factor > 1.0:
+                                drivers.append(
+                                    "This game's faster expected pace creates extra opportunities to rack up stats."
+                                )
+                            else:
+                                drivers.append(
+                                    "This game's slower expected pace could limit total stat opportunities."
+                                )
 
                     out.append(
                         PlayerPropProjection(
@@ -862,12 +911,25 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
+                        stat_name = _plain_stat_name(col, label)
+                        mins_left = int(round(rem_mins))
+                        time_left_txt = (
+                            "less than a minute left"
+                            if rem_mins < 1.0
+                            else f"{mins_left} {'minute' if mins_left == 1 else 'minutes'} left"
+                        )
                         drivers = [
-                            f"LIVE: Has {cur_stat:.0f} now + {rem_mean:.1f} rem ({rem_mins:.0f}m left) = {proj_mean:.1f} vs {line_val:.1f}"
+                            f"Currently at {cur_stat:.0f} {stat_name} and projected to finish at {proj_mean:.1f} with {time_left_txt}, compared to the {line_val:.1f} line."
                         ]
                         if abs(trailing_tilt) >= 0.6:
-                            script_txt = "trailing pass-heavy script" if trailing_tilt > 0 else "leading clock-kill script"
-                            drivers.append(f"Live {script_txt}")
+                            if trailing_tilt > 0:
+                                drivers.append(
+                                    "Trailing on the scoreboard should push the offense into a heavier passing game."
+                                )
+                            else:
+                                drivers.append(
+                                    "Protecting a lead should shift the offense toward running the ball to burn clock."
+                                )
                     else:
                         cur_stat = 0.0
                         raw_proj_mean = shrunk_base * float(np.clip(opp_mult, 0.93, 1.07)) * script_env
@@ -916,16 +978,34 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
-                        src_note = f"{line_src} — verify DK line/¢" if line_src == "Model Ref Line" else line_src
-                        drivers = [
-                            f"Proj {proj_mean:.1f} vs {line_val:.1f} ({src_note}, EWMA {ewma_val:.1f})"
-                        ]
+                        stat_name = _plain_stat_name(col, label)
+                        if line_src == "Model Ref Line":
+                            primary_driver = (
+                                f"Projected for {proj_mean:.1f} {stat_name} against an estimated {line_val:.1f} line versus a {ewma_val:.1f} recent average, so verify the posted DraftKings line."
+                            )
+                        else:
+                            primary_driver = (
+                                f"Projected for {proj_mean:.1f} {stat_name} against the {line_val:.1f} line, compared to a {ewma_val:.1f} recent average."
+                            )
+                        drivers = [primary_driver]
                         if abs(opp_mult - 1.0) >= 0.03:
-                            drivers.append(f"vs {opp} unit factor {opp_mult:.2f}x")
+                            pct_diff = abs(opp_mult - 1.0) * 100.0
+                            if opp_mult > 1.0:
+                                drivers.append(
+                                    f"{opp} has been a favorable matchup, allowing {pct_diff:.0f}% more {stat_name} than average."
+                                )
+                            else:
+                                drivers.append(
+                                    f"{opp} has been a tough matchup, holding opponents {pct_diff:.0f}% below average in {stat_name}."
+                                )
                         if not is_indoor and wind_mph >= 16.0 and "passing" in col:
-                            drivers.append(f"Wind ({wind_mph:.0f} mph) dampens air yardage")
+                            drivers.append(
+                                f"Strong {wind_mph:.0f} mph winds could limit downfield passing."
+                            )
                         elif is_indoor and ("passing" in col or "receiving" in col):
-                            drivers.append("Fast indoor/dome track boost")
+                            drivers.append(
+                                "Playing indoors on fast turf provides a clean environment for the passing game."
+                            )
 
                     out.append(
                         PlayerPropProjection(

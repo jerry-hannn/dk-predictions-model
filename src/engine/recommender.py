@@ -830,7 +830,7 @@ class ModelHub:
         endgame_locked = rem_mins < 1.5 and cur_diff <= close_thresh
         if endgame_locked:
             extra_drivers.append(
-                "Endgame latency lock (<90s in 1-score game — high order-book whipsaw risk)"
+                "Paused for late-game safety because under 90 seconds remain in a one-score game and live prices can swing quickly."
             )
 
         odds_age = mkt.get("odds_age_seconds")
@@ -838,14 +838,16 @@ class ModelHub:
             endgame_locked = True
             clarity = min(clarity, 0.55)
             extra_drivers.append(
-                "No live sportsbook quote (<5m) — refresh live feed or check exact ¢ on DK"
+                "No recent live sportsbook quote is available, so refresh the feed or check the live price on DraftKings."
             )
         elif odds_age is not None and float(odds_age) > 240.0:
             clarity = min(clarity, 0.58)
             if float(odds_age) > 480.0:
                 endgame_locked = True
+            age_mins = max(1, int(float(odds_age) // 60))
+            unit = "minute" if age_mins == 1 else "minutes"
             extra_drivers.append(
-                f"Live odds {int(float(odds_age)//60)}m old — click Sync/Refresh or verify ¢ on DK"
+                f"Live odds are {age_mins} {unit} old, so refresh the feed or confirm the current price on DraftKings."
             )
         return True, endgame_locked, kelly_mult, clarity, extra_drivers
 
@@ -860,11 +862,11 @@ class ModelHub:
         moves: list[str] = []
         if mkt.get("spread_move") and abs(float(mkt["spread_move"])) >= 0.5:
             moves.append(
-                f"Spread {mkt['open_home_spread']:+.1f} → {mkt['home_spread']:+.1f}"
+                f"The spread has moved from {mkt['open_home_spread']:+.1f} to {mkt['home_spread']:+.1f}."
             )
         if mkt.get("total_move") and abs(float(mkt["total_move"])) >= 1.0:
             moves.append(
-                f"Total {mkt['open_total_line']:.1f} → {mkt['total_line']:.1f}"
+                f"The game total has moved from {mkt['open_total_line']:.1f} to {mkt['total_line']:.1f}."
             )
         return {
             "game_state": "LIVE" if is_live else str(ev.get("state", "PRE")),
@@ -873,7 +875,7 @@ class ModelHub:
             "remaining_minutes": _num_or(ev.get("remaining_minutes"), 48.0),
             "line_source": str(mkt.get("line_source", "ESPN/DK")),
             "odds_age_seconds": mkt.get("odds_age_seconds"),
-            "line_movement": " | ".join(moves),
+            "line_movement": " ".join(moves),
         }
 
     def _build_game_winner_pick(
@@ -928,7 +930,7 @@ class ModelHub:
             best = _force_pass_evaluation(best)
             if is_live and dk_home_p is None and sharp_home_p is None and not locked:
                 safety_drivers = safety_drivers + [
-                    "Moneyline off-board at live sportsbooks (blowout/suspended — check exact ¢ on DK)"
+                    "Live sportsbooks have taken this moneyline off the board due to a blowout or suspension, so confirm the price on DraftKings."
                 ]
 
         label = f"{h} to Win (Outright)" if best.side == "YES" else f"{a} to Win (or {h} Win: NO)"
@@ -936,7 +938,7 @@ class ModelHub:
         if dk_home_p is not None and sharp_home_p is not None and abs(sharp_home_p - dk_home_p) >= 0.03:
             drivers.insert(
                 1 if is_live else 0,
-                f"DK price lag: Sharp consensus {sharp_home_p*100:.1f}% vs DK {dk_home_p*100:.1f}%",
+                f"DraftKings is lagging the broader market, pricing {h} at a {dk_home_p*100:.1f}% win chance compared to the {sharp_home_p*100:.1f}% consensus.",
             )
 
         out = {
@@ -1065,7 +1067,7 @@ class ModelHub:
             best = _force_pass_evaluation(best)
             if is_live and mkt_cov is None and dk_cov is None and not locked:
                 safety_drivers = safety_drivers + [
-                    "Spread off-board at live sportsbooks — check exact ¢ on DK"
+                    "Live sportsbooks have taken this spread off the board, so confirm the current price on DraftKings."
                 ]
 
         home_fmt = f"{sp_line:+.1f}"
@@ -1079,8 +1081,12 @@ class ModelHub:
         drivers = list(safety_drivers)
         sharp_sp = mkt.get("sharp_home_spread")
         if sharp_sp is not None and abs(float(sharp_sp) - sp_line) >= 0.5:
-            drivers.append(f"Off-market DK spread {sp_line:+.1f} vs Sharp consensus {float(sharp_sp):+.1f}")
-        drivers.append(f"Model proj line {h} {-gpred.expected_margin:+.1f} vs {home_fmt}")
+            drivers.append(
+                f"DraftKings is offering an off-market spread of {h} {sp_line:+.1f}, compared to the {float(sharp_sp):+.1f} market consensus."
+            )
+        drivers.append(
+            f"The model sets a fair spread of {h} {-gpred.expected_margin:+.1f}, compared to the posted {home_fmt} line."
+        )
         drivers.extend(gpred.drivers[:2])
 
         live_fields = self._event_live_fields(ev, mkt)
@@ -1212,7 +1218,7 @@ class ModelHub:
             best = _force_pass_evaluation(best)
             if is_live and mkt_over is None and dk_over is None and not locked:
                 safety_drivers = safety_drivers + [
-                    "Total off-board at live sportsbooks — check exact ¢ on DK"
+                    "Live sportsbooks have taken this game total off the board, so confirm the current price on DraftKings."
                 ]
 
         label = (
@@ -1224,8 +1230,12 @@ class ModelHub:
         drivers = list(safety_drivers)
         sharp_tot = mkt.get("sharp_total_line")
         if sharp_tot is not None and abs(float(sharp_tot) - tot_line) >= 1.0:
-            drivers.append(f"Off-market DK total {tot_line:.1f} vs Sharp {float(sharp_tot):.1f}")
-        drivers.append(f"Model projected total {gpred.expected_total:.1f} vs {tot_line:.1f} line")
+            drivers.append(
+                f"DraftKings is offering an off-market total of {tot_line:.1f} points, compared to the {float(sharp_tot):.1f} market consensus."
+            )
+        drivers.append(
+            f"The model projects {gpred.expected_total:.1f} combined points against the {tot_line:.1f} total line."
+        )
         drivers.extend(gpred.drivers[:2])
 
         live_fields = self._event_live_fields(ev, mkt)
@@ -1543,7 +1553,9 @@ class ModelHub:
                 p["recommended_outlay"] = round(allowed_contracts * cost_per, 2)
                 if allowed_contracts == 0:
                     p["confidence_tier"] = "PASS"
-                    p["drivers"] = ["Capped by same-game 6% correlation limit (top plays prioritized)"] + p["drivers"][:3]
+                    p["drivers"] = [
+                        "Skipped to stay within the 6% same-game exposure limit so the strongest plays in this game take priority."
+                    ] + p["drivers"][:3]
             used_by_event[ev_id] = already + float(p["recommended_outlay"])
 
     @staticmethod
@@ -2290,11 +2302,11 @@ class ModelHub:
                         )
                         drivers = list(safety_drivers) + list(gpred.drivers)
                         if shop_gain is not None and shop_gain >= 0.005:
-                            other_nm = "FD" if other_same.book == "FANDUEL" else "DK"
-                            best_nm = "DK" if best_ev.book == "DRAFTKINGS" else "FD"
+                            other_nm = "FanDuel" if other_same.book == "FANDUEL" else "DraftKings"
+                            best_nm = "DraftKings" if best_ev.book == "DRAFTKINGS" else "FanDuel"
                             drivers.insert(
                                 0,
-                                f"Line shop: {best_nm} {format_american(best_ev.american_odds)} beats {other_nm} {format_american(other_same.american_odds)} (+{shop_gain*100:.1f}% EV)",
+                                f"{best_nm} offers better odds ({format_american(best_ev.american_odds)}) than {other_nm} ({format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value.",
                             )
 
                         picks_all.append(
@@ -2450,7 +2462,7 @@ class ModelHub:
                             else None
                         )
                         drivers = list(safety_drivers) + [
-                            f"Model proj line {h} {-gpred.expected_margin:+.1f} vs {best_item['home_sp']:+.1f}"
+                            f"The model sets a fair spread of {h} {-gpred.expected_margin:+.1f}, compared to the posted {best_item['home_sp']:+.1f} line."
                         ] + list(gpred.drivers[:2])
                         picks_all.append(
                             {
@@ -2648,7 +2660,7 @@ class ModelHub:
                             else None
                         )
                         drivers = list(safety_drivers) + [
-                            f"Model proj total {gpred.expected_total:.1f} vs {best_item['line']:.1f}"
+                            f"The model projects {gpred.expected_total:.1f} combined points against the {best_item['line']:.1f} total line."
                         ] + list(gpred.drivers[:2])
                         picks_all.append(
                             {

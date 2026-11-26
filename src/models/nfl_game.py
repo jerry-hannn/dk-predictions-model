@@ -328,7 +328,10 @@ class NFLGameModel:
                     if pos == "QB":
                         if "out" in status or "doubtful" in status:
                             inj_adj_margin += sign * 4.5
-                            drivers.append(f"{team_code} QB {pname} ({item.get('status')}) impact")
+                            status_text = "doubtful to play" if "doubtful" in status else "out"
+                            drivers.append(
+                                f"{team_code} quarterback {pname} is {status_text}, which weakens their offensive outlook."
+                            )
                         elif "questionable" in status:
                             injury_clarity = min(injury_clarity, 0.65)
                     elif pos in ("WR", "LT", "OT", "CB", "DE", "EDGE") and "out" in status:
@@ -429,11 +432,17 @@ class NFLGameModel:
                 float(1.0 - norm.cdf(eff_total, loc=exp_total, scale=sigma_tot_rem))
             )
 
-            detail = str(live_state.get("status_detail") or f"{rem_mins:.1f}m left")
-            poss_note = f" ({poss_team} ball{' RZ' if is_rz else ''})" if poss_team else ""
+            detail = str(live_state.get("status_detail") or f"{rem_mins:.0f} minutes left")
+            poss_note = (
+                f" with {poss_team} in the red zone"
+                if (poss_team and is_rz)
+                else (f" with {poss_team} on offense" if poss_team else "")
+            )
+            proj_h = 0.5 * (exp_total + exp_margin)
+            proj_a = 0.5 * (exp_total - exp_margin)
             drivers.insert(
                 0,
-                f"LIVE {detail}: {a} {int(a_sc)} - {h} {int(h_sc)}{poss_note} | Proj final {0.5*(exp_total+exp_margin):.1f}-{0.5*(exp_total-exp_margin):.1f}",
+                f"Live ({detail}): {a} {int(a_sc)}, {h} {int(h_sc)}{poss_note}, with a projected final of {h} {proj_h:.1f} to {a} {proj_a:.1f}.",
             )
         else:
             exp_margin = pre_exp_margin
@@ -458,21 +467,33 @@ class NFLGameModel:
         elo_pts = (hs["elo"] - as_["elo"]) / 25.0
         if abs(elo_pts) >= 1.5:
             leader = h if elo_pts > 0 else a
-            drivers.append(f"{leader} +{abs(elo_pts):.1f} pts power rating edge")
+            drivers.append(
+                f"{leader} holds a {abs(elo_pts):.1f}-point overall team strength advantage."
+            )
         adj_diff = hs["adj_margin"] - as_["adj_margin"]
         if abs(adj_diff) >= 1.8:
             leader = h if adj_diff > 0 else a
-            drivers.append(f"{leader} +{abs(adj_diff):.1f} opp-adj margin EWMA")
+            drivers.append(
+                f"{leader} has outperformed opponents by {abs(adj_diff):.1f} more points per game recently."
+            )
         if abs(rest_diff) >= 2:
             rested = h if rest_diff > 0 else a
-            drivers.append(f"{rested} +{int(abs(rest_diff))} rest days advantage")
+            rest_days = int(abs(rest_diff))
+            day_word = "day" if rest_days == 1 else "days"
+            drivers.append(
+                f"{rested} enters this matchup with {rest_days} extra {day_word} of rest."
+            )
         if eff_wind >= 15.0:
-            drivers.append(f"Outdoor wind ({eff_wind:.0f} mph) suppresses passing & total")
+            drivers.append(
+                f"Strong {eff_wind:.0f} mph winds should make passing tougher and keep scoring lower."
+            )
         if is_indoor:
-            drivers.append("Controlled indoor/dome scoring environment")
+            drivers.append(
+                "Playing indoors removes weather factors and tends to help offenses score."
+            )
         if not drivers:
             drivers.append(
-                f"Projected score {h} {0.5*(exp_total+exp_margin):.1f} - {a} {0.5*(exp_total-exp_margin):.1f}"
+                f"The model projects a final score of {h} {0.5*(exp_total+exp_margin):.1f} to {a} {0.5*(exp_total-exp_margin):.1f}."
             )
 
         return NFLGamePrediction(
