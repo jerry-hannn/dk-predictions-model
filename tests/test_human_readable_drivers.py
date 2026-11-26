@@ -1,9 +1,10 @@
-"""Verify all user-facing 'why' drivers and reasons are plain-English full sentences."""
+"""Verify all user-facing 'why' drivers and reasons are plain-English, specific, and logically consistent."""
 
 from __future__ import annotations
 
 import re
 
+from src.data.espn_client import ESPNClient
 from src.data.nba_loader import NBALoader
 from src.data.nfl_loader import NFLLoader
 from src.engine.parlay_math import (
@@ -11,11 +12,16 @@ from src.engine.parlay_math import (
     estimate_leg_pair_correlation,
     evaluate_sportsbook_parlay,
 )
-from src.engine.recommender import ModelHub
+from src.engine.recommender import ModelHub, _assemble_prop_drivers
 from src.engine.sportsbook_math import evaluate_steam_lag
 from src.models.nba_game import NBAGameModel
 from src.models.nfl_game import NFLGameModel
-from src.models.player_props import PlayerPropsEngine
+from src.models.player_props import (
+    PlayerPropProjection,
+    PlayerPropsEngine,
+    build_prop_primary_reason,
+    prop_median_for_type,
+)
 
 BANNED_JARGON = [
     r"\bEWMA\b",
@@ -47,21 +53,42 @@ def _assert_plain_sentences(items: list[str], context: str) -> None:
             )
 
 
-def test_game_model_drivers_are_plain_sentences() -> None:
+def test_game_model_drivers_and_outdoor_nfl_weather() -> None:
     nfl_df = NFLLoader().load_schedules()
     nfl_model = NFLGameModel()
     nfl_model.fit(nfl_df)
 
-    nfl_pre = nfl_model.predict_matchup(
-        home_team="KC",
-        away_team="BUF",
-        home_rest=10,
-        away_rest=6,
+    nfl_clear = nfl_model.predict_matchup(
+        home_team="BUF",
+        away_team="KC",
         is_indoor=False,
-        wind_mph=20.0,
-        injuries_by_team={"BUF": [{"player_name": "Josh Allen", "position": "QB", "status": "Out"}]},
+        wind_mph=5.0,
+        temp_f=62.0,
+        weather_condition="Clear",
     )
-    _assert_plain_sentences(nfl_pre.drivers, "NFL pregame")
+    nfl_snow = nfl_model.predict_matchup(
+        home_team="BUF",
+        away_team="KC",
+        is_indoor=False,
+        wind_mph=19.0,
+        temp_f=24.0,
+        weather_condition="Snow",
+        injuries_by_team={"KC": [{"player_name": "Patrick Mahomes", "position": "QB", "status": "Out"}]},
+    )
+    _assert_plain_sentences(nfl_snow.drivers, "NFL outdoor snow")
+    assert nfl_snow.expected_total < nfl_clear.expected_total - 2.0
+    assert any("snow" in d.lower() for d in nfl_snow.drivers)
+
+    nfl_rain = nfl_model.predict_matchup(
+        home_team="SEA",
+        away_team="SF",
+        is_indoor=False,
+        wind_mph=14.0,
+        temp_f=44.0,
+        weather_condition="Rain",
+    )
+    _assert_plain_sentences(nfl_rain.drivers, "NFL outdoor rain")
+    assert any("rain" in d.lower() for d in nfl_rain.drivers)
 
     nfl_live = nfl_model.predict_matchup(
         home_team="KC",
@@ -104,17 +131,48 @@ def test_game_model_drivers_are_plain_sentences() -> None:
     _assert_plain_sentences(nba_live.drivers, "NBA live")
 
 
-def test_player_prop_drivers_are_plain_sentences_and_preserve_blowout_signal() -> None:
+def test_player_props_positional_defense_weather_and_skew_consistency() -> None:
     nfl_logs = NFLLoader().load_player_logs()
     nba_logs = NBALoader().load_player_logs()
     props_engine = PlayerPropsEngine()
     props_engine.fit(nfl_logs, nba_logs)
 
-    nba_pre = props_engine.project_nba_game_props(home_team="BOS", away_team="NYK")
+    # Positional opponent stats populated for both NFL (QB/RB/WR/TE) and NBA (G/F/C)
+    assert ("PHI", "TE") in props_engine.nfl_opp_pos_stats
+    assert ("CIN", "TE") in props_engine.nfl_opp_pos_stats
+    assert (
+        props_engine.nfl_opp_pos_stats[("CIN", "TE")]["receiving_yards"]["factor"]
+        > props_engine.nfl_opp_pos_stats[("PHI", "TE")]["receiving_yards"]["factor"]
+    )
+    assert any(pos == "G" for _, pos in props_engine.nba_opp_pos_stats)
+    assert any(pos == "F" for _, pos in props_engine.nba_opp_pos_stats)
+    assert any(pos == "C" for _, pos in props_engine.nba_opp_pos_stats)
+
+    # NBA pregame props: positional defense + named sidelined star + blowout spread risk
+    base_bos = [
+        p
+        for p in props_engine.project_nba_game_props(home_team="BOS", away_team="NYK")
+        if p.team == "BOS"
+    ]
+    assert base_bos
+    sidelined_name = base_bos[0].player_name
+    nba_pre = props_engine.project_nba_game_props(
+        home_team="BOS",
+        away_team="NYK",
+        expected_spread=-15.0,
+        injuries_by_team={"BOS": [{"player_name": sidelined_name, "status": "Out"}]},
+    )
     assert nba_pre
     for pp in nba_pre[:10]:
         _assert_plain_sentences(pp.drivers, f"NBA pregame prop {pp.player_name} {pp.prop_type}")
+        assert pp.position in ("G", "F", "C")
+    bos_drivers = [d for pp in nba_pre if pp.team == "BOS" for d in pp.drivers]
+    assert any(sidelined_name in d for d in bos_drivers)
+    assert any("lopsided" in d.lower() for d in bos_drivers)
+    all_nba_drivers = [d for pp in nba_pre for d in pp.drivers]
+    assert any(w in d.lower() for d in all_nba_drivers for w in ("guards", "forwards", "centers"))
 
+    # NBA live blowout preserves "blowout" keyword for open-position monitoring
     p_pre = next(p for p in nba_pre if p.team == "BOS" and p.prop_type == "points")
     top_player = p_pre.player_name
     nba_live = props_engine.project_nba_game_props(
@@ -149,14 +207,128 @@ def test_player_prop_drivers_are_plain_sentences_and_preserve_blowout_signal() -
     _assert_plain_sentences(p_live.drivers, "NBA live blowout prop")
     assert any("blowout" in d.lower() for d in p_live.drivers)
 
-    nfl_teams = nfl_logs["team"].dropna().unique().tolist()
-    home_nfl, away_nfl = nfl_teams[0], nfl_teams[1]
-    nfl_pre = props_engine.project_nfl_game_props(
-        home_team=home_nfl, away_team=away_nfl, wind_mph=20.0, is_indoor=False
+    # NFL outdoor snow vs clear weather affects passing down & rushing up, with specific reasons
+    nfl_clear = props_engine.project_nfl_game_props(
+        home_team="KC",
+        away_team="CIN",
+        is_indoor=False,
+        wind_mph=5.0,
+        temp_f=65.0,
+        weather_condition="Clear",
     )
-    assert nfl_pre
-    for pp in nfl_pre[:10]:
-        _assert_plain_sentences(pp.drivers, f"NFL pregame prop {pp.player_name} {pp.prop_type}")
+    nfl_snow = props_engine.project_nfl_game_props(
+        home_team="KC",
+        away_team="CIN",
+        is_indoor=False,
+        wind_mph=20.0,
+        temp_f=25.0,
+        weather_condition="Snow",
+    )
+    assert nfl_snow
+    for pp in nfl_snow[:12]:
+        _assert_plain_sentences(pp.drivers, f"NFL snow prop {pp.player_name} {pp.prop_type}")
+
+    qb_clear = next((p for p in nfl_clear if p.prop_type == "passing_yards"), None)
+    qb_snow = next(
+        (p for p in nfl_snow if qb_clear and p.player_name == qb_clear.player_name and p.prop_type == "passing_yards"),
+        None,
+    )
+    assert qb_clear is not None and qb_snow is not None
+    assert qb_snow.projected_mean < qb_clear.projected_mean
+    assert any("snow" in d.lower() for d in qb_snow.drivers)
+
+    rb_clear = next((p for p in nfl_clear if p.prop_type == "rushing_yards" and p.position == "RB"), None)
+    rb_snow = next(
+        (p for p in nfl_snow if rb_clear and p.player_name == rb_clear.player_name and p.prop_type == "rushing_yards"),
+        None,
+    )
+    assert rb_clear is not None and rb_snow is not None
+    assert rb_snow.projected_mean > rb_clear.projected_mean
+    assert any("rushing volume" in d.lower() for d in rb_snow.drivers)
+
+    # Positional phrasing in NFL drivers (quarterbacks / running backs / wide receivers / tight ends)
+    all_nfl_drivers = [d for pp in nfl_clear for d in pp.drivers]
+    assert any(
+        w in d.lower()
+        for d in all_nfl_drivers
+        for w in ("quarterbacks", "running backs", "wide receivers", "tight ends")
+    )
+
+    # Skew-driven Under explanation never contradicts an Under pick when mean > line > median
+    med = prop_median_for_type("receiving_yards", mean=75.3, std=48.0)
+    assert med < 66.5
+    skew_reason = build_prop_primary_reason(
+        player_name="Matthew Golden",
+        prop_type="receiving_yards",
+        prop_label="Receiving Yards",
+        side="UNDER",
+        line_val=66.5,
+        proj_mean=75.3,
+        proj_median=med,
+        side_prob=0.53,
+        line_source="DraftKings",
+    )
+    _assert_plain_sentences([skew_reason], "skew-driven under reason")
+    assert "typical outcome" in skew_reason.lower()
+    assert "below the 66.5 line" in skew_reason.lower()
+
+
+def test_cross_book_prop_driver_uses_winning_line_and_espn_weather_parsing() -> None:
+    mock_pp = PlayerPropProjection(
+        sport="NFL",
+        player_name="Patrick Mahomes",
+        team="KC",
+        opponent="CIN",
+        prop_type="passing_yards",
+        prop_label="Passing Yards",
+        line_value=252.5,
+        projected_mean=268.0,
+        projected_std=45.0,
+        over_prob=0.60,
+        under_prob=0.40,
+        drivers=["Old line 252.5."],
+        injury_clarity=1.0,
+        projected_median=261.0,
+        position="QB",
+        context_drivers=["CIN allows 12% more passing yards per game to quarterbacks than the league average (255.0 vs. 227.9)."],
+    )
+    assembled = _assemble_prop_drivers(
+        pp=mock_pp,
+        side="OVER",
+        line_val=249.5,
+        side_prob=0.63,
+        line_source="DK + FD",
+        safety_drivers=[],
+        shop_driver="FanDuel offers a better line (249.5 at -110) than DraftKings (252.5 at -110), adding 2.4% in expected value.",
+    )
+    _assert_plain_sentences(assembled, "sportsbook cross-book prop drivers")
+    assert any("249.5" in d and "18.5 above" in d for d in assembled)
+    assert not any("252.5 line" in d for d in assembled)
+
+    # ESPN weather condition + NFL dome fallback parsing
+    raw_ev = {
+        "id": "401999999",
+        "date": "2026-11-29T18:00:00Z",
+        "weather": {"displayValue": "Heavy Rain", "temperature": 38, "windSpeed": 17},
+        "competitions": [
+            {
+                "status": {"type": {"state": "pre", "name": "STATUS_SCHEDULED", "shortDetail": "Sun 1:00 PM"}},
+                "venue": {"indoor": False},
+                "competitors": [
+                    {"homeAway": "home", "team": {"id": "2", "abbreviation": "BUF", "displayName": "Buffalo Bills"}},
+                    {"homeAway": "away", "team": {"id": "12", "abbreviation": "KC", "displayName": "Kansas City Chiefs"}},
+                ],
+                "odds": [],
+            }
+        ],
+    }
+    parsed = ESPNClient()._parse_event("NFL", raw_ev)
+    assert parsed is not None
+    assert parsed["indoor"] is False
+    assert parsed["weather_condition"] == "Heavy Rain"
+    assert parsed["wind_mph"] == 17.0
+    assert parsed["temp_f"] == 38.0
+    assert parsed["precip_prob"] >= 70.0
 
 
 def test_recommender_steam_and_parlay_reasons_are_plain_sentences() -> None:

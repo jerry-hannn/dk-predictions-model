@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -68,6 +68,70 @@ TEAM_NAME_TO_ABBR = {
     "san antonio spurs": "SAS", "toronto raptors": "TOR", "utah jazz": "UTA",
     "washington wizards": "WAS",
 }
+
+# NFL home stadiums: (latitude, longitude, is_indoor_or_retractable_dome)
+NFL_STADIUMS: dict[str, tuple[float, float, bool]] = {
+    "ARI": (33.5276, -112.2626, True),
+    "ATL": (33.7554, -84.4008, True),
+    "BAL": (39.2780, -76.6227, False),
+    "BUF": (42.7738, -78.7870, False),
+    "CAR": (35.2258, -80.8528, False),
+    "CHI": (41.8623, -87.6167, False),
+    "CIN": (39.0954, -84.5160, False),
+    "CLE": (41.5061, -81.6995, False),
+    "DAL": (32.7473, -97.0945, True),
+    "DEN": (39.7439, -105.0201, False),
+    "DET": (42.3400, -83.0456, True),
+    "GB": (44.5013, -88.0622, False),
+    "HOU": (29.6847, -95.4107, True),
+    "IND": (39.7601, -86.1639, True),
+    "JAX": (30.3239, -81.6373, False),
+    "KC": (39.0489, -94.4839, False),
+    "LA": (33.9535, -118.3392, True),
+    "LAR": (33.9535, -118.3392, True),
+    "LAC": (33.9535, -118.3392, True),
+    "LV": (36.0909, -115.1833, True),
+    "MIA": (25.9580, -80.2389, False),
+    "MIN": (44.9736, -93.2575, True),
+    "NE": (42.0909, -71.2643, False),
+    "NO": (29.9511, -90.0812, True),
+    "NYG": (40.8128, -74.0742, False),
+    "NYJ": (40.8128, -74.0742, False),
+    "PHI": (39.9008, -75.1675, False),
+    "PIT": (40.4468, -80.0158, False),
+    "SEA": (47.5952, -122.3316, False),
+    "SF": (37.4033, -121.9694, False),
+    "TB": (27.9759, -82.5033, False),
+    "TEN": (36.1665, -86.7713, False),
+    "WAS": (38.9076, -76.8645, False),
+}
+
+
+def _wmo_code_to_condition(code: int | None) -> str:
+    """Convert an Open-Meteo WMO weather code into a concise plain-English condition label."""
+    if code is None:
+        return ""
+    if code in (0, 1):
+        return "Clear"
+    if code in (2, 3):
+        return "Cloudy"
+    if code in (45, 48):
+        return "Fog"
+    if code in (51, 53, 55, 61, 80):
+        return "Light Rain"
+    if code in (63, 81):
+        return "Rain"
+    if code in (65, 82):
+        return "Heavy Rain"
+    if code in (56, 57, 66, 67):
+        return "Freezing Rain"
+    if code in (71, 77, 85):
+        return "Light Snow"
+    if code in (73, 75, 86):
+        return "Snow"
+    if code in (95, 96, 99):
+        return "Thunderstorm"
+    return ""
 
 
 def _parse_american_str(val: Any) -> float | None:
@@ -305,7 +369,117 @@ class ESPNClient:
                     seen_ids.add(ev_id)
                     normalized_events.append(parsed)
 
+        # Enrich outdoor NFL games missing wind/condition data using free kickoff weather forecasts
+        if sport_u == "NFL":
+            need_wx = [
+                ev
+                for ev in normalized_events
+                if not ev.get("indoor", False)
+                and ev.get("state") in ("PRE", "IN")
+                and (not ev.get("weather_condition") or float(ev.get("wind_mph") or 0.0) <= 0.0)
+            ]
+            if need_wx:
+                def _enrich_wx(ev_item: dict[str, Any]) -> None:
+                    fc = self.fetch_nfl_weather_forecast(
+                        str(ev_item.get("home_abbr", "")),
+                        str(ev_item.get("start_time", "")),
+                        force_refresh=force_refresh,
+                    )
+                    if not fc:
+                        return
+                    if not ev_item.get("has_espn_temp") and fc.get("temp_f") is not None:
+                        ev_item["temp_f"] = fc["temp_f"]
+                    if float(ev_item.get("wind_mph") or 0.0) <= 0.0 and fc.get("wind_mph") is not None:
+                        ev_item["wind_mph"] = fc["wind_mph"]
+                    if not ev_item.get("weather_condition") and fc.get("weather_condition"):
+                        ev_item["weather_condition"] = fc["weather_condition"]
+                    if float(ev_item.get("precip_prob") or 0.0) <= 0.0 and fc.get("precip_prob") is not None:
+                        ev_item["precip_prob"] = fc["precip_prob"]
+
+                with ThreadPoolExecutor(max_workers=min(6, len(need_wx))) as pool:
+                    list(pool.map(_enrich_wx, need_wx))
+
         return normalized_events
+
+    def fetch_nfl_weather_forecast(
+        self, home_abbr: str, start_time: str, force_refresh: bool = False
+    ) -> dict[str, Any] | None:
+        """
+        Fetch kickoff-hour temperature (°F), wind speed (mph), precipitation probability,
+        and weather condition for an outdoor NFL stadium via Open-Meteo (zero API key).
+        Cached for 3 hours; returns None on dome stadiums, distant dates, or network failure.
+        """
+        stadium = NFL_STADIUMS.get(str(home_abbr or "").upper())
+        if not stadium or stadium[2]:
+            return None
+        lat, lon, _ = stadium
+
+        if not start_time:
+            return None
+        try:
+            ko_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+            if ko_dt.tzinfo is None:
+                ko_dt = ko_dt.replace(tzinfo=timezone.utc)
+            ko_utc = ko_dt.astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+        now_utc = datetime.now(timezone.utc)
+        hrs_diff = (ko_utc - now_utc).total_seconds() / 3600.0
+        if hrs_diff < -4.0 or hrs_diff > 168.0:
+            return None
+
+        target_hour = ko_utc.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:00")
+        cache_key = f"wx:nfl:{home_abbr.upper()}:{target_hour}"
+        if not force_refresh:
+            cached = self.db.get_cache(cache_key)
+            if isinstance(cached, dict):
+                return cached
+
+        try:
+            resp = http_get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "hourly": "temperature_2m,wind_speed_10m,precipitation_probability,weather_code",
+                    "temperature_unit": "fahrenheit",
+                    "wind_speed_unit": "mph",
+                    "timezone": "UTC",
+                    "forecast_days": 8,
+                },
+                headers=HEADERS,
+                timeout=3.5,
+            )
+            data = resp.json()
+            hourly = data.get("hourly") if isinstance(data, dict) else None
+            if not isinstance(hourly, dict):
+                return None
+            times = hourly.get("time") or []
+            if target_hour not in times:
+                return None
+            idx = times.index(target_hour)
+            temps = hourly.get("temperature_2m") or []
+            winds = hourly.get("wind_speed_10m") or []
+            pprobs = hourly.get("precipitation_probability") or []
+            codes = hourly.get("weather_code") or []
+
+            temp_f = _safe_float(temps[idx], 65.0) if idx < len(temps) else None
+            wind_mph = _safe_float(winds[idx], 0.0) if idx < len(winds) else None
+            precip_prob = _safe_float(pprobs[idx], 0.0) if idx < len(pprobs) else 0.0
+            code = int(codes[idx]) if idx < len(codes) and codes[idx] is not None else None
+
+            out = {
+                "temp_f": round(float(temp_f), 1) if temp_f is not None else None,
+                "wind_mph": round(max(0.0, float(wind_mph)), 1) if wind_mph is not None else None,
+                "precip_prob": round(max(0.0, min(100.0, float(precip_prob))), 1),
+                "weather_condition": _wmo_code_to_condition(code),
+            }
+            self.db.set_cache(cache_key, out, ttl_seconds=10800)
+            return out
+        except Exception:
+            stale, _ = self.db.get_cache_with_age(cache_key, allow_stale=True)
+            return stale if isinstance(stale, dict) else None
 
     def fetch_live_boxscore(
         self, sport: str, event_id: str, force_refresh: bool = False
@@ -962,22 +1136,37 @@ class ESPNClient:
         down_distance = str(situation.get("downDistanceText", "") or "") if isinstance(situation, dict) else ""
 
         venue = comp.get("venue", {}) or {}
-        indoor = bool(venue.get("indoor", False))
-        weather = ev.get("weather", {}) or {}
+        if "indoor" in venue:
+            indoor = bool(venue.get("indoor"))
+        elif sport == "NFL" and home_abbr in NFL_STADIUMS:
+            indoor = bool(NFL_STADIUMS[home_abbr][2])
+        else:
+            indoor = sport == "NBA"
+        weather = ev.get("weather") or comp.get("weather") or {}
+        if not isinstance(weather, dict):
+            weather = {}
         wind_mph = 0.0
-        if not indoor and isinstance(weather, dict):
+        weather_condition = str(weather.get("displayValue") or "").strip() if not indoor else ""
+        if not indoor:
             w_raw = weather.get("windSpeed") or weather.get("gust")
             if w_raw is not None:
                 try:
                     wind_mph = float(w_raw)
                 except (TypeError, ValueError):
                     wind_mph = 0.0
-            elif weather.get("displayValue"):
-                m = re.search(r"(\d+(?:\.\d+)?)\s*mph", str(weather["displayValue"]), re.I)
+            elif weather_condition:
+                m = re.search(r"(\d+(?:\.\d+)?)\s*mph", weather_condition, re.I)
                 if m:
                     wind_mph = float(m.group(1))
+        has_espn_temp = weather.get("temperature") is not None
         # NB: 0°F is a legitimate kickoff temperature; only missing/malformed values default to 68°F
-        temp_f = _safe_float(weather.get("temperature"), 68.0) if isinstance(weather, dict) else 68.0
+        temp_f = _safe_float(weather.get("temperature"), 68.0)
+        cond_low = weather_condition.lower()
+        precip_prob = _safe_float(weather.get("precipitationProbability"), 0.0)
+        if not indoor and precip_prob <= 0.0 and any(
+            k in cond_low for k in ("rain", "snow", "sleet", "storm", "shower", "flurr")
+        ):
+            precip_prob = 75.0
 
         odds_list = comp.get("odds", []) or []
         market_info = self._extract_embedded_odds(odds_list, home_abbr)
@@ -1010,7 +1199,10 @@ class ESPNClient:
             "away_name": away_team.get("displayName", away_abbr),
             "indoor": indoor,
             "temp_f": temp_f,
+            "has_espn_temp": has_espn_temp,
             "wind_mph": wind_mph,
+            "weather_condition": weather_condition,
+            "precip_prob": precip_prob,
             "market": market_info,
         }
 

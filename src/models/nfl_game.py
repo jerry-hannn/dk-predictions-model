@@ -297,6 +297,8 @@ class NFLGameModel:
         is_indoor: bool = False,
         wind_mph: float = 5.0,
         temp_f: float = 65.0,
+        weather_condition: str = "",
+        precip_prob: float = 0.0,
         div_game: bool = False,
         injuries_by_team: dict[str, list[dict[str, Any]]] | None = None,
         live_state: dict[str, Any] | None = None,
@@ -372,8 +374,32 @@ class NFLGameModel:
             dtype=float,
         )
 
+        cond_low = str(weather_condition or "").strip().lower()
+        has_snow = (not is_indoor) and any(k in cond_low for k in ("snow", "flurr", "blizzard", "sleet"))
+        has_rain = (not is_indoor) and (not has_snow) and any(
+            k in cond_low for k in ("rain", "shower", "storm", "drizzle")
+        )
+        likely_precip = (not is_indoor) and (not has_snow) and (not has_rain) and float(precip_prob or 0.0) >= 60.0
+
+        wx_total_adj = 0.0
+        if not is_indoor:
+            if has_snow:
+                wx_total_adj -= 2.4
+            elif has_rain:
+                wx_total_adj -= 1.6
+            elif likely_precip:
+                wx_total_adj -= 0.9
+            if 12.0 <= eff_wind < 15.0:
+                wx_total_adj -= 0.6
+            elif eff_wind >= 20.0:
+                wx_total_adj -= 1.0
+
         pre_exp_margin = float(self.margin_reg.predict(x_vec)[0]) + inj_adj_margin
-        pre_exp_total = float(self.total_reg.predict(x_tot)[0]) - abs(inj_adj_margin) * 0.35
+        pre_exp_total = (
+            float(self.total_reg.predict(x_tot)[0])
+            - abs(inj_adj_margin) * 0.35
+            + wx_total_adj
+        )
 
         clf_prob = float(self.win_clf.predict_proba(x_vec)[0, 1])
         margin_win_prob = float(1.0 - norm.cdf(0.0, loc=pre_exp_margin, scale=self.residual_std))
@@ -483,10 +509,46 @@ class NFLGameModel:
             drivers.append(
                 f"{rested} enters this matchup with {rest_days} extra {day_word} of rest."
             )
-        if eff_wind >= 15.0:
-            drivers.append(
-                f"Strong {eff_wind:.0f} mph winds should make passing tougher and keep scoring lower."
-            )
+        if not is_indoor:
+            wx_driver = ""
+            if has_snow:
+                wind_part = f" and {eff_wind:.0f} mph winds" if eff_wind >= 10.0 else ""
+                wx_driver = (
+                    f"Outdoor snow ({eff_temp:.0f}°F{wind_part}) should hurt footing and passing, pulling total scoring down."
+                )
+            elif has_rain:
+                wind_part = f" and {eff_wind:.0f} mph winds" if eff_wind >= 10.0 else ""
+                wx_driver = (
+                    f"Outdoor rain ({eff_temp:.0f}°F{wind_part}) makes ball security and passing tougher, pointing toward lower scoring."
+                )
+            elif likely_precip:
+                wind_part = f" with {eff_wind:.0f} mph winds" if eff_wind >= 10.0 else ""
+                wx_driver = (
+                    f"A {float(precip_prob):.0f}% chance of wet outdoor weather ({eff_temp:.0f}°F{wind_part}) could dampen passing and scoring."
+                )
+            elif eff_wind >= 15.0:
+                cold_part = f" and {eff_temp:.0f}°F temperatures" if eff_temp <= 38.0 else ""
+                wx_driver = (
+                    f"Strong {eff_wind:.0f} mph outdoor winds{cold_part} should make passing tougher and keep scoring lower."
+                )
+            elif eff_wind >= 12.0:
+                wx_driver = (
+                    f"Breezy {eff_wind:.0f} mph outdoor winds could modestly limit deep passing."
+                )
+            elif eff_temp <= 32.0:
+                wx_driver = (
+                    f"Freezing {eff_temp:.0f}°F outdoor temperatures typically tighten offenses and keep scoring lower."
+                )
+            elif eff_temp <= 38.0:
+                wx_driver = (
+                    f"Cold {eff_temp:.0f}°F outdoor conditions could slightly dampen passing efficiency."
+                )
+            if wx_driver:
+                # Surface severe outdoor weather prominently so game totals include it
+                if has_snow or has_rain or eff_wind >= 15.0 or eff_temp <= 32.0:
+                    drivers.insert(1 if is_live else 0, wx_driver)
+                else:
+                    drivers.append(wx_driver)
         if is_indoor:
             drivers.append(
                 "Playing indoors removes weather factors and tends to help offenses score."

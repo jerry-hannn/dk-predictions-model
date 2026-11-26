@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import json
 import os
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
 import pandas as pd
 
 from src.config import PROJECT_ROOT
+from src.data.odds_client import normalize_player_name
 
 DATA_DIR = PROJECT_ROOT / "data"
 
@@ -84,6 +88,141 @@ class NBALoader:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.games_csv = self.cache_dir / "nba_games.csv"
         self.player_logs_csv = self.cache_dir / "nba_player_logs.csv"
+        self.player_positions_json = self.cache_dir / "nba_player_positions.json"
+
+    @staticmethod
+    def _normalize_nba_position(raw_pos: str) -> str:
+        p = str(raw_pos or "").strip().upper()
+        if not p:
+            return ""
+        head = p.split("-", 1)[0].split("/", 1)[0].strip()
+        if head in ("PG", "SG", "G"):
+            return "G"
+        if head in ("SF", "PF", "F"):
+            return "F"
+        if head == "C":
+            return "C"
+        return ""
+
+    def load_player_positions(self, force_refresh: bool = False) -> dict[str, str]:
+        """
+        Load cached `{normalized_player_name: 'G'|'F'|'C'}` map from disk, refreshing from
+        ESPN's public NBA team rosters when requested. Never fails when offline.
+        """
+        if self.player_positions_json.exists() and not force_refresh:
+            try:
+                data = json.loads(self.player_positions_json.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and data:
+                    return {str(k): str(v) for k, v in data.items() if v in ("G", "F", "C")}
+            except Exception:
+                pass
+
+        if not force_refresh and not self.player_positions_json.exists():
+            # Avoid unexpected network calls during offline unit tests unless refresh requested
+            return {}
+
+        fetched: dict[str, str] = {}
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            r = httpx.get(
+                "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams?limit=40",
+                headers=headers,
+                timeout=6.0,
+            )
+            r.raise_for_status()
+            teams = r.json().get("sports", [{}])[0].get("leagues", [{}])[0].get("teams", [])
+            tids = [str(t.get("team", {}).get("id", "")) for t in teams if t.get("team", {}).get("id")]
+
+            def _fetch_one(tid: str) -> dict[str, str]:
+                out: dict[str, str] = {}
+                try:
+                    resp = httpx.get(
+                        f"https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/{tid}/roster",
+                        headers=headers,
+                        timeout=6.0,
+                    )
+                    if resp.status_code != 200:
+                        return out
+                    for ath in resp.json().get("athletes") or []:
+                        if not isinstance(ath, dict):
+                            continue
+                        name = str(ath.get("displayName") or ath.get("fullName") or "").strip()
+                        pos_raw = (ath.get("position") or {}).get("abbreviation", "")
+                        pos = self._normalize_nba_position(pos_raw)
+                        if name and pos:
+                            out[name.lower()] = pos
+                            norm = normalize_player_name(name)
+                            if norm:
+                                out[norm] = pos
+                except Exception:
+                    return out
+                return out
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+                for part in pool.map(_fetch_one, tids):
+                    fetched.update(part)
+
+            if fetched:
+                tmp = self.player_positions_json.with_suffix(".tmp")
+                tmp.write_text(json.dumps(fetched, sort_keys=True), encoding="utf-8")
+                os.replace(tmp, self.player_positions_json)
+                return fetched
+        except Exception:
+            pass
+
+        if self.player_positions_json.exists():
+            try:
+                data = json.loads(self.player_positions_json.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return {str(k): str(v) for k, v in data.items() if v in ("G", "F", "C")}
+            except Exception:
+                pass
+        return {}
+
+    @staticmethod
+    def attach_player_positions(df: pd.DataFrame, pos_map: dict[str, str] | None = None) -> pd.DataFrame:
+        """
+        Attach a clean NBA position bucket (`G`, `F`, `C`) to each player row using cached
+        roster positions with a deterministic per-36 stat-profile fallback for unmapped players.
+        """
+        if len(df) == 0:
+            return df
+        if "position" in df.columns and df["position"].isin(["G", "F", "C"]).all():
+            return df
+
+        work = df.copy()
+        pmap = pos_map or {}
+
+        # Per-36 fallback profile computed per player across active games
+        active = work[work["minutes"] >= 8.0] if "minutes" in work.columns else work
+        if len(active) == 0:
+            active = work
+        prof = active.groupby("player_name", as_index=False).agg(
+            mins=("minutes", "sum"),
+            reb=("rebounds", "sum"),
+            ast=("assists", "sum"),
+            fg3m=("fg3m", "sum"),
+        )
+        inferred: dict[str, str] = {}
+        for _, r in prof.iterrows():
+            nm = str(r["player_name"])
+            known = pmap.get(nm.lower()) or pmap.get(normalize_player_name(nm))
+            if known in ("G", "F", "C"):
+                inferred[nm] = known
+                continue
+            m = max(1.0, float(r["mins"]))
+            reb36 = float(r["reb"]) * 36.0 / m
+            ast36 = float(r["ast"]) * 36.0 / m
+            fg3_36 = float(r["fg3m"]) * 36.0 / m
+            if reb36 >= 10.2 or (reb36 >= 8.6 and fg3_36 < 1.2 and ast36 < 4.5):
+                inferred[nm] = "C"
+            elif ast36 >= 4.2 or (fg3_36 >= 2.1 and reb36 < 6.4):
+                inferred[nm] = "G"
+            else:
+                inferred[nm] = "F"
+
+        work["position"] = work["player_name"].map(inferred).fillna("F")
+        return work
 
     def load_games(
         self, seasons: list[str] | None = None, force_refresh: bool = False
@@ -129,9 +268,10 @@ class NBALoader:
     def load_player_logs(
         self, seasons: list[str] | None = None, force_refresh: bool = False
     ) -> pd.DataFrame:
-        """Load NBA player box-score logs (minutes, PTS, REB, AST, FG3M, usage proxy)."""
+        """Load NBA player box-score logs (minutes, PTS, REB, AST, FG3M, usage proxy, position)."""
+        pos_map = self.load_player_positions(force_refresh=force_refresh)
         if self.player_logs_csv.exists() and not force_refresh:
-            return read_csv_cached(self.player_logs_csv)
+            return self.attach_player_positions(read_csv_cached(self.player_logs_csv), pos_map)
 
         season_strs = seasons or ["2025-26", "2026-27"]
         try:
@@ -155,15 +295,15 @@ class NBALoader:
                 df = self._normalize_player_logs(raw)
                 if len(df) >= 200:
                     write_csv_atomic(df, self.player_logs_csv)
-                    return df
+                    return self.attach_player_positions(df, pos_map)
         except Exception:
             pass
 
         if self.player_logs_csv.exists():
-            return read_csv_cached(self.player_logs_csv)
+            return self.attach_player_positions(read_csv_cached(self.player_logs_csv), pos_map)
         df = self.generate_synthetic_nba_player_logs()
         write_csv_atomic(df, self.player_logs_csv)
-        return df
+        return self.attach_player_positions(df, pos_map)
 
     @staticmethod
     def _pair_team_logs(raw: pd.DataFrame) -> pd.DataFrame:

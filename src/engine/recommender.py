@@ -51,7 +51,12 @@ from src.engine.sportsbook_math import (
 from src.models import atomic_joblib_dump
 from src.models.nba_game import NBAGameModel
 from src.models.nfl_game import NFLGameModel
-from src.models.player_props import PlayerPropsEngine, prop_over_prob_for_line
+from src.models.player_props import (
+    PlayerPropsEngine,
+    build_prop_primary_reason,
+    prop_median_for_type,
+    prop_over_prob_for_line,
+)
 from src.storage.db import Database
 
 
@@ -62,6 +67,54 @@ def _num_or(value: Any, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return out if math.isfinite(out) else default
+
+
+def _assemble_prop_drivers(
+    *,
+    pp: Any,
+    side: str,
+    line_val: float,
+    side_prob: float,
+    line_source: str,
+    safety_drivers: list[str],
+    shop_driver: str | None = None,
+) -> list[str]:
+    """Assemble side- and line-aware prop drivers that always match the chosen bet."""
+    is_live = bool(getattr(pp, "is_live", False))
+    cur_stat = float(getattr(pp, "current_stat", 0.0) or 0.0)
+    proj_mean = float(getattr(pp, "projected_mean", 0.0) or 0.0)
+    proj_std = float(getattr(pp, "projected_std", 1.0) or 1.0)
+    proj_median = getattr(pp, "projected_median", None)
+    if proj_median is None:
+        proj_median = prop_median_for_type(pp.prop_type, proj_mean, proj_std)
+
+    primary = build_prop_primary_reason(
+        player_name=pp.player_name,
+        prop_type=pp.prop_type,
+        prop_label=pp.prop_label,
+        side=side,
+        line_val=float(line_val),
+        proj_mean=proj_mean,
+        proj_median=float(proj_median) if proj_median is not None else None,
+        side_prob=float(side_prob),
+        line_source=line_source,
+        is_live=is_live,
+        current_stat=cur_stat,
+        live_time_note=str(getattr(pp, "live_time_note", "") or ""),
+    )
+    ctx = getattr(pp, "context_drivers", None)
+    if ctx is None:
+        raw_d = list(getattr(pp, "drivers", []) or [])
+        ctx = raw_d[1:] if len(raw_d) > 1 else []
+    else:
+        ctx = list(ctx)
+
+    assembled: list[str] = list(safety_drivers)
+    if shop_driver:
+        assembled.append(shop_driver)
+    assembled.append(primary)
+    assembled.extend(ctx)
+    return assembled[:4]
 
 
 def blend_probabilities(
@@ -623,6 +676,8 @@ class ModelHub:
                         is_indoor=bool(ev.get("indoor", False)),
                         wind_mph=_num_or(ev.get("wind_mph"), 5.0),
                         temp_f=_num_or(ev.get("temp_f"), 65.0),
+                        weather_condition=str(ev.get("weather_condition") or ""),
+                        precip_prob=_num_or(ev.get("precip_prob"), 0.0),
                         injuries_by_team=injuries,
                         live_state=ev if is_live else None,
                     )
@@ -634,6 +689,9 @@ class ModelHub:
                             expected_total=gpred.expected_total,
                             is_indoor=bool(ev.get("indoor", False)),
                             wind_mph=_num_or(ev.get("wind_mph"), 5.0),
+                            temp_f=_num_or(ev.get("temp_f"), 65.0),
+                            weather_condition=str(ev.get("weather_condition") or ""),
+                            precip_prob=_num_or(ev.get("precip_prob"), 0.0),
                             injuries_by_team=injuries,
                             custom_lines=custom_prop_lines or None,
                             live_prop_markets=live_prop_mkts,
@@ -1416,7 +1474,14 @@ class ModelHub:
             "american_equivalent": best.american_equivalent,
             "confidence_score": best.confidence_score,
             "confidence_tier": best.confidence_tier,
-            "drivers": (list(safety_drivers) + list(pp.drivers))[:4],
+            "drivers": _assemble_prop_drivers(
+                pp=pp,
+                side="OVER" if best.side == "YES" else "UNDER",
+                line_val=float(pp.line_value),
+                side_prob=float(best.model_prob),
+                line_source=prop_src,
+                safety_drivers=safety_drivers,
+            ),
             "injury_notes": inj_notes,
         }
         out.update(live_fields)
@@ -1984,6 +2049,8 @@ class ModelHub:
                         is_indoor=bool(ev.get("indoor", False)),
                         wind_mph=_num_or(ev.get("wind_mph"), 5.0),
                         temp_f=_num_or(ev.get("temp_f"), 65.0),
+                        weather_condition=str(ev.get("weather_condition") or ""),
+                        precip_prob=_num_or(ev.get("precip_prob"), 0.0),
                         injuries_by_team=injuries,
                         live_state=ev if is_live else None,
                     )
@@ -1995,6 +2062,9 @@ class ModelHub:
                             expected_total=gpred.expected_total,
                             is_indoor=bool(ev.get("indoor", False)),
                             wind_mph=_num_or(ev.get("wind_mph"), 5.0),
+                            temp_f=_num_or(ev.get("temp_f"), 65.0),
+                            weather_condition=str(ev.get("weather_condition") or ""),
+                            precip_prob=_num_or(ev.get("precip_prob"), 0.0),
                             injuries_by_team=injuries,
                             live_prop_markets=live_prop_mkts,
                             live_state=ev if is_live else None,
@@ -2448,22 +2518,36 @@ class ModelHub:
                                 bankroll=0.0,
                                 min_ev_edge=99.0,
                             )
-                        other_same = next(
+                        other_item = next(
                             (
-                                x["eval"]
+                                x
                                 for x in sp_evals
                                 if x["eval"].side == best_ev.side and x["eval"].book != best_ev.book
                             ),
                             None,
                         )
+                        other_same = other_item["eval"] if other_item is not None else None
                         shop_gain = (
                             round(best_ev.ev_pct - other_same.ev_pct, 4)
                             if other_same is not None
                             else None
                         )
-                        drivers = list(safety_drivers) + [
+                        drivers = list(safety_drivers)
+                        if shop_gain is not None and shop_gain >= 0.005 and other_item is not None:
+                            other_nm = "FanDuel" if other_same.book == "FANDUEL" else "DraftKings"
+                            best_nm = "DraftKings" if best_ev.book == "DRAFTKINGS" else "FanDuel"
+                            if abs(float(best_item["line"]) - float(other_item["line"])) >= 0.25:
+                                drivers.append(
+                                    f"{best_nm} offers a better spread ({best_item['line']:+.1f} at {format_american(best_ev.american_odds)}) than {other_nm} ({other_item['line']:+.1f} at {format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value."
+                                )
+                            else:
+                                drivers.append(
+                                    f"{best_nm} offers better odds ({format_american(best_ev.american_odds)}) than {other_nm} ({format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value."
+                                )
+                        drivers.append(
                             f"The model sets a fair spread of {h} {-gpred.expected_margin:+.1f}, compared to the posted {best_item['home_sp']:+.1f} line."
-                        ] + list(gpred.drivers[:2])
+                        )
+                        drivers.extend(gpred.drivers[:2])
                         picks_all.append(
                             {
                                 **base_meta,
@@ -2646,22 +2730,36 @@ class ModelHub:
                                 bankroll=0.0,
                                 min_ev_edge=99.0,
                             )
-                        other_same = next(
+                        other_item = next(
                             (
-                                x["eval"]
+                                x
                                 for x in tot_evals
                                 if x["eval"].side == best_ev.side and x["eval"].book != best_ev.book
                             ),
                             None,
                         )
+                        other_same = other_item["eval"] if other_item is not None else None
                         shop_gain = (
                             round(best_ev.ev_pct - other_same.ev_pct, 4)
                             if other_same is not None
                             else None
                         )
-                        drivers = list(safety_drivers) + [
+                        drivers = list(safety_drivers)
+                        if shop_gain is not None and shop_gain >= 0.005 and other_item is not None:
+                            other_nm = "FanDuel" if other_same.book == "FANDUEL" else "DraftKings"
+                            best_nm = "DraftKings" if best_ev.book == "DRAFTKINGS" else "FanDuel"
+                            if abs(float(best_item["line"]) - float(other_item["line"])) >= 0.25:
+                                drivers.append(
+                                    f"{best_nm} offers a better total ({best_item['line']:.1f} at {format_american(best_ev.american_odds)}) than {other_nm} ({other_item['line']:.1f} at {format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value."
+                                )
+                            else:
+                                drivers.append(
+                                    f"{best_nm} offers better odds ({format_american(best_ev.american_odds)}) than {other_nm} ({format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value."
+                                )
+                        drivers.append(
                             f"The model projects {gpred.expected_total:.1f} combined points against the {best_item['line']:.1f} total line."
-                        ] + list(gpred.drivers[:2])
+                        )
+                        drivers.extend(gpred.drivers[:2])
                         picks_all.append(
                             {
                                 **base_meta,
@@ -2832,19 +2930,32 @@ class ModelHub:
                                 bankroll=0.0,
                                 min_ev_edge=99.0,
                             )
-                        other_same = next(
+                        other_item = next(
                             (
-                                x["eval"]
+                                x
                                 for x in pp_evals
                                 if x["eval"].side == best_ev.side and x["eval"].book != best_ev.book
                             ),
                             None,
                         )
+                        other_same = other_item["eval"] if other_item is not None else None
                         shop_gain = (
                             round(best_ev.ev_pct - other_same.ev_pct, 4)
                             if other_same is not None
                             else None
                         )
+                        shop_driver: str | None = None
+                        if shop_gain is not None and shop_gain >= 0.005 and other_item is not None:
+                            other_nm = "FanDuel" if other_same.book == "FANDUEL" else "DraftKings"
+                            best_nm = "DraftKings" if best_ev.book == "DRAFTKINGS" else "FanDuel"
+                            if abs(float(best_item["line"]) - float(other_item["line"])) >= 0.25:
+                                shop_driver = (
+                                    f"{best_nm} offers a better line ({best_item['line']:.1f} at {format_american(best_ev.american_odds)}) than {other_nm} ({other_item['line']:.1f} at {format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value."
+                                )
+                            else:
+                                shop_driver = (
+                                    f"{best_nm} offers better odds ({format_american(best_ev.american_odds)}) than {other_nm} ({format_american(other_same.american_odds)}), adding {shop_gain*100:.1f}% in expected value."
+                                )
                         slug = pp.player_name.lower().replace(" ", "_")
                         picks_all.append(
                             {
@@ -2861,7 +2972,15 @@ class ModelHub:
                                 "line_shopping_gain_pct": shop_gain,
                                 "yes_true_prob": round(best_item["blend_ov"], 4),
                                 "line_source": pp_line_src,
-                                "drivers": (list(safety_drivers) + list(pp.drivers))[:4],
+                                "drivers": _assemble_prop_drivers(
+                                    pp=pp,
+                                    side=best_ev.side,
+                                    line_val=float(best_item["line"]),
+                                    side_prob=float(best_ev.model_prob),
+                                    line_source=pp_line_src,
+                                    safety_drivers=safety_drivers,
+                                    shop_driver=shop_driver,
+                                ),
                                 **best_ev.to_dict(),
                             }
                         )

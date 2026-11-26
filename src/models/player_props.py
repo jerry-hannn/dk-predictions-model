@@ -35,6 +35,10 @@ class PlayerPropProjection:
     default_line_value: float | None = None
     is_custom_line: bool = False
     book_lines: dict[str, dict[str, Any]] | None = None
+    projected_median: float | None = None
+    position: str = ""
+    context_drivers: list[str] | None = None
+    live_time_note: str = ""
 
 
 _PLAIN_STAT_NAMES: dict[str, str] = {
@@ -50,9 +54,23 @@ _PLAIN_STAT_NAMES: dict[str, str] = {
     "receptions": "receptions",
 }
 
+_POSITION_PLURALS: dict[str, str] = {
+    "QB": "quarterbacks",
+    "RB": "running backs",
+    "WR": "wide receivers",
+    "TE": "tight ends",
+    "G": "guards",
+    "F": "forwards",
+    "C": "centers",
+}
+
 
 def _plain_stat_name(col: str, fallback: str) -> str:
     return _PLAIN_STAT_NAMES.get(col, fallback.lower())
+
+
+def _plain_pos_plural(pos: str) -> str:
+    return _POSITION_PLURALS.get(str(pos or "").upper(), "")
 
 
 def _lookup_player_prop(
@@ -167,6 +185,132 @@ def prop_over_prob_for_line(
     return clamp_prob(0.50 + shrink_factor * (raw - 0.50))
 
 
+def prop_median_for_type(prop_type: str, mean: float, std: float) -> float:
+    """
+    Compute the 50th-percentile (typical/median) outcome for the prop's exact distribution.
+    For right-skewed yardage (Gamma) and count (NegBin/Poisson) stats, the median sits below
+    the arithmetic mean when game-to-game variance is large.
+    """
+    pt = str(prop_type).lower()
+    if pt in ("points", "pra"):
+        return round(float(mean), 2)
+    if pt in ("passing_yards", "rushing_yards", "receiving_yards"):
+        mu = max(1.0, float(mean))
+        sigma = max(1.5, float(std))
+        shape = (mu / sigma) ** 2
+        scale = (sigma * sigma) / mu
+        return round(float(gamma.ppf(0.5, a=shape, scale=scale)), 2)
+    mu = max(0.05, float(mean))
+    var = max(mu * 1.02, float(std) ** 2)
+    if var <= mu * 1.06:
+        return round(float(poisson.ppf(0.5, mu=mu)), 2)
+    p = mu / var
+    n = (mu * mu) / (var - mu)
+    return round(float(nbinom.ppf(0.5, n=n, p=p)), 2)
+
+
+def build_prop_primary_reason(
+    *,
+    player_name: str,
+    prop_type: str,
+    prop_label: str,
+    side: str,
+    line_val: float,
+    proj_mean: float,
+    proj_median: float | None,
+    side_prob: float,
+    line_source: str = "DraftKings",
+    is_live: bool = False,
+    current_stat: float = 0.0,
+    live_time_note: str = "",
+) -> str:
+    """
+    Build a concise, side- and line-aware plain-English primary reason that never contradicts
+    the recommended Over/Under side (accounting for right-skewed medians and price-driven picks).
+    """
+    stat_name = _plain_stat_name(prop_type, prop_label)
+    side_u = "OVER" if str(side).upper() in ("OVER", "YES") else "UNDER"
+
+    if is_live:
+        time_part = f" with {live_time_note}" if live_time_note else ""
+        return (
+            f"{player_name} has {current_stat:.0f} {stat_name} so far and projects to finish "
+            f"around {proj_mean:.1f}{time_part}, against the {line_val:.1f} line."
+        )
+
+    is_est = line_source == "Model Ref Line"
+    est_adj = "estimated " if is_est else ""
+    verify_note = "; verify the posted DraftKings line" if is_est else ""
+
+    if side_u == "OVER":
+        if proj_mean >= line_val + 0.25:
+            gap = proj_mean - line_val
+            return (
+                f"The model projects {player_name} for {proj_mean:.1f} {stat_name}, "
+                f"{gap:.1f} above the {est_adj}{line_val:.1f} line{verify_note}."
+            )
+        return (
+            f"The model projects {player_name} near {proj_mean:.1f} {stat_name} with a "
+            f"{side_prob * 100:.0f}% chance to clear the {est_adj}{line_val:.1f} line, "
+            f"making the current price attractive{verify_note}."
+        )
+
+    # UNDER side
+    if proj_mean <= line_val - 0.25:
+        gap = line_val - proj_mean
+        return (
+            f"The model projects {player_name} for {proj_mean:.1f} {stat_name}, "
+            f"{gap:.1f} below the {est_adj}{line_val:.1f} line{verify_note}."
+        )
+    if proj_median is not None and proj_median <= line_val + 0.05 and proj_mean > line_val:
+        return (
+            f"Boom-or-bust game logs put {player_name}'s typical outcome around {proj_median:.1f} "
+            f"{stat_name}, below the {est_adj}{line_val:.1f} line even though spike games lift "
+            f"the average to {proj_mean:.1f}{verify_note}."
+        )
+    return (
+        f"The model gives {player_name} a {side_prob * 100:.0f}% chance to stay under the "
+        f"{est_adj}{line_val:.1f} {stat_name} line (projecting {proj_mean:.1f}), making the "
+        f"current price attractive{verify_note}."
+    )
+
+
+def _format_positional_defense_driver(
+    *,
+    opp: str,
+    pos: str,
+    stat_name: str,
+    pos_info: dict[str, float] | None,
+    fallback_mult: float,
+) -> str | None:
+    """Format a specific plain-English opponent positional defense reason when meaningful."""
+    pos_plural = _plain_pos_plural(pos)
+    if pos_info and pos_plural:
+        pct_diff = float(pos_info.get("pct_diff", 0.0))
+        opp_avg = float(pos_info.get("opp_avg", 0.0))
+        lg_avg = float(pos_info.get("lg_avg", 0.0))
+        factor = float(pos_info.get("factor", 1.0))
+        if abs(pct_diff) >= 5.0 or abs(factor - 1.0) >= 0.025:
+            if pct_diff > 0:
+                return (
+                    f"{opp} allows {abs(pct_diff):.0f}% more {stat_name} per game to {pos_plural} "
+                    f"than the league average ({opp_avg:.1f} vs. {lg_avg:.1f})."
+                )
+            return (
+                f"{opp} holds {pos_plural} to {abs(pct_diff):.0f}% fewer {stat_name} per game "
+                f"than the league average ({opp_avg:.1f} vs. {lg_avg:.1f})."
+            )
+        return None
+
+    if abs(fallback_mult - 1.0) >= 0.03:
+        pct_diff = abs(fallback_mult - 1.0) * 100.0
+        target_txt = pos_plural or "opponents"
+        if fallback_mult > 1.0:
+            return f"{opp} allows {pct_diff:.0f}% more {stat_name} per game to {target_txt} than average."
+        return f"{opp} holds {target_txt} to {pct_diff:.0f}% fewer {stat_name} per game than average."
+    return None
+
+
 class PlayerPropsEngine:
     """Generates calibrated pre-game and live in-play player prop distributions."""
 
@@ -191,10 +335,18 @@ class PlayerPropsEngine:
         self.nfl_logs: pd.DataFrame = pd.DataFrame()
         self.nba_opp_def_factor: dict[str, dict[str, float]] = {}
         self.nfl_opp_def_factor: dict[str, dict[str, float]] = {}
+        self.nba_opp_pos_stats: dict[tuple[str, str], dict[str, dict[str, float]]] = {}
+        self.nfl_opp_pos_stats: dict[tuple[str, str], dict[str, dict[str, float]]] = {}
 
     def fit(self, nfl_logs: pd.DataFrame, nba_logs: pd.DataFrame) -> None:
+        from src.data.nba_loader import NBALoader
+
         self.nfl_logs = nfl_logs.sort_values("game_order").reset_index(drop=True)
-        self.nba_logs = nba_logs.sort_values("gameday").reset_index(drop=True)
+        nba_sorted = nba_logs.sort_values("gameday").reset_index(drop=True)
+        if len(nba_sorted) > 0 and "position" not in nba_sorted.columns:
+            ldr = NBALoader()
+            nba_sorted = ldr.attach_player_positions(nba_sorted, ldr.load_player_positions())
+        self.nba_logs = nba_sorted
         self._team_map_cache = {}
         self._compute_opponent_allowances()
 
@@ -229,7 +381,20 @@ class PlayerPropsEngine:
         return team_map
 
     def _compute_opponent_allowances(self) -> None:
+        self.nba_opp_def_factor = {}
+        self.nfl_opp_def_factor = {}
+        self.nba_opp_pos_stats = {}
+        self.nfl_opp_pos_stats = {}
+
         if len(self.nba_logs) > 0:
+            if "position" not in self.nba_logs.columns:
+                from src.data.nba_loader import NBALoader
+
+                ldr = NBALoader()
+                self.nba_logs = ldr.attach_player_positions(
+                    self.nba_logs, ldr.load_player_positions()
+                )
+
             team_game = (
                 self.nba_logs.groupby(["opponent", "gameday"], as_index=False)
                 .agg(
@@ -258,7 +423,53 @@ class PlayerPropsEngine:
                     "pra": (0.60 * pts_f + 0.22 * reb_f + 0.18 * ast_f),
                 }
 
+            # Position-specific NBA opponent allowances (G / F / C) reindexed over all team games
+            all_nba_games = team_game[["opponent", "gameday"]].drop_duplicates()
+            nba_stat_cols = ("points", "rebounds", "assists", "fg3m", "pra")
+            work_nba = self.nba_logs.copy()
+            if "pra" not in work_nba.columns:
+                work_nba["pra"] = work_nba["points"] + work_nba["rebounds"] + work_nba["assists"]
+            for pos in ("G", "F", "C"):
+                sub = work_nba[work_nba["position"].astype(str).str.upper() == pos]
+                if len(sub) == 0:
+                    continue
+                pos_game = (
+                    sub.groupby(["opponent", "gameday"], as_index=False)[list(nba_stat_cols)]
+                    .sum()
+                )
+                pos_full = all_nba_games.merge(pos_game, on=["opponent", "gameday"], how="left").fillna(0.0)
+                pos_lg = {c: max(0.5, float(pos_full[c].mean())) for c in nba_stat_cols}
+                pos_by_opp = pos_full.groupby("opponent", as_index=False).agg(
+                    n_games=("gameday", "count"),
+                    **{c: (c, "mean") for c in nba_stat_cols},
+                )
+                for _, r in pos_by_opp.iterrows():
+                    opp = str(r["opponent"]).upper()
+                    n_g = float(r["n_games"])
+                    shrink_w = n_g / (n_g + 16.0)
+                    stats_map: dict[str, dict[str, float]] = {}
+                    for c in nba_stat_cols:
+                        opp_avg = float(r[c])
+                        lg_avg = pos_lg[c]
+                        raw_ratio = opp_avg / lg_avg
+                        shrunk = float(np.clip(1.0 + shrink_w * (raw_ratio - 1.0), 0.90, 1.10))
+                        stats_map[c] = {
+                            "factor": round(shrunk, 4),
+                            "opp_avg": round(opp_avg, 2),
+                            "lg_avg": round(lg_avg, 2),
+                            "pct_diff": round((raw_ratio - 1.0) * 100.0, 1),
+                            "n_games": n_g,
+                        }
+                    self.nba_opp_pos_stats[(opp, pos)] = stats_map
+
         if len(self.nfl_logs) > 0:
+            nfl_stat_cols = (
+                "passing_yards",
+                "passing_tds",
+                "rushing_yards",
+                "receiving_yards",
+                "receptions",
+            )
             team_wk = (
                 self.nfl_logs.groupby(["opponent", "season", "week"], as_index=False)
                 .agg(
@@ -269,16 +480,7 @@ class PlayerPropsEngine:
                     receptions=("receptions", "sum"),
                 )
             )
-            lg_means = {
-                c: max(0.5, float(team_wk[c].mean()))
-                for c in (
-                    "passing_yards",
-                    "passing_tds",
-                    "rushing_yards",
-                    "receiving_yards",
-                    "receptions",
-                )
-            }
+            lg_means = {c: max(0.5, float(team_wk[c].mean())) for c in nfl_stat_cols}
             by_opp = team_wk.groupby("opponent", as_index=False).mean(numeric_only=True)
             for _, r in by_opp.iterrows():
                 opp = str(r["opponent"]).upper()
@@ -286,6 +488,45 @@ class PlayerPropsEngine:
                     c: float(np.clip(r[c] / lg_means[c], 0.92, 1.08))
                     for c in lg_means
                 }
+
+            # Position-specific NFL opponent allowances (QB / RB / WR / TE)
+            if "position" in self.nfl_logs.columns:
+                all_nfl_games = team_wk[["opponent", "season", "week"]].drop_duplicates()
+                pos_col = self.nfl_logs["position"].astype(str).str.upper()
+                for pos in ("QB", "RB", "WR", "TE"):
+                    sub = self.nfl_logs[pos_col == pos]
+                    if len(sub) == 0:
+                        continue
+                    pos_wk = (
+                        sub.groupby(["opponent", "season", "week"], as_index=False)[list(nfl_stat_cols)]
+                        .sum()
+                    )
+                    pos_full = all_nfl_games.merge(
+                        pos_wk, on=["opponent", "season", "week"], how="left"
+                    ).fillna(0.0)
+                    pos_lg = {c: max(0.15, float(pos_full[c].mean())) for c in nfl_stat_cols}
+                    pos_by_opp = pos_full.groupby("opponent", as_index=False).agg(
+                        n_games=("week", "count"),
+                        **{c: (c, "mean") for c in nfl_stat_cols},
+                    )
+                    for _, r in pos_by_opp.iterrows():
+                        opp = str(r["opponent"]).upper()
+                        n_g = float(r["n_games"])
+                        shrink_w = n_g / (n_g + 12.0)
+                        stats_map = {}
+                        for c in nfl_stat_cols:
+                            opp_avg = float(r[c])
+                            lg_avg = pos_lg[c]
+                            raw_ratio = opp_avg / lg_avg
+                            shrunk = float(np.clip(1.0 + shrink_w * (raw_ratio - 1.0), 0.89, 1.11))
+                            stats_map[c] = {
+                                "factor": round(shrunk, 4),
+                                "opp_avg": round(opp_avg, 2),
+                                "lg_avg": round(lg_avg, 2),
+                                "pct_diff": round((raw_ratio - 1.0) * 100.0, 1),
+                                "n_games": n_g,
+                            }
+                        self.nfl_opp_pos_stats[(opp, pos)] = stats_map
 
     def project_nba_game_props(
         self,
@@ -367,15 +608,17 @@ class PlayerPropsEngine:
                 .agg(avg_min=("minutes", "mean"), avg_pts=("points", "mean"), n=("points", "count"))
                 .sort_values("avg_pts", ascending=False)
             )
-            vacated_pts = sum(
-                float(r["avg_pts"])
+            sidelined_rows = [
+                (str(r["player_name"]), float(r["avg_pts"]))
                 for _, r in player_summaries.iterrows()
                 if (
                     str(r["player_name"]).lower() in out_names
                     or normalize_player_name(str(r["player_name"])) in out_names
                 )
                 and float(r["avg_min"]) >= 22.0
-            )
+            ]
+            vacated_pts = sum(pts for _, pts in sidelined_rows)
+            sidelined_stars = [nm for nm, _ in sidelined_rows[:2]]
             usage_boost = float(np.clip(1.0 + (vacated_pts * 0.0045), 1.0, 1.12))
 
             if live_prop_markets or custom_lines:
@@ -411,7 +654,10 @@ class PlayerPropsEngine:
                     and int(r["n"]) >= 4
                 ][:3]
 
+            if not getattr(self, "nba_opp_pos_stats", None) and len(self.nba_logs) > 0:
+                self._compute_opponent_allowances()
             opp_factors = self.nba_opp_def_factor.get(opp, {})
+            nba_pos_stats = getattr(self, "nba_opp_pos_stats", {}) or {}
 
             for pname in top_players:
                 p_live = _lookup_live_player(live_boxscore, pname) if is_live else None
@@ -425,6 +671,13 @@ class PlayerPropsEngine:
                 p_all_active = p_all[p_all["minutes"] >= 12.0]
                 if len(p_all_active) < 4:
                     continue
+                pos = (
+                    str(p_all["position"].iloc[-1]).upper()
+                    if "position" in p_all.columns and len(p_all) > 0
+                    else ""
+                )
+                opp_pos_map = nba_pos_stats.get((opp, pos), {}) if pos else {}
+
                 p_hist = p_all_active.tail(15)
                 min_vals = p_hist["minutes"].to_numpy(dtype=float)
                 ewma_min, _ = _ewma_mean_std(min_vals, span=5)
@@ -491,7 +744,13 @@ class PlayerPropsEngine:
                     recent_rate = ewma_val / max(15.0, ewma_min)
                     blended_rate = 0.55 * season_rate + 0.45 * recent_rate
 
-                    opp_mult = float(np.clip(opp_factors.get(col, 1.0), 0.94, 1.06))
+                    pos_info = opp_pos_map.get(col)
+                    raw_opp_f = (
+                        float(pos_info["factor"])
+                        if pos_info is not None
+                        else float(opp_factors.get(col, 1.0))
+                    )
+                    opp_mult = float(np.clip(raw_opp_f, 0.92, 1.08))
                     pace_adj = float(np.clip(pace_factor, 0.96, 1.04))
                     boost_mult = (
                         usage_boost
@@ -501,6 +760,8 @@ class PlayerPropsEngine:
 
                     base_std = max(std_val, 0.22 * season_avg)
                     mkt_anchor = 0.55 * season_avg + 0.45 * ewma_val
+                    stat_name = _plain_stat_name(col, label)
+                    live_time_note = ""
 
                     if is_live:
                         cur_stat = float(p_live.get(col, 0.0) or 0.0) if p_live else 0.0
@@ -543,6 +804,7 @@ class PlayerPropsEngine:
                         need_rem = line_val - cur_stat
                         raw_over_p = tail_fn(rem_mean, eff_std, need_rem)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
+                        proj_median = round(cur_stat + prop_median_for_type(col, rem_mean, eff_std), 2)
                         rem_mkt_center = (
                             max(0.1, float(mkt_prop["line"]) - cur_stat)
                             if mkt_prop is not None
@@ -564,10 +826,24 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
-                        stat_name = _plain_stat_name(col, label)
-                        drivers = [
-                            f"Currently at {cur_stat:.0f} {stat_name} and projected to finish at {proj_mean:.1f} over {rem_proj_min:.1f} expected minutes left, compared to the {line_val:.1f} line."
-                        ] + live_notes[:2]
+                        live_time_note = f"{rem_proj_min:.1f} expected minutes left"
+                        default_side = "OVER" if over_p >= 0.50 else "UNDER"
+                        primary_driver = build_prop_primary_reason(
+                            player_name=pname,
+                            prop_type=col,
+                            prop_label=label,
+                            side=default_side,
+                            line_val=line_val,
+                            proj_mean=proj_mean,
+                            proj_median=proj_median,
+                            side_prob=over_p if default_side == "OVER" else (1.0 - over_p),
+                            line_source=line_src,
+                            is_live=True,
+                            current_stat=cur_stat,
+                            live_time_note=live_time_note,
+                        )
+                        context_drivers = list(live_notes[:2])
+                        drivers = [primary_driver] + context_drivers
                     else:
                         cur_stat = 0.0
                         raw_proj_mean = blended_rate * full_proj_min * pace_adj * opp_mult * boost_mult
@@ -597,6 +873,7 @@ class PlayerPropsEngine:
 
                         raw_over_p = tail_fn(proj_mean, eff_std, line_val)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
+                        proj_median = prop_median_for_type(col, proj_mean, eff_std)
                         mkt_center = (
                             float(mkt_prop["line"]) if mkt_prop is not None else mkt_anchor
                         )
@@ -616,39 +893,62 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
-                        stat_name = _plain_stat_name(col, label)
-                        if line_src == "Model Ref Line":
-                            primary_driver = (
-                                f"Projected for {proj_mean:.1f} {stat_name} in about {full_proj_min:.0f} minutes against an estimated {line_val:.1f} line, so verify the posted DraftKings line."
-                            )
-                        else:
-                            primary_driver = (
-                                f"Projected for {proj_mean:.1f} {stat_name} in about {full_proj_min:.0f} minutes against the {line_val:.1f} line."
-                            )
-                        drivers = [primary_driver]
+                        default_side = "OVER" if over_p >= 0.50 else "UNDER"
+                        primary_driver = build_prop_primary_reason(
+                            player_name=pname,
+                            prop_type=col,
+                            prop_label=label,
+                            side=default_side,
+                            line_val=line_val,
+                            proj_mean=proj_mean,
+                            proj_median=proj_median,
+                            side_prob=over_p if default_side == "OVER" else (1.0 - over_p),
+                            line_source=line_src,
+                        )
+                        context_drivers = []
+                        pos_def_txt = _format_positional_defense_driver(
+                            opp=opp,
+                            pos=pos,
+                            stat_name=stat_name,
+                            pos_info=pos_info,
+                            fallback_mult=opp_mult,
+                        )
+                        if pos_def_txt:
+                            context_drivers.append(pos_def_txt)
                         if usage_boost > 1.02:
-                            drivers.append(
-                                f"Injured teammates are expected to increase this player's offensive role by {(usage_boost - 1.0)*100:.1f}%."
-                            )
-                        if abs(opp_mult - 1.0) >= 0.03:
-                            pct_diff = abs(opp_mult - 1.0) * 100.0
-                            if opp_mult > 1.0:
-                                drivers.append(
-                                    f"{opp} has a favorable defense here, allowing {pct_diff:.0f}% more {stat_name} than average."
+                            if sidelined_stars:
+                                names_txt = " and ".join(sidelined_stars)
+                                context_drivers.append(
+                                    f"With {names_txt} sidelined, {pname} is projected for a {(usage_boost - 1.0)*100:.1f}% boost in offensive usage."
                                 )
                             else:
-                                drivers.append(
-                                    f"{opp} has a tough defense here, holding opponents {pct_diff:.0f}% below average in {stat_name}."
+                                context_drivers.append(
+                                    f"Injured teammates are expected to increase {pname}'s offensive usage by {(usage_boost - 1.0)*100:.1f}%."
                                 )
+                        if blowout_haircut < 1.0:
+                            context_drivers.append(
+                                f"A lopsided {abs(expected_spread):.1f}-point spread raises the risk of reduced fourth-quarter minutes for starters."
+                            )
                         if abs(pace_factor - 1.0) >= 0.02:
                             if pace_factor > 1.0:
-                                drivers.append(
-                                    "This game's faster expected pace creates extra opportunities to rack up stats."
+                                context_drivers.append(
+                                    f"A faster projected tempo ({expected_pace:.1f} possessions per game) creates extra opportunities for {stat_name}."
                                 )
                             else:
-                                drivers.append(
-                                    "This game's slower expected pace could limit total stat opportunities."
+                                context_drivers.append(
+                                    f"A slower projected tempo ({expected_pace:.1f} possessions per game) could limit opportunities for {stat_name}."
                                 )
+                        if abs(ewma_min - season_min) >= 2.5:
+                            trend_dir = "climbed" if ewma_min > season_min else "dipped"
+                            cmp_dir = "up from" if ewma_min > season_min else "down from"
+                            context_drivers.append(
+                                f"{pname}'s playing time has {trend_dir} to {ewma_min:.0f} minutes per game recently ({cmp_dir} {season_min:.0f} on the season), averaging {ewma_val:.1f} {stat_name}."
+                            )
+                        else:
+                            context_drivers.append(
+                                f"{pname} is projected for about {full_proj_min:.0f} minutes and has averaged {ewma_val:.1f} {stat_name} over recent games."
+                            )
+                        drivers = [primary_driver] + context_drivers[:3]
 
                     out.append(
                         PlayerPropProjection(
@@ -663,7 +963,7 @@ class PlayerPropsEngine:
                             projected_std=round(eff_std, 2),
                             over_prob=round(over_p, 4),
                             under_prob=round(1.0 - over_p, 4),
-                            drivers=drivers[:3],
+                            drivers=drivers[:4],
                             injury_clarity=inj_clarity,
                             current_stat=cur_stat,
                             is_live=is_live,
@@ -673,6 +973,10 @@ class PlayerPropsEngine:
                             default_line_value=sync_default_line,
                             is_custom_line=is_custom,
                             book_lines=mkt_prop.get("books") if mkt_prop else None,
+                            projected_median=proj_median,
+                            position=pos,
+                            context_drivers=context_drivers[:3],
+                            live_time_note=live_time_note,
                         )
                     )
         return out
@@ -686,6 +990,9 @@ class PlayerPropsEngine:
         expected_total: float = 45.5,
         is_indoor: bool = False,
         wind_mph: float = 5.0,
+        temp_f: float = 65.0,
+        weather_condition: str = "",
+        precip_prob: float = 0.0,
         max_game_order: int | None = None,
         injuries_by_team: dict[str, list[dict[str, Any]]] | None = None,
         custom_lines: dict[tuple[str, str], float] | None = None,
@@ -714,8 +1021,51 @@ class PlayerPropsEngine:
         )
         max_order = int(logs["game_order"].max())
 
-        env_pass_mult = 1.03 if is_indoor else (0.91 if wind_mph >= 16.0 else 1.0)
+        # Outdoor NFL weather effects on passing/receiving vs. rushing
+        eff_wind = 0.0 if is_indoor else max(0.0, float(wind_mph))
+        eff_temp = 70.0 if is_indoor else float(temp_f)
+        cond_low = "" if is_indoor else str(weather_condition or "").strip().lower()
+        has_snow = (not is_indoor) and any(k in cond_low for k in ("snow", "flurr", "blizzard", "sleet"))
+        has_rain = (not is_indoor) and (not has_snow) and any(
+            k in cond_low for k in ("rain", "shower", "storm", "drizzle")
+        )
+        likely_precip = (not is_indoor) and (not has_snow) and (not has_rain) and float(precip_prob or 0.0) >= 60.0
+
+        if is_indoor:
+            env_pass_mult = 1.03
+            env_rush_mult = 1.00
+        else:
+            env_pass_mult = 1.0
+            env_rush_mult = 1.0
+            if eff_wind >= 18.0:
+                env_pass_mult *= 0.90
+                env_rush_mult *= 1.04
+            elif eff_wind >= 14.0:
+                env_pass_mult *= 0.94
+                env_rush_mult *= 1.02
+            elif eff_wind >= 11.0:
+                env_pass_mult *= 0.97
+                env_rush_mult *= 1.01
+            if has_snow:
+                env_pass_mult *= 0.92
+                env_rush_mult *= 1.03
+            elif has_rain:
+                env_pass_mult *= 0.95
+                env_rush_mult *= 1.02
+            elif likely_precip:
+                env_pass_mult *= 0.97
+                env_rush_mult *= 1.01
+            if eff_temp <= 32.0:
+                env_pass_mult *= 0.96
+                env_rush_mult *= 1.02
+            env_pass_mult = float(np.clip(env_pass_mult, 0.84, 1.04))
+            env_rush_mult = float(np.clip(env_rush_mult, 0.97, 1.08))
+
         tot_mult = float(np.clip(expected_total / 45.5, 0.90, 1.10))
+
+        if not getattr(self, "nfl_opp_pos_stats", None) and len(self.nfl_logs) > 0:
+            self._compute_opponent_allowances()
+        nfl_pos_stats = getattr(self, "nfl_opp_pos_stats", {}) or {}
 
         out: list[PlayerPropProjection] = []
         for team, opp, is_home in (
@@ -820,10 +1170,28 @@ class PlayerPropsEngine:
                     continue
                 p_all = player_logs_by_name.get(pname, t_logs.iloc[0:0])
                 p_hist = p_all.tail(12)
+                opp_pos_map = nfl_pos_stats.get((opp, pos), {})
                 inj_clarity = (
                     0.68
                     if (pname.lower() in q_names or normalize_player_name(pname) in q_names)
                     else 1.0
+                )
+
+                # Recent volume metrics for concrete, human-friendly baseline explanations
+                recent_attempts = (
+                    _ewma_mean_std(p_hist["attempts"].to_numpy(dtype=float), span=5)[0]
+                    if "attempts" in p_hist.columns and len(p_hist) > 0
+                    else 0.0
+                )
+                recent_carries = (
+                    _ewma_mean_std(p_hist["carries"].to_numpy(dtype=float), span=5)[0]
+                    if "carries" in p_hist.columns and len(p_hist) > 0
+                    else 0.0
+                )
+                recent_targets = (
+                    _ewma_mean_std(p_hist["targets"].to_numpy(dtype=float), span=5)[0]
+                    if "targets" in p_hist.columns and len(p_hist) > 0
+                    else 0.0
                 )
 
                 for col, label, allowed_pos, tail_fn in self.NFL_PROPS:
@@ -845,20 +1213,29 @@ class PlayerPropsEngine:
                     if col == "passing_tds" and ewma_val < (0.6 if has_explicit_line else 1.05):
                         continue
 
-                    opp_mult = float(opp_factors.get(col, 1.0))
-                    if "passing" in col or "receiving" in col or col == "receptions":
+                    pos_info = opp_pos_map.get(col)
+                    raw_opp_f = (
+                        float(pos_info["factor"])
+                        if pos_info is not None
+                        else float(opp_factors.get(col, 1.0))
+                    )
+                    opp_mult = float(np.clip(raw_opp_f, 0.90, 1.10))
+                    is_air_prop = "passing" in col or "receiving" in col or col == "receptions"
+                    if is_air_prop:
                         script_env = pass_script * env_pass_mult * (1.0 if is_live else tot_mult)
                     else:
-                        script_env = rush_script * (1.0 if is_live else tot_mult)
+                        script_env = rush_script * env_rush_mult * (1.0 if is_live else tot_mult)
 
                     season_avg = float(np.mean(p_all[col].to_numpy(dtype=float)))
                     shrunk_base = 0.55 * season_avg + 0.45 * ewma_val
                     base_std = max(std_val, 0.25 * season_avg)
                     mkt_anchor = 0.60 * season_avg + 0.40 * ewma_val
+                    stat_name = _plain_stat_name(col, label)
+                    live_time_note = ""
 
                     if is_live:
                         cur_stat = float(p_live.get(col, 0.0) or 0.0) if p_live else 0.0
-                        rem_mean = shrunk_base * rem_frac * float(np.clip(opp_mult, 0.93, 1.07)) * script_env
+                        rem_mean = shrunk_base * rem_frac * opp_mult * script_env
                         proj_mean = cur_stat + rem_mean
                         eff_std = max(0.6, base_std * float(np.sqrt(max(0.04, rem_frac))))
 
@@ -890,6 +1267,7 @@ class PlayerPropsEngine:
                         need_rem = line_val - cur_stat
                         raw_over_p = tail_fn(rem_mean, eff_std, need_rem)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
+                        proj_median = round(cur_stat + prop_median_for_type(col, rem_mean, eff_std), 2)
                         rem_mkt_center = (
                             max(0.1, float(mkt_prop["line"]) - cur_stat)
                             if mkt_prop is not None
@@ -911,28 +1289,41 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
-                        stat_name = _plain_stat_name(col, label)
                         mins_left = int(round(rem_mins))
-                        time_left_txt = (
+                        live_time_note = (
                             "less than a minute left"
                             if rem_mins < 1.0
                             else f"{mins_left} {'minute' if mins_left == 1 else 'minutes'} left"
                         )
-                        drivers = [
-                            f"Currently at {cur_stat:.0f} {stat_name} and projected to finish at {proj_mean:.1f} with {time_left_txt}, compared to the {line_val:.1f} line."
-                        ]
+                        default_side = "OVER" if over_p >= 0.50 else "UNDER"
+                        primary_driver = build_prop_primary_reason(
+                            player_name=pname,
+                            prop_type=col,
+                            prop_label=label,
+                            side=default_side,
+                            line_val=line_val,
+                            proj_mean=proj_mean,
+                            proj_median=proj_median,
+                            side_prob=over_p if default_side == "OVER" else (1.0 - over_p),
+                            line_source=line_src,
+                            is_live=True,
+                            current_stat=cur_stat,
+                            live_time_note=live_time_note,
+                        )
+                        context_drivers: list[str] = []
                         if abs(trailing_tilt) >= 0.6:
                             if trailing_tilt > 0:
-                                drivers.append(
+                                context_drivers.append(
                                     "Trailing on the scoreboard should push the offense into a heavier passing game."
                                 )
                             else:
-                                drivers.append(
+                                context_drivers.append(
                                     "Protecting a lead should shift the offense toward running the ball to burn clock."
                                 )
+                        drivers = [primary_driver] + context_drivers
                     else:
                         cur_stat = 0.0
-                        raw_proj_mean = shrunk_base * float(np.clip(opp_mult, 0.93, 1.07)) * script_env
+                        raw_proj_mean = shrunk_base * opp_mult * script_env
                         eff_std = base_std
                         sync_default_line = (
                             float(mkt_prop["line"])
@@ -959,6 +1350,7 @@ class PlayerPropsEngine:
 
                         raw_over_p = tail_fn(proj_mean, eff_std, line_val)
                         over_p = clamp_prob(0.50 + 0.78 * (raw_over_p - 0.50))
+                        proj_median = prop_median_for_type(col, proj_mean, eff_std)
                         mkt_center = (
                             float(mkt_prop["line"]) if mkt_prop is not None else mkt_anchor
                         )
@@ -978,34 +1370,127 @@ class PlayerPropsEngine:
                             if same_as_mkt and mkt_prop.get("dk_over_prob") is not None
                             else round(est_mkt_over, 4)
                         )
-                        stat_name = _plain_stat_name(col, label)
-                        if line_src == "Model Ref Line":
-                            primary_driver = (
-                                f"Projected for {proj_mean:.1f} {stat_name} against an estimated {line_val:.1f} line versus a {ewma_val:.1f} recent average, so verify the posted DraftKings line."
-                            )
-                        else:
-                            primary_driver = (
-                                f"Projected for {proj_mean:.1f} {stat_name} against the {line_val:.1f} line, compared to a {ewma_val:.1f} recent average."
-                            )
-                        drivers = [primary_driver]
-                        if abs(opp_mult - 1.0) >= 0.03:
-                            pct_diff = abs(opp_mult - 1.0) * 100.0
-                            if opp_mult > 1.0:
-                                drivers.append(
-                                    f"{opp} has been a favorable matchup, allowing {pct_diff:.0f}% more {stat_name} than average."
-                                )
+                        default_side = "OVER" if over_p >= 0.50 else "UNDER"
+                        primary_driver = build_prop_primary_reason(
+                            player_name=pname,
+                            prop_type=col,
+                            prop_label=label,
+                            side=default_side,
+                            line_val=line_val,
+                            proj_mean=proj_mean,
+                            proj_median=proj_median,
+                            side_prob=over_p if default_side == "OVER" else (1.0 - over_p),
+                            line_source=line_src,
+                        )
+                        context_drivers = []
+
+                        # 1. Position-specific opponent defense
+                        pos_def_txt = _format_positional_defense_driver(
+                            opp=opp,
+                            pos=pos,
+                            stat_name=stat_name,
+                            pos_info=pos_info,
+                            fallback_mult=opp_mult,
+                        )
+                        if pos_def_txt:
+                            context_drivers.append(pos_def_txt)
+
+                        # 2. Outdoor weather or indoor dome environment
+                        if not is_indoor:
+                            if is_air_prop:
+                                if has_snow:
+                                    wind_part = f" and {eff_wind:.0f} mph winds" if eff_wind >= 10.0 else ""
+                                    context_drivers.append(
+                                        f"Outdoor snow ({eff_temp:.0f}°F{wind_part}) should make throwing and catching tougher."
+                                    )
+                                elif has_rain:
+                                    wind_part = f" and {eff_wind:.0f} mph winds" if eff_wind >= 10.0 else ""
+                                    context_drivers.append(
+                                        f"Outdoor rain ({eff_temp:.0f}°F{wind_part}) tends to dampen passing volume and accuracy."
+                                    )
+                                elif likely_precip:
+                                    context_drivers.append(
+                                        f"A {float(precip_prob):.0f}% chance of wet outdoor weather ({eff_temp:.0f}°F) could limit downfield passing."
+                                    )
+                                elif eff_wind >= 14.0:
+                                    cold_part = f" and {eff_temp:.0f}°F temperatures" if eff_temp <= 38.0 else ""
+                                    context_drivers.append(
+                                        f"Strong {eff_wind:.0f} mph outdoor winds{cold_part} should limit downfield passing."
+                                    )
+                                elif eff_temp <= 32.0:
+                                    context_drivers.append(
+                                        f"Freezing {eff_temp:.0f}°F outdoor temperatures typically reduce passing efficiency."
+                                    )
                             else:
-                                drivers.append(
-                                    f"{opp} has been a tough matchup, holding opponents {pct_diff:.0f}% below average in {stat_name}."
-                                )
-                        if not is_indoor and wind_mph >= 16.0 and "passing" in col:
-                            drivers.append(
-                                f"Strong {wind_mph:.0f} mph winds could limit downfield passing."
-                            )
-                        elif is_indoor and ("passing" in col or "receiving" in col):
-                            drivers.append(
+                                # Rushing prop in adverse outdoor weather
+                                if has_snow or has_rain or eff_wind >= 15.0 or eff_temp <= 32.0:
+                                    cond_bits = []
+                                    if has_snow:
+                                        cond_bits.append("snow")
+                                    elif has_rain:
+                                        cond_bits.append("rain")
+                                    if eff_wind >= 14.0:
+                                        cond_bits.append(f"{eff_wind:.0f} mph winds")
+                                    if eff_temp <= 32.0:
+                                        cond_bits.append(f"{eff_temp:.0f}°F cold")
+                                    if len(cond_bits) >= 3:
+                                        cond_desc = ", ".join(cond_bits[:-1]) + f", and {cond_bits[-1]}"
+                                    else:
+                                        cond_desc = " and ".join(cond_bits)
+                                    context_drivers.append(
+                                        f"Tough outdoor weather ({cond_desc}) typically shifts offenses toward heavier rushing volume."
+                                    )
+                        elif is_air_prop:
+                            context_drivers.append(
                                 "Playing indoors on fast turf provides a clean environment for the passing game."
                             )
+
+                        # 3. Game total / pregame script context
+                        if expected_total >= 48.5:
+                            context_drivers.append(
+                                f"A high {expected_total:.1f}-point projected game total points to extra offensive volume."
+                            )
+                        elif expected_total <= 41.0:
+                            context_drivers.append(
+                                f"A low {expected_total:.1f}-point projected game total could cap overall offensive volume."
+                            )
+                        elif abs(trailing_tilt) >= 0.35:
+                            if is_air_prop and trailing_tilt > 0:
+                                context_drivers.append(
+                                    f"Projected as an underdog, {team} may need to lean more heavily on the passing game."
+                                )
+                            elif is_air_prop and trailing_tilt < 0:
+                                context_drivers.append(
+                                    f"As a solid favorite, {team} could lean more on the run if they build a lead."
+                                )
+                            elif (not is_air_prop) and trailing_tilt < 0:
+                                context_drivers.append(
+                                    f"As a solid favorite, {team} is positioned to lean on the run game to protect a lead."
+                                )
+                            elif (not is_air_prop) and trailing_tilt > 0:
+                                context_drivers.append(
+                                    f"Projected as an underdog, {team} could shift away from the run if they fall behind."
+                                )
+
+                        # 4. Concrete recent workload & form baseline
+                        if "passing" in col and recent_attempts >= 15.0:
+                            context_drivers.append(
+                                f"{pname} has averaged {recent_attempts:.1f} pass attempts and {ewma_val:.1f} {stat_name} per game recently."
+                            )
+                        elif col == "rushing_yards" and recent_carries >= 5.0:
+                            context_drivers.append(
+                                f"{pname} has averaged {recent_carries:.1f} carries and {ewma_val:.1f} rushing yards per game recently."
+                            )
+                        elif ("receiving" in col or col == "receptions") and recent_targets >= 2.5:
+                            context_drivers.append(
+                                f"{pname} has drawn {recent_targets:.1f} targets per game recently, averaging {ewma_val:.1f} {stat_name}."
+                            )
+                        else:
+                            context_drivers.append(
+                                f"{pname} has averaged {ewma_val:.1f} {stat_name} over recent games ({season_avg:.1f} across the full sample)."
+                            )
+
+                        drivers = [primary_driver] + context_drivers[:3]
 
                     out.append(
                         PlayerPropProjection(
@@ -1020,7 +1505,7 @@ class PlayerPropsEngine:
                             projected_std=round(eff_std, 2),
                             over_prob=round(over_p, 4),
                             under_prob=round(1.0 - over_p, 4),
-                            drivers=drivers[:3],
+                            drivers=drivers[:4],
                             injury_clarity=inj_clarity,
                             current_stat=cur_stat,
                             is_live=is_live,
@@ -1030,6 +1515,10 @@ class PlayerPropsEngine:
                             default_line_value=sync_default_line,
                             is_custom_line=is_custom,
                             book_lines=mkt_prop.get("books") if mkt_prop else None,
+                            projected_median=proj_median,
+                            position=pos,
+                            context_drivers=context_drivers[:3],
+                            live_time_note=live_time_note,
                         )
                     )
         return out
